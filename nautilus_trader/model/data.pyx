@@ -953,8 +953,6 @@ cdef class Bar(Data):
 
     """
 
-    print("hey")
-
     def __init__(
         self,
         BarType bar_type not None,
