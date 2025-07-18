@@ -561,11 +561,11 @@ impl<'de> Deserialize<'de> for Quantity {
     }
 }
 
-/// Checks if the given quantity is positive.
+/// Checks if the quantity `value` is positive.
 ///
 /// # Errors
 ///
-/// Returns an error if the quantity is not positive.
+/// Returns an error if `value` is not positive.
 pub fn check_positive_quantity(value: Quantity, param: &str) -> anyhow::Result<()> {
     if !value.is_positive() {
         anyhow::bail!("invalid `Quantity` for '{param}' not positive, was {value}")
@@ -594,7 +594,15 @@ mod tests {
     }
 
     #[rstest]
-    #[cfg(not(feature = "defi"))]
+    #[cfg(all(not(feature = "defi"), not(feature = "high-precision")))]
+    #[should_panic(expected = "`precision` exceeded maximum `FIXED_PRECISION` (9), was 17")]
+    fn test_invalid_precision_new() {
+        // Precision 17 should fail due to DeFi validation
+        let _ = Quantity::new(1.0, 17);
+    }
+
+    #[rstest]
+    #[cfg(all(not(feature = "defi"), feature = "high-precision"))]
     #[should_panic(expected = "`precision` exceeded maximum `FIXED_PRECISION` (16), was 17")]
     fn test_invalid_precision_new() {
         // Precision 17 should fail due to DeFi validation
@@ -934,7 +942,7 @@ mod tests {
     ) {
         let quantity = if precision > crate::types::fixed::MAX_FLOAT_PRECISION {
             // For high precision, use from_raw to avoid f64 conversion issues
-            Quantity::from_raw(value as u128, precision)
+            Quantity::from_raw(value as QuantityRaw, precision)
         } else {
             Quantity::new(value, precision)
         };
@@ -1127,14 +1135,14 @@ mod property_tests {
         ) {
             // Create a decimal string with exactly 'precision' decimal places
             let fractional_str = format!("{:0width$}", fractional % 10_u32.pow(precision as u32), width = precision as usize);
-            let quantity_str = format!("{}.{}", integral, fractional_str);
+            let quantity_str = format!("{integral}.{fractional_str}");
 
             let parsed: Quantity = quantity_str.parse().unwrap();
             prop_assert_eq!(parsed.precision, precision);
 
             // Round-trip should preserve the original string (after normalization)
             let round_trip = parsed.to_string();
-            let expected_value = format!("{}.{}", integral, fractional_str);
+            let expected_value = format!("{integral}.{fractional_str}");
             prop_assert_eq!(round_trip, expected_value);
         }
 
@@ -1178,7 +1186,7 @@ mod property_tests {
 
             // Addition should either succeed or fail predictably
             let sum_f64 = q_a.as_f64() + q_b.as_f64();
-            if sum_f64.is_finite() && sum_f64 >= QUANTITY_MIN && sum_f64 <= QUANTITY_MAX {
+            if sum_f64.is_finite() && (QUANTITY_MIN..=QUANTITY_MAX).contains(&sum_f64) {
                 let sum = q_a + q_b;
                 prop_assert!(sum.as_f64().is_finite());
                 prop_assert!(!sum.is_undefined());
@@ -1186,7 +1194,7 @@ mod property_tests {
 
             // Subtraction should either succeed or fail predictably
             let diff_f64 = q_a.as_f64() - q_b.as_f64();
-            if diff_f64.is_finite() && diff_f64 >= QUANTITY_MIN && diff_f64 <= QUANTITY_MAX {
+            if diff_f64.is_finite() && (QUANTITY_MIN..=QUANTITY_MAX).contains(&diff_f64) {
                 let diff = q_a - q_b;
                 prop_assert!(diff.as_f64().is_finite());
                 prop_assert!(!diff.is_undefined());
@@ -1196,26 +1204,24 @@ mod property_tests {
         /// Property: Multiplication should preserve non-negativity
         #[test]
         fn prop_quantity_multiplication_non_negative(
-            a in quantity_value_strategy().prop_filter("Reasonable values", |&x| x > 0.0 && x < 100.0),
-            b in quantity_value_strategy().prop_filter("Reasonable values", |&x| x > 0.0 && x < 100.0),
+            a in quantity_value_strategy().prop_filter("Reasonable values", |&x| x > 0.0 && x < 10.0),
+            b in quantity_value_strategy().prop_filter("Reasonable values", |&x| x > 0.0 && x < 10.0),
             precision in precision_strategy()
         ) {
             let q_a = Quantity::new(a, precision);
             let q_b = Quantity::new(b, precision);
 
-            // Check if multiplication would overflow before performing it
-            let product_f64 = q_a.as_f64() * q_b.as_f64();
-            // More conservative overflow check for high-precision modes
-            let safe_limit = if cfg!(any(feature = "defi", feature = "high-precision")) {
-                QUANTITY_MAX / 10000.0  // Much more conservative in high-precision mode
-            } else {
-                QUANTITY_MAX
-            };
+            // Check if multiplication would overflow at the raw level before performing it
+            let raw_product_check = q_a.raw.checked_mul(q_b.raw);
 
-            if product_f64.is_finite() && product_f64 <= safe_limit {
-                // Multiplying two quantities should always result in a non-negative value
-                let product = q_a * q_b;
-                prop_assert!(product.as_f64() >= 0.0, "Quantity multiplication produced negative value: {}", product.as_f64());
+            if let Some(raw_product) = raw_product_check {
+                // Additional check to ensure the scaled result won't overflow
+                let scaled_raw = raw_product / (FIXED_SCALAR as QuantityRaw);
+                if scaled_raw <= QUANTITY_RAW_MAX {
+                    // Multiplying two quantities should always result in a non-negative value
+                    let product = q_a * q_b;
+                    prop_assert!(product.as_f64() >= 0.0, "Quantity multiplication produced negative value: {}", product.as_f64());
+                }
             }
         }
 

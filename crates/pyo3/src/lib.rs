@@ -56,12 +56,6 @@ fn nautilus_pyo3(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     re_export_module_attributes(m, n)?;
 
-    let n = "model";
-    let submodule = pyo3::wrap_pymodule!(nautilus_model::python::model);
-    m.add_wrapped(submodule)?;
-    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
-    re_export_module_attributes(m, n)?;
-
     let n = "indicators";
     let submodule = pyo3::wrap_pymodule!(nautilus_indicators::python::indicators);
     m.add_wrapped(submodule)?;
@@ -70,6 +64,18 @@ fn nautilus_pyo3(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let n = "infrastructure";
     let submodule = pyo3::wrap_pymodule!(nautilus_infrastructure::python::infrastructure);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    re_export_module_attributes(m, n)?;
+
+    let n = "live";
+    let submodule = pyo3::wrap_pymodule!(nautilus_live::python::live);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    re_export_module_attributes(m, n)?;
+
+    let n = "model";
+    let submodule = pyo3::wrap_pymodule!(nautilus_model::python::model);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     re_export_module_attributes(m, n)?;
@@ -106,6 +112,12 @@ fn nautilus_pyo3(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Adapters
 
+    let n = "blockchain";
+    let submodule = pyo3::wrap_pymodule!(nautilus_blockchain::python::blockchain);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    re_export_module_attributes(m, n)?;
+
     let n = "coinbase_intx";
     let submodule = pyo3::wrap_pymodule!(nautilus_coinbase_intx::python::coinbase_intx);
     m.add_wrapped(submodule)?;
@@ -114,6 +126,18 @@ fn nautilus_pyo3(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let n = "databento";
     let submodule = pyo3::wrap_pymodule!(nautilus_databento::python::databento);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    re_export_module_attributes(m, n)?;
+
+    let n = "hyperliquid";
+    let submodule = pyo3::wrap_pymodule!(nautilus_hyperliquid::python::hyperliquid);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    re_export_module_attributes(m, n)?;
+
+    let n = "okx";
+    let submodule = pyo3::wrap_pymodule!(nautilus_okx::python::okx);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     re_export_module_attributes(m, n)?;

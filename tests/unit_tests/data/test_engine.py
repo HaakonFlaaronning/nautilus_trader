@@ -540,6 +540,8 @@ class TestDataEngine:
             correlation_id=UUID4(),
             response_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
+            start=pd.Timestamp("2023-01-01"),
+            end=pd.Timestamp("2023-01-02"),
         )
 
         # Act
@@ -3493,6 +3495,30 @@ class TestDataBufferEngine:
         assert len(handler) == 2
         assert len(handler[0].deltas) == 1
         assert len(handler[1].deltas) == 1
+
+    def test_execute_skips_commands_for_external_clients(self):
+        # Arrange
+        ext_client_id = ClientId("EXT_DATA")
+
+        msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        cache = TestComponentStubs.cache()
+
+        engine = DataEngine(
+            msgbus=msgbus,
+            cache=cache,
+            clock=self.clock,
+            config=DataEngineConfig(external_clients=[ext_client_id]),
+        )
+
+        cmd = SubscribeInstruments(
+            client_id=ext_client_id,
+            venue=None,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act / Assert: should not raise even though no client registered
+        engine.execute(cmd)
 
     def test_process_order_book_deltas_then_sends_to_registered_handler(self):
         # Arrange

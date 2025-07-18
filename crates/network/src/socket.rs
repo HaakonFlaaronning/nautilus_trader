@@ -402,13 +402,13 @@ impl SocketClientInner {
                                 }
 
                                 #[cfg(feature = "python")]
-                                if let Some(py_handler) = &py_handler {
-                                    if let Err(e) = Python::with_gil(|py| {
+                                if let Some(py_handler) = &py_handler
+                                    && let Err(e) = Python::with_gil(|py| {
                                         py_handler.call1(py, (data.as_slice(),))
-                                    }) {
-                                        tracing::error!("Call to handler failed: {e}");
-                                        break;
-                                    }
+                                    })
+                                {
+                                    tracing::error!("Call to handler failed: {e}");
+                                    break;
                                 }
                             }
                         }
@@ -554,11 +554,11 @@ impl Drop for SocketClientInner {
             log_task_aborted("write");
         }
 
-        if let Some(ref handle) = self.heartbeat_task.take() {
-            if !handle.is_finished() {
-                handle.abort();
-                log_task_aborted("heartbeat");
-            }
+        if let Some(ref handle) = self.heartbeat_task.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+            log_task_aborted("heartbeat");
         }
     }
 }
@@ -764,11 +764,11 @@ impl SocketClient {
                             log_task_aborted("read");
                         }
 
-                        if let Some(task) = &inner.heartbeat_task {
-                            if !task.is_finished() {
-                                task.abort();
-                                log_task_aborted("heartbeat");
-                            }
+                        if let Some(task) = &inner.heartbeat_task
+                            && !task.is_finished()
+                        {
+                            task.abort();
+                            log_task_aborted("heartbeat");
                         }
                     })
                     .await
@@ -1258,7 +1258,7 @@ mod rust_tests {
         // Server task: accept one connection and then drop it
         let server = task::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.shutdown();
+                drop(sock.shutdown());
             }
             // Keep listener alive briefly to avoid premature exit
             sleep(Duration::from_secs(1)).await;

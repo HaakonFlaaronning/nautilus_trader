@@ -15,13 +15,20 @@
 
 use std::sync::Arc;
 
+use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::defi::Chain;
 
 /// Configuration for blockchain data clients.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.blockchain")
+)]
 pub struct BlockchainDataClientConfig {
     /// The blockchain chain configuration.
     pub chain: Arc<Chain>,
+    /// List of decentralized exchange IDs to register and sync during connection.
+    pub dex_ids: Vec<String>,
     /// Determines if the client should use Hypersync for live data streaming.
     pub use_hypersync_for_live_data: bool,
     /// The HTTP URL for the blockchain RPC endpoint.
@@ -32,26 +39,33 @@ pub struct BlockchainDataClientConfig {
     pub wss_rpc_url: Option<String>,
     /// The block from which to sync historical data.
     pub from_block: Option<u64>,
+    /// Optional configuration for data client's Postgres cache database
+    pub postgres_cache_database_config: Option<PostgresConnectOptions>,
 }
 
 impl BlockchainDataClientConfig {
     /// Creates a new [`BlockchainDataClientConfig`] instance.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub const fn new(
         chain: Arc<Chain>,
+        dex_ids: Vec<String>,
         http_rpc_url: String,
         rpc_requests_per_second: Option<u32>,
         wss_rpc_url: Option<String>,
         use_hypersync_for_live_data: bool,
         from_block: Option<u64>,
+        postgres_cache_database_config: Option<PostgresConnectOptions>,
     ) -> Self {
         Self {
             chain,
+            dex_ids,
             use_hypersync_for_live_data,
             http_rpc_url,
             rpc_requests_per_second,
             wss_rpc_url,
             from_block,
+            postgres_cache_database_config,
         }
     }
 }

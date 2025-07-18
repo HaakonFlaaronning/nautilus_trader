@@ -254,10 +254,10 @@ impl DataType {
         let topic = if let Some(ref meta) = metadata {
             let meta_str = meta
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(".");
-            format!("{}.{}", type_name, meta_str)
+            format!("{type_name}.{meta_str}")
         } else {
             type_name.to_string()
         };
@@ -546,7 +546,7 @@ mod tests {
         );
         let data_type = DataType::new("ExampleType", metadata);
 
-        assert_eq!(format!("{}", data_type), "ExampleType.key1=value1");
+        assert_eq!(format!("{data_type}"), "ExampleType.key1=value1");
     }
 
     #[rstest]

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     data::HasTsInit,
-    defi::{amm::SharedPool, chain::SharedChain, dex::SharedDex},
+    defi::{SharedChain, SharedDex},
     enums::OrderSide,
     identifiers::InstrumentId,
     types::{Price, Quantity},
@@ -29,13 +29,19 @@ use crate::{
 
 /// Represents a token swap transaction on a decentralized exchange (DEX).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+)]
 pub struct PoolSwap {
     /// The blockchain network where the swap occurred.
     pub chain: SharedChain,
     /// The decentralized exchange where the swap was executed.
     pub dex: SharedDex,
-    /// The DEX liquidity pool.
-    pub pool: SharedPool,
+    /// The instrument ID.
+    pub instrument_id: InstrumentId,
+    /// The blockchain address of the pool smart contract.
+    pub pool_address: Address,
     /// The blockchain block number at which the swap was executed.
     pub block: u64,
     /// The unique hash identifier of the blockchain transaction containing the swap.
@@ -65,7 +71,8 @@ impl PoolSwap {
     pub fn new(
         chain: SharedChain,
         dex: SharedDex,
-        pool: SharedPool,
+        instrument_id: InstrumentId,
+        pool_address: Address,
         block: u64,
         transaction_hash: String,
         transaction_index: u32,
@@ -79,7 +86,8 @@ impl PoolSwap {
         Self {
             chain,
             dex,
-            pool,
+            instrument_id,
+            pool_address,
             block,
             transaction_hash,
             transaction_index,
@@ -91,12 +99,6 @@ impl PoolSwap {
             price,
             ts_init: timestamp, // TODO: Use swap timestamp as init timestamp for now
         }
-    }
-
-    /// Returns the instrument ID for this swap.
-    #[must_use]
-    pub fn instrument_id(&self) -> InstrumentId {
-        self.pool.instrument_id()
     }
 }
 
@@ -110,11 +112,9 @@ impl Display for PoolSwap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}(chain={}, dex={}, pool={}, side={}, quantity={}, price={})",
+            "{}(instrument_id={}, side={}, quantity={}, price={})",
             stringify!(PoolSwap),
-            self.chain.name,
-            self.dex.name,
-            self.pool.ticker(),
+            self.instrument_id,
             self.side,
             self.size,
             self.price,

@@ -307,7 +307,7 @@ where
     T: Debug,
 {
     pub fn new(actor_id: Ustr) -> Self {
-        let endpoint = Ustr::from(&format!("{}_process", actor_id));
+        let endpoint = Ustr::from(&format!("{actor_id}_process"));
         Self {
             actor_id,
             endpoint,
@@ -833,7 +833,7 @@ mod tests {
         proptest!(move |(inputs in throttler_test_strategy())| {
             test_throttler_with_inputs(inputs, test_throttler.clone());
             // Reset throttler state between runs
-            let throttler = unsafe { &mut *(test_throttler.throttler.get() as *mut _ as *mut Throttler<u64, Box<dyn Fn(u64)>>) };
+            let throttler = unsafe { &mut *test_throttler.throttler.get() };
             throttler.reset();
             throttler.clock.borrow_mut().reset();
         });

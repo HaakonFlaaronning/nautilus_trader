@@ -531,33 +531,33 @@ impl OrderMatchingEngine {
 
             // Check for instrument expiration or activation
             if EXPIRING_INSTRUMENT_TYPES.contains(&self.instrument.instrument_class()) {
-                if let Some(activation_ns) = self.instrument.activation_ns() {
-                    if self.clock.borrow().timestamp_ns() < activation_ns {
-                        self.generate_order_rejected(
-                            order,
-                            format!(
-                                "Contract {} is not yet active, activation {}",
-                                self.instrument.id(),
-                                self.instrument.activation_ns().unwrap()
-                            )
-                            .into(),
-                        );
-                        return;
-                    }
+                if let Some(activation_ns) = self.instrument.activation_ns()
+                    && self.clock.borrow().timestamp_ns() < activation_ns
+                {
+                    self.generate_order_rejected(
+                        order,
+                        format!(
+                            "Contract {} is not yet active, activation {}",
+                            self.instrument.id(),
+                            self.instrument.activation_ns().unwrap()
+                        )
+                        .into(),
+                    );
+                    return;
                 }
-                if let Some(expiration_ns) = self.instrument.expiration_ns() {
-                    if self.clock.borrow().timestamp_ns() >= expiration_ns {
-                        self.generate_order_rejected(
-                            order,
-                            format!(
-                                "Contract {} has expired, expiration {}",
-                                self.instrument.id(),
-                                self.instrument.expiration_ns().unwrap()
-                            )
-                            .into(),
-                        );
-                        return;
-                    }
+                if let Some(expiration_ns) = self.instrument.expiration_ns()
+                    && self.clock.borrow().timestamp_ns() >= expiration_ns
+                {
+                    self.generate_order_rejected(
+                        order,
+                        format!(
+                            "Contract {} has expired, expiration {}",
+                            self.instrument.id(),
+                            self.instrument.expiration_ns().unwrap()
+                        )
+                        .into(),
+                    );
+                    return;
                 }
             }
 
@@ -632,9 +632,10 @@ impl OrderMatchingEngine {
             }
 
             // Check for valid order price precision
-            if let Some(price) = order.price() {
-                if price.precision != self.instrument.price_precision() {
-                    self.generate_order_rejected(
+            if let Some(price) = order.price()
+                && price.precision != self.instrument.price_precision()
+            {
+                self.generate_order_rejected(
                         order,
                         format!(
                             "Invalid order price precision for order {}, was {} when {} price precision is {}",
@@ -645,14 +646,14 @@ impl OrderMatchingEngine {
                         )
                             .into(),
                     );
-                    return;
-                }
+                return;
             }
 
             // Check for valid order trigger price precision
-            if let Some(trigger_price) = order.trigger_price() {
-                if trigger_price.precision != self.instrument.price_precision() {
-                    self.generate_order_rejected(
+            if let Some(trigger_price) = order.trigger_price()
+                && trigger_price.precision != self.instrument.price_precision()
+            {
+                self.generate_order_rejected(
                         order,
                         format!(
                             "Invalid order trigger price precision for order {}, was {} when {} price precision is {}",
@@ -663,8 +664,7 @@ impl OrderMatchingEngine {
                         )
                             .into(),
                     );
-                    return;
-                }
+                return;
             }
 
             // Get position if exists
@@ -778,10 +778,11 @@ impl OrderMatchingEngine {
     }
 
     pub fn process_cancel_all(&mut self, command: &CancelAllOrders, account_id: AccountId) {
+        let instrument_id = command.instrument_id;
         let open_orders = self
             .cache
             .borrow()
-            .orders_open(None, Some(&command.instrument_id), None, None)
+            .orders_open(None, Some(&instrument_id), None, None)
             .into_iter()
             .cloned()
             .collect::<Vec<OrderAny>>();
@@ -1049,12 +1050,12 @@ impl OrderMatchingEngine {
     }
 
     fn process_trailing_stop_order(&mut self, order: &mut OrderAny) {
-        if let Some(trigger_price) = order.trigger_price() {
-            if self
+        if let Some(trigger_price) = order.trigger_price()
+            && self
                 .core
                 .is_stop_matched(order.order_side_specified(), trigger_price)
-            {
-                self.generate_order_rejected(
+        {
+            self.generate_order_rejected(
                     order,
                     format!(
                         "{} {} order trigger px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
@@ -1069,8 +1070,7 @@ impl OrderMatchingEngine {
                             .map_or_else(|| "None".to_string(), |p| p.to_string())
                     ).into(),
                 );
-                return;
-            }
+            return;
         }
 
         // Order is valid and accepted
@@ -1107,33 +1107,119 @@ impl OrderMatchingEngine {
         self.iterate_orders(timestamp_ns, &orders_ask);
     }
 
+    fn maybe_activate_trailing_stop(
+        &mut self,
+        order: &mut OrderAny,
+        bid: Option<Price>,
+        ask: Option<Price>,
+    ) -> bool {
+        match order {
+            OrderAny::TrailingStopMarket(inner) => {
+                if inner.is_activated {
+                    return true;
+                }
+
+                if inner.activation_price.is_none() {
+                    let px = match inner.order_side() {
+                        OrderSide::Buy => ask,
+                        OrderSide::Sell => bid,
+                        _ => None,
+                    };
+                    if let Some(p) = px {
+                        inner.activation_price = Some(p);
+                        inner.set_activated();
+                        if let Err(e) = self.cache.borrow_mut().update_order(order) {
+                            log::error!("Failed to update order: {e}");
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+
+                let activation_price = inner.activation_price.unwrap();
+                let hit = match inner.order_side() {
+                    OrderSide::Buy => ask.is_some_and(|a| a <= activation_price),
+                    OrderSide::Sell => bid.is_some_and(|b| b >= activation_price),
+                    _ => false,
+                };
+                if hit {
+                    inner.set_activated();
+                    if let Err(e) = self.cache.borrow_mut().update_order(order) {
+                        log::error!("Failed to update order: {e}");
+                    }
+                }
+                hit
+            }
+            OrderAny::TrailingStopLimit(inner) => {
+                if inner.is_activated {
+                    return true;
+                }
+
+                if inner.activation_price.is_none() {
+                    let px = match inner.order_side() {
+                        OrderSide::Buy => ask,
+                        OrderSide::Sell => bid,
+                        _ => None,
+                    };
+                    if let Some(p) = px {
+                        inner.activation_price = Some(p);
+                        inner.set_activated();
+                        if let Err(e) = self.cache.borrow_mut().update_order(order) {
+                            log::error!("Failed to update order: {e}");
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+
+                let activation_price = inner.activation_price.unwrap();
+                let hit = match inner.order_side() {
+                    OrderSide::Buy => ask.is_some_and(|a| a <= activation_price),
+                    OrderSide::Sell => bid.is_some_and(|b| b >= activation_price),
+                    _ => false,
+                };
+                if hit {
+                    inner.set_activated();
+                    if let Err(e) = self.cache.borrow_mut().update_order(order) {
+                        log::error!("Failed to update order: {e}");
+                    }
+                }
+                hit
+            }
+            _ => true,
+        }
+    }
+
     fn iterate_orders(&mut self, timestamp_ns: UnixNanos, orders: &[PassiveOrderAny]) {
         for order in orders {
             if order.is_closed() {
                 continue;
             }
 
-            // Check expiration
-            if self.config.support_gtd_orders {
-                if let Some(expire_time) = order.expire_time() {
-                    if timestamp_ns >= expire_time {
-                        // SAFTEY: We know this order is in the core
-                        self.core.delete_order(order).unwrap();
-                        self.cached_filled_qty.remove(&order.client_order_id());
-                        self.expire_order(order);
-                    }
-                }
+            if self.config.support_gtd_orders
+                && order
+                    .expire_time()
+                    .is_some_and(|expire_timestamp_ns| timestamp_ns >= expire_timestamp_ns)
+            {
+                let _ = self.core.delete_order(order);
+                self.cached_filled_qty.remove(&order.client_order_id());
+                self.expire_order(order);
+                continue;
             }
 
-            // Manage trailing stop
-            if let PassiveOrderAny::Stop(o) = order {
-                if let PassiveOrderAny::Stop(
-                    StopOrderAny::TrailingStopMarket(_) | StopOrderAny::TrailingStopLimit(_),
-                ) = order
-                {
-                    let mut order = OrderAny::from(o.to_owned());
-                    self.update_trailing_stop_order(&mut order);
+            if matches!(
+                order,
+                PassiveOrderAny::Stop(
+                    StopOrderAny::TrailingStopMarket(_) | StopOrderAny::TrailingStopLimit(_)
+                )
+            ) {
+                let mut any = OrderAny::from(order.clone());
+
+                if !self.maybe_activate_trailing_stop(&mut any, self.core.bid, self.core.ask) {
+                    continue;
                 }
+
+                self.update_trailing_stop_order(&mut any);
             }
 
             // Move market back to targets
@@ -1141,11 +1227,15 @@ impl OrderMatchingEngine {
                 self.core.bid = Some(target_bid);
                 self.target_bid = None;
             }
-            if let Some(target_ask) = self.target_ask {
+            if let Some(target_bid) = self.target_bid.take() {
+                self.core.bid = Some(target_bid);
+                self.target_bid = None;
+            }
+            if let Some(target_ask) = self.target_ask.take() {
                 self.core.ask = Some(target_ask);
                 self.target_ask = None;
             }
-            if let Some(target_last) = self.target_last {
+            if let Some(target_last) = self.target_last.take() {
                 self.core.last = Some(target_last);
                 self.target_last = None;
             }
@@ -1274,17 +1364,17 @@ impl OrderMatchingEngine {
     }
 
     pub fn fill_market_order(&mut self, order: &mut OrderAny) {
-        if let Some(filled_qty) = self.cached_filled_qty.get(&order.client_order_id()) {
-            if filled_qty >= &order.quantity() {
-                log::info!(
-                    "Ignoring fill as already filled pending application of events: {:?}, {:?}, {:?}, {:?}",
-                    filled_qty,
-                    order.quantity(),
-                    order.filled_qty(),
-                    order.quantity()
-                );
-                return;
-            }
+        if let Some(filled_qty) = self.cached_filled_qty.get(&order.client_order_id())
+            && filled_qty >= &order.quantity()
+        {
+            log::info!(
+                "Ignoring fill as already filled pending application of events: {:?}, {:?}, {:?}, {:?}",
+                filled_qty,
+                order.quantity(),
+                order.filled_qty(),
+                order.quantity()
+            );
+            return;
         }
 
         let venue_position_id = self.ids_generator.get_position_id(order, Some(true));
@@ -1453,21 +1543,21 @@ impl OrderMatchingEngine {
             }
 
             // Check reduce only order
-            if self.config.use_reduce_only && order.is_reduce_only() {
-                if let Some(position) = &position {
-                    if *fill_qty > position.quantity {
-                        if position.quantity == Quantity::zero(position.quantity.precision) {
-                            // Done
-                            return;
-                        }
-
-                        // Adjust fill to honor reduce only execution (fill remaining position size only)
-                        let adjusted_fill_qty =
-                            Quantity::from_raw(position.quantity.raw, fill_qty.precision);
-
-                        self.generate_order_updated(order, adjusted_fill_qty, None, None);
-                    }
+            if self.config.use_reduce_only
+                && order.is_reduce_only()
+                && let Some(position) = &position
+                && *fill_qty > position.quantity
+            {
+                if position.quantity == Quantity::zero(position.quantity.precision) {
+                    // Done
+                    return;
                 }
+
+                // Adjust fill to honor reduce only execution (fill remaining position size only)
+                let adjusted_fill_qty =
+                    Quantity::from_raw(position.quantity.raw, fill_qty.precision);
+
+                self.generate_order_updated(order, adjusted_fill_qty, None, None);
             }
 
             if fill_qty.is_zero() {
@@ -1953,6 +2043,8 @@ impl OrderMatchingEngine {
     fn update_trailing_stop_order(&mut self, order: &mut OrderAny) {
         let (new_trigger_price, new_price) = trailing_stop_calculate(
             self.instrument.price_increment(),
+            order.trigger_price(),
+            order.activation_price(),
             order,
             self.core.bid,
             self.core.ask,

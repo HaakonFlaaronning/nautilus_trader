@@ -15,12 +15,10 @@
 
 use std::{
     ops::{Deref, DerefMut},
-    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
-use alloy::primitives::Address;
 use nautilus_blockchain::{
     config::BlockchainDataClientConfig, factories::BlockchainDataClientFactory,
 };
@@ -30,15 +28,22 @@ use nautilus_common::{
     logging::log_info,
 };
 use nautilus_core::env::get_env_var;
+use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     defi::{Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap, chain::chains},
-    identifiers::{ClientId, TraderId},
+    identifiers::{ClientId, InstrumentId, TraderId},
 };
 
 // Requires capnp installed on the machine
 // Run with `cargo run -p nautilus-blockchain --bin node_test --features hypersync`
 // To see additional tracing logs `export RUST_LOG=debug,h2=off`
+
+// ================================================================================================
+// IMPORTANT: The actor definitions below are EXAMPLE CODE for demonstration purposes.
+// They should NOT be moved to the main library as they are specific to this test scenario.
+// If you need production-ready actors, create them in a separate production module.
+// ================================================================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,12 +63,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_factory = BlockchainDataClientFactory::new();
     let client_config = BlockchainDataClientConfig::new(
         Arc::new(chain.clone()),
+        vec!["Arbitrum:UniswapV3".to_string()],
         http_rpc_url,
         None, // RPC requests per second
         Some(wss_rpc_url),
         true, // Use HyperSync for live data
         // Some(from_block), // from_block
         from_block,
+        Some(PostgresConnectOptions::default()),
     );
 
     let mut node = LiveNode::builder(node_name, trader_id, environment)?
@@ -78,8 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create and register a blockchain subscriber actor
     let client_id = ClientId::new(format!("BLOCKCHAIN-{}", chain.name));
+
     let pools = vec![
-        Address::from_str("0xC31E54c7A869B9fCbECC14363CF510d1C41Fa443")?, // WETH/USDC Arbitrum One
+        InstrumentId::from("WETH/USDC-3000.UniswapV3:Arbitrum"), // Arbitrum WETH/USDC 0.30% pool
     ];
 
     let actor_config = BlockchainSubscriberActorConfig::new(client_id, chain.name, pools);
@@ -94,6 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Configuration for the blockchain subscriber actor.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.blockchain")
+)]
 pub struct BlockchainSubscriberActorConfig {
     /// Base data actor configuration.
     pub base: DataActorConfig,
@@ -101,14 +113,14 @@ pub struct BlockchainSubscriberActorConfig {
     pub client_id: ClientId,
     /// The blockchain to subscribe for.
     pub chain: Blockchain,
-    /// Pool addresses to monitor for swaps and liquidity updates.
-    pub pools: Vec<Address>,
+    /// Pool instrument IDs to monitor for swaps and liquidity updates.
+    pub pools: Vec<InstrumentId>,
 }
 
 impl BlockchainSubscriberActorConfig {
     /// Creates a new [`BlockchainSubscriberActorConfig`] instance.
     #[must_use]
-    pub fn new(client_id: ClientId, chain: Blockchain, pools: Vec<Address>) -> Self {
+    pub fn new(client_id: ClientId, chain: Blockchain, pools: Vec<InstrumentId>) -> Self {
         Self {
             base: DataActorConfig::default(),
             client_id,
@@ -118,12 +130,52 @@ impl BlockchainSubscriberActorConfig {
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl BlockchainSubscriberActorConfig {
+    /// Creates a new `BlockchainSubscriberActorConfig` instance.
+    #[new]
+    fn py_new(client_id: ClientId, chain: Blockchain, pools: Vec<InstrumentId>) -> Self {
+        Self::new(client_id, chain, pools)
+    }
+
+    /// Returns the client ID.
+    #[getter]
+    const fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    /// Returns the blockchain.
+    #[getter]
+    const fn chain(&self) -> Blockchain {
+        self.chain
+    }
+
+    /// Returns the pool instrument IDs.
+    #[getter]
+    fn pools(&self) -> Vec<InstrumentId> {
+        self.pools.clone()
+    }
+
+    /// Returns a string representation of the configuration.
+    fn __repr__(&self) -> String {
+        format!(
+            "BlockchainSubscriberActorConfig(client_id={}, chain={:?}, pools={:?})",
+            self.client_id, self.chain, self.pools
+        )
+    }
+}
+
 /// A basic blockchain subscriber actor that monitors DeFi activities.
 ///
 /// This actor demonstrates how to use the `DataActor` trait to monitor blockchain data
 /// from DEXs, pools, and other DeFi protocols. It logs received blocks and swaps
 /// to demonstrate the data flow.
 #[derive(Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.blockchain", unsendable)
+)]
 pub struct BlockchainSubscriberActor {
     core: DataActorCore,
     config: BlockchainSubscriberActorConfig,
@@ -153,11 +205,11 @@ impl DataActor for BlockchainSubscriberActor {
 
         self.subscribe_blocks(self.config.chain, Some(client_id), None);
 
-        let pool_addresses = self.config.pools.clone();
-        for address in pool_addresses {
-            self.subscribe_pool(address, Some(client_id), None);
-            self.subscribe_pool_swaps(address, Some(client_id), None);
-            self.subscribe_pool_liquidity_updates(address, Some(client_id), None);
+        let pool_instrument_ids = self.config.pools.clone();
+        for instrument_id in pool_instrument_ids {
+            self.subscribe_pool(instrument_id, Some(client_id), None);
+            self.subscribe_pool_swaps(instrument_id, Some(client_id), None);
+            self.subscribe_pool_liquidity_updates(instrument_id, Some(client_id), None);
         }
 
         self.clock().set_timer(
@@ -188,11 +240,11 @@ impl DataActor for BlockchainSubscriberActor {
 
         self.unsubscribe_blocks(self.config.chain, Some(client_id), None);
 
-        let pool_addresses = self.config.pools.clone();
-        for address in pool_addresses {
-            self.unsubscribe_pool(address, Some(client_id), None);
-            self.unsubscribe_pool_swaps(address, Some(client_id), None);
-            self.unsubscribe_pool_liquidity_updates(address, Some(client_id), None);
+        let pool_instrument_ids = self.config.pools.clone();
+        for instrument_id in pool_instrument_ids {
+            self.unsubscribe_pool(instrument_id, Some(client_id), None);
+            self.unsubscribe_pool_swaps(instrument_id, Some(client_id), None);
+            self.unsubscribe_pool_liquidity_updates(instrument_id, Some(client_id), None);
         }
 
         Ok(())
@@ -227,7 +279,7 @@ impl BlockchainSubscriberActor {
         }
     }
 
-    /// Returns the number of pools received by this actor.
+    /// Returns the number of blocks received by this actor.
     #[must_use]
     pub const fn block_count(&self) -> usize {
         self.received_blocks.len()
@@ -249,5 +301,70 @@ impl BlockchainSubscriberActor {
     #[must_use]
     pub const fn pool_liquidity_update_count(&self) -> usize {
         self.received_pool_liquidity_updates.len()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl BlockchainSubscriberActor {
+    /// Creates a new `BlockchainSubscriberActor` instance.
+    #[new]
+    fn py_new(config: BlockchainSubscriberActorConfig) -> Self {
+        Self::new(config)
+    }
+
+    /// Returns the number of blocks received by this actor.
+    const fn py_block_count(&self) -> usize {
+        self.block_count()
+    }
+
+    /// Returns the number of pools received by this actor.
+    const fn py_pool_count(&self) -> usize {
+        self.pool_count()
+    }
+
+    /// Returns the number of swaps received by this actor.
+    const fn py_pool_swap_count(&self) -> usize {
+        self.pool_swap_count()
+    }
+
+    /// Returns the number of liquidity updates received by this actor.
+    const fn py_pool_liquidity_update_count(&self) -> usize {
+        self.pool_liquidity_update_count()
+    }
+
+    /// Returns the received blocks.
+    #[getter]
+    fn received_blocks(&self) -> Vec<Block> {
+        self.received_blocks.clone()
+    }
+
+    /// Returns the received pool swaps.
+    #[getter]
+    fn received_pool_swaps(&self) -> Vec<PoolSwap> {
+        self.received_pool_swaps.clone()
+    }
+
+    /// Returns the received pool liquidity updates.
+    #[getter]
+    fn received_pool_liquidity_updates(&self) -> Vec<PoolLiquidityUpdate> {
+        self.received_pool_liquidity_updates.clone()
+    }
+
+    /// Returns the received pools.
+    #[getter]
+    fn received_pools(&self) -> Vec<Pool> {
+        self.received_pools.clone()
+    }
+
+    /// Returns a string representation of the actor.
+    fn __repr__(&self) -> String {
+        format!(
+            "BlockchainSubscriberActor(blocks={}, swaps={}, liquidity_updates={}, pools={})",
+            self.block_count(),
+            self.pool_swap_count(),
+            self.pool_liquidity_update_count(),
+            self.pool_count()
+        )
     }
 }

@@ -50,7 +50,9 @@ harness = false                    # disable the default libtest harness
    `sample_size` when the defaults aren’t ideal.
 
 ```rust
-use criterion::{black_box, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_my_algo(c: &mut Criterion) {
     let data = prepare_data(); // heavy set-up done once
@@ -73,7 +75,7 @@ can be ignored). Keep them as small as possible so the measured instruction
 count is meaningful.
 
 ```rust
-use iai::black_box;
+use std::hint::black_box;
 
 fn bench_add() -> i64 {
     let a = black_box(123);
@@ -88,9 +90,11 @@ iai::main!(bench_add);
 
 ## Running benches locally
 
-- **All benches** for every crate: `make cargo-bench` (delegates to `cargo bench`).
 - **Single crate**: `cargo bench -p nautilus-core`.
-- **Single benchmark file**: `cargo bench -p nautilus-core --bench time`.
+- **Single benchmark module**: `cargo bench -p nautilus-core --bench time`.
+- **CI performance benches**: `make cargo-ci-benches` (runs the crates included
+  in the CI performance workflow one at a time to avoid the mixed-panic-strategy
+  linker issue).
 
 Criterion writes HTML reports to `target/criterion/`; open `target/criterion/report/index.html` in your browser.
 

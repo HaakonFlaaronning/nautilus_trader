@@ -25,6 +25,7 @@ import pandas as pd
 from nautilus_trader.adapters.databento.data_utils import data_path
 from nautilus_trader.adapters.databento.data_utils import databento_data
 from nautilus_trader.adapters.databento.data_utils import load_catalog
+from nautilus_trader.backtest.config import MarginModelConfig
 from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.config import BacktestDataConfig
@@ -132,7 +133,7 @@ class OptionStrategy(Strategy):
 
         self.subscribe_quote_ticks(
             self.config.option_id,
-            params={"duration_seconds": pd.Timedelta(minutes=2).seconds},
+            params={"durations_seconds": (pd.Timedelta(minutes=2).seconds,)},
         )
         self.subscribe_quote_ticks(self.config.option_id2)
         self.subscribe_bars(self.bar_type)
@@ -325,6 +326,9 @@ venues = [
         account_type="MARGIN",
         base_currency="USD",
         starting_balances=["1_000_000 USD"],
+        margin_model=MarginModelConfig(
+            model_type="standard",
+        ),  # Use standard margin model for options trading
     ),
 ]
 

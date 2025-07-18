@@ -452,6 +452,19 @@ impl<'de> Deserialize<'de> for Money {
     }
 }
 
+/// Checks if the money `value` is positive.
+///
+/// # Errors
+///
+/// Returns an error if `value` is not positive.
+#[inline(always)]
+pub fn check_positive_money(value: Money, param: &str) -> anyhow::Result<()> {
+    if value.raw <= 0 {
+        anyhow::bail!("invalid `Money` for '{param}' not positive, was {value}");
+    }
+    Ok(())
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Tests
 ////////////////////////////////////////////////////////////////////////////////
@@ -1005,6 +1018,32 @@ mod tests {
                 let expected_sub = original_f64 - factor;
                 prop_assert!((sub_result - expected_sub).abs() < 0.01,
                     "Subtraction with f64 should be accurate");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case(42.0, true, "positive value")]
+    #[case(0.0, false, "zero value")]
+    #[case( -13.5,  false, "negative value")]
+    fn test_check_positive_money(
+        #[case] amount: f64,
+        #[case] should_succeed: bool,
+        #[case] _case_name: &str,
+    ) {
+        let money = Money::new(amount, Currency::USD());
+
+        let res = check_positive_money(money, "money");
+
+        match should_succeed {
+            true => assert!(res.is_ok(), "expected Ok(..) for {amount}"),
+            false => {
+                assert!(res.is_err(), "expected Err(..) for {amount}");
+                let msg = res.unwrap_err().to_string();
+                assert!(
+                    msg.contains("not positive"),
+                    "error message should mention positivity; got: {msg:?}"
+                );
             }
         }
     }

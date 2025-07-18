@@ -52,6 +52,7 @@ from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.common.generators cimport PositionIdGenerator
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.core.fsm cimport InvalidStateTrigger
+from nautilus_trader.core.message cimport Command
 from nautilus_trader.core.rust.core cimport secs_to_nanos
 from nautilus_trader.core.rust.model cimport ContingencyType
 from nautilus_trader.core.rust.model cimport OmsType
@@ -63,6 +64,7 @@ from nautilus_trader.execution.messages cimport BatchCancelOrders
 from nautilus_trader.execution.messages cimport CancelAllOrders
 from nautilus_trader.execution.messages cimport CancelOrder
 from nautilus_trader.execution.messages cimport ModifyOrder
+from nautilus_trader.execution.messages cimport QueryAccount
 from nautilus_trader.execution.messages cimport QueryOrder
 from nautilus_trader.execution.messages cimport SubmitOrder
 from nautilus_trader.execution.messages cimport SubmitOrderList
@@ -138,6 +140,7 @@ cdef class ExecutionEngine(Component):
         self._clients: dict[ClientId, ExecutionClient] = {}
         self._routing_map: dict[Venue, ExecutionClient] = {}
         self._default_client: ExecutionClient | None = None
+        self._external_clients: set[ClientId] = set((config.external_clients or []))
         self._oms_overrides: dict[StrategyId, OmsType] = {}
         self._external_order_claims: dict[InstrumentId, StrategyId] = {}
 
@@ -155,6 +158,7 @@ cdef class ExecutionEngine(Component):
         self.snapshot_positions = config.snapshot_positions
         self.snapshot_positions_interval_secs = config.snapshot_positions_interval_secs or 0
         self.snapshot_positions_timer_name = "ExecEngine_SNAPSHOT_POSITIONS"
+
 
         self._log.info(f"{config.snapshot_orders=}", LogColor.BLUE)
         self._log.info(f"{config.snapshot_positions=}", LogColor.BLUE)
@@ -708,13 +712,13 @@ cdef class ExecutionEngine(Component):
 
         self._log.info(f"Loaded cache in {(int(time.time() * 1000) - ts)}ms")
 
-    cpdef void execute(self, TradingCommand command):
+    cpdef void execute(self, Command command):
         """
         Execute the given command.
 
         Parameters
         ----------
-        command : TradingCommand
+        command : Command
             The command to execute.
 
         """
@@ -858,21 +862,42 @@ cdef class ExecutionEngine(Component):
 
 # -- COMMAND HANDLERS -----------------------------------------------------------------------------
 
-    cpdef void _execute_command(self, TradingCommand command):
+    cpdef void _execute_command(self, Command command):
         if self.debug:
             self._log.debug(f"{RECV}{CMD} {command}", LogColor.MAGENTA)
         self.command_count += 1
 
-        cdef ExecutionClient client = self._clients.get(command.client_id)
-        if client is None:
-            client = self._routing_map.get(
-                command.instrument_id.venue,
-                self._default_client,
+        if command.client_id in self._external_clients:
+            self._msgbus.publish_c(
+                topic=f"commands.trading.{command.client_id}",
+                msg=command,
             )
+            if self.debug:
+                self._log.debug(
+                    f"Skipping execution command for external client {command.client_id}: {command}",
+                    LogColor.MAGENTA,
+                )
+            return
+
+        cdef ExecutionClient client = self._clients.get(command.client_id)
+        cdef Venue venue
+
+        if client is None:
+            if isinstance(command, QueryAccount):
+                venue = Venue(command.account_id.get_issuer())
+            elif isinstance(command, TradingCommand):
+                venue = command.instrument_id.venue
+            else:
+                self._log.error(  # pragma: no cover (design-time error)
+                    f"Cannot handle command: unrecognized {command}",  # pragma: no cover (design-time error)
+                )
+                return
+
+            client = self._routing_map.get(venue, self._default_client)
             if client is None:
                 self._log.error(
                     f"Cannot execute command: "
-                    f"no execution client configured for {command.instrument_id.venue} or `client_id` {command.client_id}, "
+                    f"no execution client configured for {venue} or `client_id` {command.client_id}, "
                     f"{command}"
                 )
                 return  # No client to handle command
@@ -889,6 +914,8 @@ cdef class ExecutionEngine(Component):
             self._handle_cancel_all_orders(client, command)
         elif isinstance(command, BatchCancelOrders):
             self._handle_batch_cancel_orders(client, command)
+        elif isinstance(command, QueryAccount):
+            self._handle_query_account(client, command)
         elif isinstance(command, QueryOrder):
             self._handle_query_order(client, command)
         else:
@@ -983,6 +1010,9 @@ cdef class ExecutionEngine(Component):
 
     cpdef void _handle_batch_cancel_orders(self, ExecutionClient client, BatchCancelOrders command):
         client.batch_cancel_orders(command)
+
+    cpdef void _handle_query_account(self, ExecutionClient client, QueryAccount command):
+        client.query_account(command)
 
     cpdef void _handle_query_order(self, ExecutionClient client, QueryOrder command):
         client.query_order(command)
