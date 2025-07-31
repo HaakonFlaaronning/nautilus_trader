@@ -157,8 +157,9 @@ cdef class WaveTrendOscillator(Indicator):
             self._set_has_inputs(True)
             return
 
+
         # Calculate typical price (HLC3)
-        cdef double ap =  (high + low + close) / 3.0
+        cdef double ap =  high + low + (close / 3.0) # (high + low + close) / 3.0
 
         # Update ESA (EMA of typical price)
         self._esa.update_raw(ap)
