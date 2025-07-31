@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
-
+from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.indicators.average.moving_average cimport MovingAverage
 from nautilus_trader.indicators.base.indicator cimport Indicator
 
@@ -27,6 +27,8 @@ cdef class WaveTrendOscillator(Indicator):
     """The channel length period.\n\n:returns: `int`"""
     cdef readonly int average_length
     """The average length period.\n\n:returns: `int`"""
+    cdef readonly PriceType price_type
+    """The specified price type for extracting values from quotes.\n\n:returns: `PriceType`"""
     cdef readonly double wt_fast
     """The current WaveTrend fast value (TCI).\n\n:returns: `double`"""
     cdef readonly double wt_slow
