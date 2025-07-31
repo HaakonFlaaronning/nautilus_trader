@@ -147,24 +147,15 @@ cdef class WaveTrendOscillator(Indicator):
         """
         # Check if first input
         if not self.has_inputs:
-            # On the first bar, seed with the close price and zeros
-            self._esa.update_raw(close)
-            self._d_ema.update_raw(0.0)
-            self._tci_ema.update_raw(0.0)
-            self._wt_slow.update_raw(0.0)
-            self.wt_fast = 0.0
-            self.wt_slow = 0.0
             self._set_has_inputs(True)
-            return
 
-
-        # Calculate typical price (HLC3)
-        cdef double ap =  high + low + (close / 3.0) # (high + low + close) / 3.0
+        # Calculate typical price
+        cdef double ap = (high + low + close) / 3.0
 
         # Update ESA (EMA of typical price)
         self._esa.update_raw(ap)
 
-        # Calculate absolute difference and update D (EMA of absolute difference)
+        # Calculate absolute difference and update d_ema (EMA of absolute difference)
         cdef double d_absolute = abs(ap - self._esa.value)
         self._d_ema.update_raw(d_absolute)
 
