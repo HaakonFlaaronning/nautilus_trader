@@ -29,7 +29,7 @@ cdef class ZigZag(Indicator):
     def __init__(
         self,
         double deviation_value,
-        bint use_point_deviation_type=True,
+        bint use_point_deviation_type=False,
         bint use_high_low=False,
     ):
         Condition.positive(deviation_value, "deviation_value")

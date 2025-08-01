@@ -55,9 +55,9 @@ cdef class MASlope(Indicator):
 
     def __init__(
         self,
-        int start_bars_ago,
-        int end_bars_ago,
         int ma_period,
+        int start_bars_ago,
+        int end_bars_ago=0,
         ma_type not None: MovingAverageType=MovingAverageType.SIMPLE,
         PriceType price_type=PriceType.LAST,
     ):
