@@ -13,8 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 from nautilus_trader.core.rust.model cimport PriceType
-from nautilus_trader.indicators.average.moving_average cimport MovingAverage
-from nautilus_trader.indicators.base.indicator cimport Indicator
+from nautilus_trader.indicators.averages cimport MovingAverage
+from nautilus_trader.indicators.base cimport Indicator
 
 
 cdef class WaveTrendOscillator(Indicator):

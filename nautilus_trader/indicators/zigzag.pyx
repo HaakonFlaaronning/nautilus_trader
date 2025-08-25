@@ -17,7 +17,7 @@
 from libc.math cimport fabs
 
 from nautilus_trader.core.correctness cimport Condition
-from nautilus_trader.indicators.base.indicator cimport Indicator
+from nautilus_trader.indicators.base cimport Indicator
 from nautilus_trader.model.data cimport Bar
 
 
