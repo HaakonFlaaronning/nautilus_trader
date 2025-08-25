@@ -45,6 +45,8 @@ from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
+from nautilus_trader.live.cancellation import DEFAULT_FUTURE_CANCELLATION_TIMEOUT
+from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
@@ -57,6 +59,7 @@ from nautilus_trader.model.functions import order_side_to_pyo3
 from nautilus_trader.model.functions import time_in_force_to_pyo3
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.orders import MarketOrder
@@ -175,14 +178,19 @@ class CoinbaseIntxExecutionClient(LiveExecutionClient):
             await asyncio.sleep(0.01)
 
     async def _disconnect(self) -> None:
+        # Shutdown FIX client
         if not self._fix_client.is_logged_on():
             self._log.info("Disconnecting FIX client")
             await self._fix_client.close()
             self._log.info("Disconnected from FIX Drop Copy server", LogColor.BLUE)
 
-        for future in self._fix_client_futures:
-            if not future.done():
-                future.cancel()
+        # Cancel any pending futures
+        await cancel_tasks_with_timeout(
+            self._fix_client_futures,
+            self._log,
+            timeout_secs=DEFAULT_FUTURE_CANCELLATION_TIMEOUT,
+        )
+        self._fix_client_futures.clear()
 
     async def _cache_instruments(self) -> None:
         # Ensures instrument definitions are available for correct
@@ -618,6 +626,9 @@ class CoinbaseIntxExecutionClient(LiveExecutionClient):
             reduce_only=order.is_reduce_only if order.is_reduce_only else None,
         )
 
+    def _is_external_order(self, client_order_id: ClientOrderId) -> bool:
+        return not client_order_id or not self._cache.strategy_id_for_order(client_order_id)
+
     def _handle_msg(self, msg: Any) -> None:  # noqa: C901 (too complex)
         # Note: These FIX execution reports are using a default precision of 8 for now,
         # this avoids the need to track a separate cache down in Rust. Ensure all price
@@ -626,8 +637,9 @@ class CoinbaseIntxExecutionClient(LiveExecutionClient):
 
         if isinstance(msg, nautilus_pyo3.OrderStatusReport):
             report = OrderStatusReport.from_pyo3(msg)
-            if report.order_status is None:
-                self._log.warning(f"No ClientOrderId to process {report}")
+
+            if self._is_external_order(report.client_order_id):
+                self._send_order_status_report(report)
                 return
 
             order = self._cache.order(report.client_order_id)
@@ -686,8 +698,9 @@ class CoinbaseIntxExecutionClient(LiveExecutionClient):
                 self._log.warning(f"Received unhandled execution report {report}")
         elif isinstance(msg, nautilus_pyo3.FillReport):
             report = FillReport.from_pyo3(msg)
-            if report.client_order_id is None:
-                self._log.warning(f"No ClientOrderId to process {report}")
+
+            if self._is_external_order(report.client_order_id):
+                self._send_order_status_report(report)
                 return
 
             order = self._cache.order(report.client_order_id)

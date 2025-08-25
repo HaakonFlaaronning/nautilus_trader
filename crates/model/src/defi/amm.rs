@@ -24,20 +24,20 @@ use serde::{Deserialize, Serialize};
 use crate::{
     data::HasTsInit,
     defi::{Blockchain, SharedDex, chain::SharedChain, dex::Dex, token::Token},
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, Symbol, Venue},
 };
 
 /// Represents a liquidity pool in a decentralized exchange.
 ///
 /// The instrument ID encodes with the following components:
-/// `symbol` – The base/quote ticker plus the pool fee tier (in hundred-thousandths).
-/// `venue`  – The DEX name plus chain name.
+/// `symbol` – The pool address.
+/// `venue`  – The chain name plus DEX ID.
 ///
 /// The string representation therefore has the form:
-/// `<BASE>/<QUOTE>-<FEE>.<DEX_NAME>:<CHAIN_NAME>`
+/// `<POOL_ADDRESS>.<CHAIN_NAME>:<DEX_ID>`
 ///
 /// Example:
-/// `WETH/USDT-3000.UniswapV3:Arbitrum`
+/// `0x11b815efB8f581194ae79006d24E0d814B7697F6.Ethereum:UniswapV3`
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
@@ -65,9 +65,9 @@ pub struct Pool {
     /// • `500`   →  0.05 %  (5 bps)
     /// • `3_000` →  0.30 %  (30 bps)
     /// • `10_000`→  1.00 %
-    pub fee: u32,
+    pub fee: Option<u32>,
     /// The minimum tick spacing for positions in concentrated liquidity AMMs.
-    pub tick_spacing: u32,
+    pub tick_spacing: Option<u32>,
     /// UNIX timestamp (nanoseconds) when the instance was created.
     pub ts_init: UnixNanos,
 }
@@ -86,11 +86,11 @@ impl Pool {
         creation_block: u64,
         token0: Token,
         token1: Token,
-        fee: u32,
-        tick_spacing: u32,
+        fee: Option<u32>,
+        tick_spacing: Option<u32>,
         ts_init: UnixNanos,
     ) -> Self {
-        let instrument_id = Self::create_instrument_id(chain.name, &dex, &token0, &token1, fee);
+        let instrument_id = Self::create_instrument_id(chain.name, &dex, &address);
 
         Self {
             chain,
@@ -106,56 +106,11 @@ impl Pool {
         }
     }
 
-    pub fn create_instrument_id(
-        chain: Blockchain,
-        dex: &Dex,
-        token0: &Token,
-        token1: &Token,
-        fee: u32,
-    ) -> InstrumentId {
-        let symbol = format!(
-            "{}/{}-{}",
-            sanitize_symbol(&token0.symbol),
-            sanitize_symbol(&token1.symbol),
-            fee
-        );
-        let venue = format!("{}:{}", dex.name, chain);
-        InstrumentId::from(format!("{symbol}.{venue}").as_str())
+    pub fn create_instrument_id(chain: Blockchain, dex: &Dex, address: &Address) -> InstrumentId {
+        let symbol = Symbol::new(address.to_string());
+        let venue = Venue::new(format!("{}:{}", chain, dex.name));
+        InstrumentId::new(symbol, venue)
     }
-}
-
-fn sanitize_symbol(symbol: &str) -> String {
-    symbol
-        .chars()
-        .map(|c| match c {
-            '₮' => 'T', // Tugrik sign
-            '₽' => 'R', // Ruble sign
-            '₹' => 'R', // Rupee sign
-            '₩' => 'W', // Won sign
-            '₴' => 'H', // Hryvnia sign
-            '₡' => 'C', // Colon sign
-            '₪' => 'S', // Shekel sign
-            '₫' => 'D', // Dong sign
-            '₦' => 'N', // Naira sign
-            '₨' => 'R', // Rupee sign
-            '₧' => 'P', // Peseta sign
-            '₭' => 'K', // Kip sign
-            '₵' => 'C', // Cedi sign
-            '₱' => 'P', // Peso sign
-            '₲' => 'G', // Guarani sign
-            '₳' => 'A', // Austral sign
-            '₸' => 'T', // Tenge sign
-            '₶' => 'L', // Livre sign
-            '₷' => 'S', // Spesmilo sign
-            '₺' => 'T', // Lira sign
-            '₻' => 'N', // Nordic mark sign
-            '₼' => 'M', // Manat sign
-            '₾' => 'L', // Lari sign
-            '₿' => 'B', // Bitcoin sign
-            _ if c.is_ascii() => c,
-            _ => '_', // Replace any other non-ASCII with underscore
-        })
-        .collect()
 }
 
 impl Display for Pool {
@@ -163,7 +118,11 @@ impl Display for Pool {
         write!(
             f,
             "Pool(instrument_id={}, dex={}, fee={}, address={})",
-            self.instrument_id, self.dex.name, self.fee, self.address
+            self.instrument_id,
+            self.dex.name,
+            self.fee
+                .map_or("None".to_string(), |fee| format!("fee={}, ", fee)),
+            self.address
         )
     }
 }
@@ -183,7 +142,7 @@ mod tests {
     use super::*;
     use crate::defi::{
         chain::chains,
-        dex::{AmmType, Dex},
+        dex::{AmmType, Dex, DexType},
         token::Token,
     };
 
@@ -192,7 +151,7 @@ mod tests {
         let chain = Arc::new(chains::ETHEREUM.clone());
         let dex = Dex::new(
             chains::ETHEREUM.clone(),
-            "UniswapV3",
+            DexType::UniswapV3,
             "0x1F98431c8aD98523631AE4a59f267346ea31F984",
             0,
             AmmType::CLAMM,
@@ -234,25 +193,25 @@ mod tests {
             12345678,
             token0,
             token1,
-            3000,
-            60,
+            Some(3000),
+            Some(60),
             ts_init,
         );
 
         assert_eq!(pool.chain.chain_id, chain.chain_id);
-        assert_eq!(pool.dex.name, "UniswapV3");
+        assert_eq!(pool.dex.name, DexType::UniswapV3);
         assert_eq!(pool.address, pool_address);
         assert_eq!(pool.creation_block, 12345678);
         assert_eq!(pool.token0.symbol, "WETH");
         assert_eq!(pool.token1.symbol, "USDT");
-        assert_eq!(pool.fee, 3000);
-        assert_eq!(pool.tick_spacing, 60);
+        assert_eq!(pool.fee.unwrap(), 3000);
+        assert_eq!(pool.tick_spacing.unwrap(), 60);
         assert_eq!(pool.ts_init, ts_init);
-        assert_eq!(pool.instrument_id.symbol.as_str(), "WETH/USDT-3000");
-
-        let instrument_id = pool.instrument_id;
-        assert!(instrument_id.to_string().contains("WETH/USDT"));
-        assert!(instrument_id.to_string().contains("UniswapV3"));
+        assert_eq!(
+            pool.instrument_id.symbol.as_str(),
+            "0x11b815efB8f581194ae79006d24E0d814B7697F6"
+        );
+        assert_eq!(pool.instrument_id.venue.as_str(), "Ethereum:UniswapV3");
     }
 
     #[rstest]
@@ -262,7 +221,7 @@ mod tests {
 
         let dex = Dex::new(
             chains::ETHEREUM.clone(),
-            "UniswapV3",
+            DexType::UniswapV3,
             factory_address,
             0,
             AmmType::CLAMM,
@@ -301,14 +260,14 @@ mod tests {
             0,
             token0,
             token1,
-            3000,
-            60,
+            Some(3000),
+            Some(60),
             UnixNanos::default(),
         );
 
         assert_eq!(
             pool.instrument_id.to_string(),
-            "WETH/USDT-3000.UniswapV3:Ethereum"
+            "0x11b815efB8f581194ae79006d24E0d814B7697F6.Ethereum:UniswapV3"
         );
     }
 }

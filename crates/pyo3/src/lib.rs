@@ -13,6 +13,35 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Python bindings aggregator crate for [NautilusTrader](http://nautilustrader.io).
+//!
+//! The `nautilus-pyo3` crate collects the Python bindings generated across the NautilusTrader workspace
+//! and re-exports them through a single shared library that can be included in binary wheels.
+//!
+//! # Platform
+//!
+//! [NautilusTrader](http://nautilustrader.io) is an open-source, high-performance, production-grade
+//! algorithmic trading platform, providing quantitative traders with the ability to backtest
+//! portfolios of automated trading strategies on historical data with an event-driven engine,
+//! and also deploy those same strategies live, with no code changes.
+//!
+//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
+//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//!
+//! # Feature flags
+//!
+//! This crate is primarily intended to be built for Python via
+//! [maturin](https://github.com/PyO3/maturin) and therefore provides a broad set of feature flags
+//! to toggle bindings and optional dependencies:
+//!
+//! - `extension-module`: Builds the crate as a Python extension module (automatically enabled by `maturin`).
+//! - `ffi`: Enables the C foreign function interface (FFI) support in dependent crates.
+//! - `high-precision`: Uses 128-bit value types throughout the workspace.
+//! - `cython-compat`: Adjusts the module name so it can be imported from Cython generated code.
+//! - `postgres`: Enables PostgreSQL (sqlx) back-ends in dependent crates.
+//! - `redis`: Enables Redis based infrastructure in dependent crates.
+//! - `hypersync`: Enables hypersync support (fast parallel hash maps) where available.
+
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
 #![deny(nonstandard_style)]
@@ -132,8 +161,8 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Adapters
 
-    let n = "blockchain";
-    let submodule = pyo3::wrap_pymodule!(nautilus_blockchain::python::blockchain);
+    let n = "bitmex";
+    let submodule = pyo3::wrap_pymodule!(nautilus_bitmex::python::bitmex);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     #[cfg(feature = "cython-compat")]
@@ -173,6 +202,16 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     #[cfg(feature = "cython-compat")]
     re_export_module_attributes(m, n)?;
+
+    #[cfg(feature = "defi")]
+    {
+        let n = "blockchain";
+        let submodule = pyo3::wrap_pymodule!(nautilus_blockchain::python::blockchain);
+        m.add_wrapped(submodule)?;
+        sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+        #[cfg(feature = "cython-compat")]
+        re_export_module_attributes(m, n)?;
+    }
 
     Ok(())
 }

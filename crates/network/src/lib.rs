@@ -15,7 +15,7 @@
 
 //! Network functionality for [NautilusTrader](http://nautilustrader.io).
 //!
-//! The *network* crate provides networking components including HTTP, WebSocket, and raw TCP socket
+//! The `nautilus-network` crate provides networking components including HTTP, WebSocket, and raw TCP socket
 //! clients, rate limiting, backoff strategies, and socket TLS utilities for connecting to
 //! trading venues and data providers.
 //!
@@ -37,6 +37,7 @@
 //! or as part of a Rust only build.
 //!
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

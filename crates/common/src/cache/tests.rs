@@ -21,10 +21,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use nautilus_core::UnixNanos;
 #[cfg(feature = "defi")]
-use nautilus_model::defi::{AmmType, Dex, Pool, Token, chain::chains};
+use nautilus_model::defi::{AmmType, Dex, DexType, Pool, Token, chain::chains};
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, MarkPriceUpdate, QuoteTick, TradeTick},
+    data::{Bar, FundingRateUpdate, MarkPriceUpdate, QuoteTick, TradeTick},
     enums::{BookType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, PriceType},
     events::{OrderAccepted, OrderEventAny, OrderRejected, OrderSubmitted},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, Symbol, Venue},
@@ -742,7 +742,7 @@ fn test_pool() -> Pool {
     let chain = Arc::new(chains::ETHEREUM.clone());
     let dex = Dex::new(
         chains::ETHEREUM.clone(),
-        "UniswapV3",
+        DexType::UniswapV3,
         "0x1F98431c8aD98523631AE4a59f267346ea31F984",
         0,
         AmmType::CLAMM,
@@ -781,8 +781,8 @@ fn test_pool() -> Pool {
         12345678,
         token0,
         token1,
-        3000,
-        60,
+        Some(3000),
+        Some(60),
         UnixNanos::from(1_234_567_890_000_000_000u64),
     )
 }
@@ -821,7 +821,7 @@ fn test_pool_mut_when_some(mut cache: Cache, test_pool: Pool) {
 
     assert!(result.is_some());
     if let Some(pool_ref) = result {
-        assert_eq!(pool_ref.fee, 3000);
+        assert_eq!(pool_ref.fee.unwrap(), 3000);
     }
 }
 
@@ -947,6 +947,53 @@ fn test_index_price_when_empty(cache: Cache, audusd_sim: CurrencyPair) {
 fn test_index_prices_when_empty(cache: Cache, audusd_sim: CurrencyPair) {
     let result = cache.index_prices(&audusd_sim.id);
     assert!(result.is_none());
+}
+
+#[rstest]
+fn test_funding_rate_when_empty(cache: Cache, audusd_sim: CurrencyPair) {
+    let result = cache.funding_rate(&audusd_sim.id);
+    assert!(result.is_none());
+}
+
+#[rstest]
+fn test_add_funding_rate(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let funding_rate = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0001".parse().unwrap(),
+        None,
+        UnixNanos::from(5),
+        UnixNanos::from(10),
+    );
+
+    cache.add_funding_rate(funding_rate).unwrap();
+
+    let result = cache.funding_rate(&audusd_sim.id);
+    assert_eq!(result, Some(&funding_rate));
+}
+
+#[rstest]
+fn test_add_funding_rate_updates_existing(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let funding_rate1 = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0001".parse().unwrap(),
+        None,
+        UnixNanos::from(5),
+        UnixNanos::from(10),
+    );
+
+    let funding_rate2 = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0002".parse().unwrap(),
+        None,
+        UnixNanos::from(15),
+        UnixNanos::from(20),
+    );
+
+    cache.add_funding_rate(funding_rate1).unwrap();
+    cache.add_funding_rate(funding_rate2).unwrap();
+
+    let result = cache.funding_rate(&audusd_sim.id);
+    assert_eq!(result, Some(&funding_rate2));
 }
 
 #[rstest]

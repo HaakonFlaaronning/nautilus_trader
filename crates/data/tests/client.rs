@@ -39,6 +39,7 @@ use nautilus_common::{
             SubscribeBookDepth10,
             SubscribeBookSnapshots,
             SubscribeCustomData,
+            SubscribeFundingRates,
             SubscribeIndexPrices,
             SubscribeInstrument,
             SubscribeInstrumentClose,
@@ -52,6 +53,7 @@ use nautilus_common::{
             UnsubscribeBookDepth10,
             UnsubscribeBookSnapshots,
             UnsubscribeCustomData,
+            UnsubscribeFundingRates,
             UnsubscribeIndexPrices,
             UnsubscribeInstrument,
             UnsubscribeInstrumentClose,
@@ -518,6 +520,46 @@ fn test_index_price_subscription(
     ));
     adapter.execute_unsubscribe(&unsub);
     assert!(!adapter.subscriptions_index_prices.contains(&inst_id));
+}
+
+#[rstest]
+fn test_funding_rate_subscription(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
+    let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
+
+    let instrument = audusd_sim();
+    let inst_id = instrument.id;
+
+    let sub = SubscribeCommand::FundingRates(SubscribeFundingRates::new(
+        inst_id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+    adapter.execute_subscribe(&sub);
+    assert!(adapter.subscriptions_funding_rates.contains(&inst_id));
+
+    // Idempotency check
+    adapter.execute_subscribe(&sub);
+    assert_eq!(adapter.subscriptions_funding_rates.len(), 1);
+
+    let unsub = UnsubscribeCommand::FundingRates(UnsubscribeFundingRates::new(
+        inst_id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+    adapter.execute_unsubscribe(&unsub);
+    assert!(!adapter.subscriptions_funding_rates.contains(&inst_id));
 }
 
 #[rstest]
@@ -1263,6 +1305,66 @@ fn test_index_prices_unsubscribe_idempotent(
 }
 
 #[rstest]
+fn test_funding_rates_unsubscribe_noop(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
+    let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
+
+    let inst_id = audusd_sim().id;
+    let unsub = UnsubscribeCommand::FundingRates(UnsubscribeFundingRates::new(
+        inst_id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+    adapter.execute_unsubscribe(&unsub);
+    assert!(!adapter.subscriptions_funding_rates.contains(&inst_id));
+}
+
+#[rstest]
+fn test_funding_rates_unsubscribe_idempotent(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
+    let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
+
+    let inst_id = audusd_sim().id;
+    let sub = SubscribeCommand::FundingRates(SubscribeFundingRates::new(
+        inst_id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+    adapter.execute_subscribe(&sub);
+    assert!(adapter.subscriptions_funding_rates.contains(&inst_id));
+
+    let unsub = UnsubscribeCommand::FundingRates(UnsubscribeFundingRates::new(
+        inst_id,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+    adapter.execute_unsubscribe(&unsub);
+    assert!(!adapter.subscriptions_funding_rates.contains(&inst_id));
+
+    adapter.execute_unsubscribe(&unsub);
+    assert!(!adapter.subscriptions_funding_rates.contains(&inst_id));
+}
+
+#[rstest]
 fn test_instrument_status_unsubscribe_noop(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
@@ -1397,6 +1499,9 @@ fn test_request_data(
     let req = RequestCustomData {
         client_id,
         data_type,
+        start: None,
+        end: None,
+        limit: None,
         request_id: UUID4::new(),
         ts_init: UnixNanos::default(),
         params: None,
@@ -1676,7 +1781,8 @@ fn test_defi_pool_swaps_subscription(
     let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
-    let instrument_id = InstrumentId::from("WETH/USDT-3000.UniswapV3:Arbitrum");
+    let instrument_id =
+        InstrumentId::from("0x11b815efB8f581194ae79006d24E0d814B7697F6.Arbitrum:UniswapV3");
 
     let sub = DefiSubscribeCommand::PoolSwaps(SubscribePoolSwaps {
         instrument_id,
@@ -1775,7 +1881,8 @@ fn test_defi_pool_swaps_unsubscribe_noop(
     let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
-    let instrument_id = InstrumentId::from("WETH/USDT-3000.UniswapV3:Arbitrum");
+    let instrument_id =
+        InstrumentId::from("0x11b815efB8f581194ae79006d24E0d814B7697F6.Arbitrum:UniswapV3");
 
     // Unsubscribe without prior subscribe should be no-op
     let unsub = DefiUnsubscribeCommand::PoolSwaps(UnsubscribePoolSwaps {
@@ -1801,7 +1908,8 @@ fn test_defi_pool_swaps_unsubscribe_idempotent(
     let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
-    let instrument_id = InstrumentId::from("WETH/USDT-3000.UniswapV3:Arbitrum");
+    let instrument_id =
+        InstrumentId::from("0x11b815efB8f581194ae79006d24E0d814B7697F6.Arbitrum:UniswapV3");
 
     // Subscribe then unsubscribe twice
     let sub = DefiSubscribeCommand::PoolSwaps(SubscribePoolSwaps {

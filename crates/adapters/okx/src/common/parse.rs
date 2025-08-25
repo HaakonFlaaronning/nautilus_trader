@@ -23,7 +23,8 @@ use nautilus_core::{
 use nautilus_model::{
     currencies::CURRENCY_MAP,
     data::{
-        Bar, BarSpecification, BarType, Data, IndexPriceUpdate, MarkPriceUpdate, TradeTick,
+        Bar, BarSpecification, BarType, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
+        TradeTick,
         bar::{
             BAR_SPEC_1_DAY_LAST, BAR_SPEC_1_HOUR_LAST, BAR_SPEC_1_MINUTE_LAST,
             BAR_SPEC_1_MONTH_LAST, BAR_SPEC_1_SECOND_LAST, BAR_SPEC_1_WEEK_LAST,
@@ -35,8 +36,8 @@ use nautilus_model::{
         },
     },
     enums::{
-        AccountType, AggressorSide, AssetClass, CurrencyType, LiquiditySide, OptionKind, OrderSide,
-        OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, AggregationSource, AggressorSide, AssetClass, CurrencyType, LiquiditySide,
+        OptionKind, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
@@ -56,12 +57,29 @@ use crate::{
         models::OKXInstrument,
     },
     http::models::{
-        OKXAccount, OKXCandlestick, OKXOrderHistory, OKXPosition, OKXTrade, OKXTransactionDetail,
+        OKXAccount, OKXCandlestick, OKXIndexTicker, OKXMarkPrice, OKXOrderHistory, OKXPosition,
+        OKXTrade, OKXTransactionDetail,
     },
-    websocket::enums::OKXWsChannel,
+    websocket::{enums::OKXWsChannel, messages::OKXFundingRateMsg},
 };
 
-/// Deserializes empty strings as None for optional fields.
+/// Deserializes an empty string into [`None`].
+///
+/// OKX frequently represents *null* string fields as an empty string (`""`).
+/// When such a payload is mapped onto `Option<String>` the default behaviour
+/// would yield `Some("")`, which is semantically different from the intended
+/// absence of a value.  Applying this helper via
+///
+/// ```rust
+/// #[serde(deserialize_with = "crate::common::parse::deserialize_empty_string_as_none")]
+/// pub cl_ord_id: Option<String>,
+/// ```
+///
+/// ensures that empty strings are normalised to `None` during deserialization.
+///
+/// # Errors
+///
+/// Returns an error if the JSON value cannot be deserialised into a string.
 pub fn deserialize_empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -70,7 +88,11 @@ where
     Ok(opt.filter(|s| !s.is_empty()))
 }
 
-/// Deserializes empty Ustr values as None for optional fields.
+/// Deserializes an empty [`Ustr`] into [`None`].
+///
+/// # Errors
+///
+/// Returns an error if the JSON value cannot be deserialised into a string.
 pub fn deserialize_empty_ustr_as_none<'de, D>(deserializer: D) -> Result<Option<Ustr>, D::Error>
 where
     D: Deserializer<'de>,
@@ -79,7 +101,11 @@ where
     Ok(opt.filter(|s| !s.is_empty()))
 }
 
-/// Deserializes string values to u64 integers.
+/// Deserializes a numeric string into a `u64`.
+///
+/// # Errors
+///
+/// Returns an error if the string cannot be parsed into a `u64`.
 pub fn deserialize_string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -92,7 +118,11 @@ where
     }
 }
 
-/// Deserializes optional string values to u64 integers.
+/// Deserializes an optional numeric string into `Option<u64>`.
+///
+/// # Errors
+///
+/// Returns an error under the same cases as [`deserialize_string_to_u64`].
 pub fn deserialize_optional_string_to_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -115,7 +145,12 @@ fn get_currency(code: &str) -> Currency {
         .unwrap_or(Currency::new(code, 8, 0, code, CurrencyType::Crypto))
 }
 
-/// Gets the OKX instrument type for the given instrument.
+/// Returns the [`OKXInstrumentType`] that corresponds to the supplied
+/// [`InstrumentAny`].
+///
+/// # Errors
+///
+/// Returns an error if the instrument variant is not supported by OKX.
 pub fn okx_instrument_type(instrument: &InstrumentAny) -> anyhow::Result<OKXInstrumentType> {
     match instrument {
         InstrumentAny::CurrencyPair(_) => Ok(OKXInstrumentType::Spot),
@@ -142,10 +177,19 @@ pub fn parse_client_order_id(value: &str) -> Option<ClientOrderId> {
     }
 }
 
+/// Converts a millisecond-based timestamp (as returned by OKX) into
+/// [`UnixNanos`].
+#[must_use]
 pub fn parse_millisecond_timestamp(timestamp_ms: u64) -> UnixNanos {
     UnixNanos::from(timestamp_ms * NANOSECONDS_IN_MILLISECOND)
 }
 
+/// Parses an RFC 3339 timestamp string into [`UnixNanos`].
+///
+/// # Errors
+///
+/// Returns an error if the string is not a valid RFC 3339 datetime or if the
+/// timestamp cannot be represented in nanoseconds.
 pub fn parse_rfc3339_timestamp(timestamp: &str) -> anyhow::Result<UnixNanos> {
     let dt = chrono::DateTime::parse_from_rfc3339(timestamp)?;
     let nanos = dt.timestamp_nanos_opt().ok_or_else(|| {
@@ -154,14 +198,35 @@ pub fn parse_rfc3339_timestamp(timestamp: &str) -> anyhow::Result<UnixNanos> {
     Ok(UnixNanos::from(nanos as u64))
 }
 
+/// Converts a textual price to a [`Price`] using the given precision.
+///
+/// # Errors
+///
+/// Returns an error if the string fails to parse into `f64` or if the number
+/// of decimal places exceeds `precision`.
 pub fn parse_price(value: &str, precision: u8) -> anyhow::Result<Price> {
     Price::new_checked(value.parse::<f64>()?, precision)
 }
 
+/// Converts a textual quantity to a [`Quantity`].
+///
+/// # Errors
+///
+/// Returns an error for the same reasons as [`parse_price`] – parsing failure or invalid
+/// precision.
 pub fn parse_quantity(value: &str, precision: u8) -> anyhow::Result<Quantity> {
     Quantity::new_checked(value.parse::<f64>()?, precision)
 }
 
+/// Converts a textual fee amount into a [`Money`] value.
+///
+/// OKX represents *charges* as positive numbers but they reduce the account
+/// balance, hence the value is negated.
+///
+/// # Errors
+///
+/// Returns an error if the fee cannot be parsed into `f64` or fails internal
+/// validation in [`Money::new_checked`].
 pub fn parse_fee(value: Option<&str>, currency: Currency) -> anyhow::Result<Money> {
     // OKX report positive fees with negative signs (i.e., fee charged)
     let fee_f64 = value.unwrap_or("0").parse::<f64>()?;
@@ -171,18 +236,18 @@ pub fn parse_fee(value: Option<&str>, currency: Currency) -> anyhow::Result<Mone
 /// Parses OKX side to Nautilus aggressor side.
 pub fn parse_aggressor_side(side: &Option<OKXSide>) -> AggressorSide {
     match side {
-        Some(OKXSide::Buy) => nautilus_model::enums::AggressorSide::Buyer,
-        Some(OKXSide::Sell) => nautilus_model::enums::AggressorSide::Seller,
-        None => nautilus_model::enums::AggressorSide::NoAggressor,
+        Some(OKXSide::Buy) => AggressorSide::Buyer,
+        Some(OKXSide::Sell) => AggressorSide::Seller,
+        None => AggressorSide::NoAggressor,
     }
 }
 
 /// Parses OKX execution type to Nautilus liquidity side.
 pub fn parse_execution_type(liquidity: &Option<OKXExecType>) -> LiquiditySide {
     match liquidity {
-        Some(OKXExecType::Maker) => nautilus_model::enums::LiquiditySide::Maker,
-        Some(OKXExecType::Taker) => nautilus_model::enums::LiquiditySide::Taker,
-        _ => nautilus_model::enums::LiquiditySide::NoLiquiditySide,
+        Some(OKXExecType::Maker) => LiquiditySide::Maker,
+        Some(OKXExecType::Taker) => LiquiditySide::Taker,
+        _ => LiquiditySide::NoLiquiditySide,
     }
 }
 
@@ -195,18 +260,14 @@ pub fn parse_position_side(current_qty: Option<i64>) -> PositionSide {
     }
 }
 
-/// Parses OKX side to Nautilus order side.
-pub fn parse_order_side(order_side: &Option<OKXSide>) -> OrderSide {
-    match order_side {
-        Some(OKXSide::Buy) => OrderSide::Buy,
-        Some(OKXSide::Sell) => OrderSide::Sell,
-        None => OrderSide::NoOrderSide,
-    }
-}
-
 /// Parses an OKX mark price record into a Nautilus [`MarkPriceUpdate`].
+///
+/// # Errors
+///
+/// Returns an error if `raw.mark_px` cannot be parsed into a [`Price`] with
+/// the specified precision.
 pub fn parse_mark_price_update(
-    raw: &crate::http::models::OKXMarkPrice,
+    raw: &OKXMarkPrice,
     instrument_id: InstrumentId,
     price_precision: u8,
     ts_init: UnixNanos,
@@ -222,8 +283,13 @@ pub fn parse_mark_price_update(
 }
 
 /// Parses an OKX index ticker record into a Nautilus [`IndexPriceUpdate`].
+///
+/// # Errors
+///
+/// Returns an error if `raw.idx_px` cannot be parsed into a [`Price`] with the
+/// specified precision.
 pub fn parse_index_price_update(
-    raw: &crate::http::models::OKXIndexTicker,
+    raw: &OKXIndexTicker,
     instrument_id: InstrumentId,
     price_precision: u8,
     ts_init: UnixNanos,
@@ -238,7 +304,42 @@ pub fn parse_index_price_update(
     ))
 }
 
+/// Parses an [`OKXFundingRateMsg`] into a [`FundingRateUpdate`].
+///
+/// # Errors
+///
+/// Returns an error if the `funding_rate` or `next_funding_rate` fields fail
+/// to parse into Decimal values.
+pub fn parse_funding_rate_msg(
+    msg: &OKXFundingRateMsg,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FundingRateUpdate> {
+    let funding_rate = msg
+        .funding_rate
+        .as_str()
+        .parse::<Decimal>()
+        .map_err(|e| anyhow::anyhow!("Invalid funding_rate value: {e}"))?
+        .normalize();
+
+    let funding_time = Some(parse_millisecond_timestamp(msg.funding_time));
+    let ts_event = parse_millisecond_timestamp(msg.ts);
+
+    Ok(FundingRateUpdate::new(
+        instrument_id,
+        funding_rate,
+        funding_time,
+        ts_event,
+        ts_init,
+    ))
+}
+
 /// Parses an OKX trade record into a Nautilus [`TradeTick`].
+///
+/// # Errors
+///
+/// Returns an error if the price or quantity strings cannot be parsed, or if
+/// [`TradeTick::new_checked`] validation fails.
 pub fn parse_trade_tick(
     raw: &OKXTrade,
     instrument_id: InstrumentId,
@@ -246,11 +347,10 @@ pub fn parse_trade_tick(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<TradeTick> {
-    // Parse event timestamp
     let ts_event = parse_millisecond_timestamp(raw.ts);
     let price = parse_price(&raw.px, price_precision)?;
     let size = parse_quantity(&raw.sz, size_precision)?;
-    let aggressor = AggressorSide::from(raw.side.clone());
+    let aggressor: AggressorSide = raw.side.into();
     let trade_id = TradeId::new(raw.trade_id);
 
     TradeTick::new_checked(
@@ -265,6 +365,11 @@ pub fn parse_trade_tick(
 }
 
 /// Parses an OKX historical candlestick record into a Nautilus [`Bar`].
+///
+/// # Errors
+///
+/// Returns an error if any of the price or volume strings cannot be parsed or
+/// if [`Bar::new`] validation fails.
 pub fn parse_candlestick(
     raw: &OKXCandlestick,
     bar_type: BarType,
@@ -287,7 +392,7 @@ pub fn parse_candlestick(
 /// Parses an OKX order history record into a Nautilus [`OrderStatusReport`].
 #[allow(clippy::too_many_lines)]
 pub fn parse_order_status_report(
-    order: OKXOrderHistory,
+    order: &OKXOrderHistory,
     account_id: AccountId,
     instrument_id: InstrumentId,
     price_precision: u8,
@@ -359,15 +464,15 @@ pub fn parse_order_status_report(
     );
 
     // Optional fields
-    if !order.px.is_empty() {
-        if let Ok(p) = order.px.parse::<f64>() {
-            report = report.with_price(Price::new(p, price_precision));
-        }
+    if !order.px.is_empty()
+        && let Ok(p) = order.px.parse::<f64>()
+    {
+        report = report.with_price(Price::new(p, price_precision));
     }
-    if !order.avg_px.is_empty() {
-        if let Ok(avg) = order.avg_px.parse::<f64>() {
-            report = report.with_avg_px(avg);
-        }
+    if !order.avg_px.is_empty()
+        && let Ok(avg) = order.avg_px.parse::<f64>()
+    {
+        report = report.with_avg_px(avg);
     }
     if order.ord_type == "post_only" {
         report = report.with_post_only(true);
@@ -396,8 +501,7 @@ pub fn parse_position_status_report(
         .unwrap_or_default();
     let venue_position_id = None; // TODO: Only support netting for now
     // let venue_position_id = Some(PositionId::new(position.pos_id));
-    // TODO: Standardize timestamp parsing (deserialize model fields)
-    let ts_last = UnixNanos::from(position.u_time * NANOSECONDS_IN_MILLISECOND);
+    let ts_last = parse_millisecond_timestamp(position.u_time);
 
     PositionStatusReport::new(
         account_id,
@@ -431,12 +535,12 @@ pub fn parse_fill_report(
     };
     let venue_order_id = VenueOrderId::new(detail.ord_id);
     let trade_id = TradeId::new(detail.trade_id);
-    let order_side = parse_order_side(&Some(detail.side.clone()));
+    let order_side: OrderSide = detail.side.into();
     let last_px = parse_price(&detail.fill_px, price_precision)?;
     let last_qty = parse_quantity(&detail.fill_sz, size_precision)?;
     let fee_f64 = detail.fee.as_deref().unwrap_or("0").parse::<f64>()?;
     let commission = Money::new(-fee_f64, Currency::from(&detail.fee_ccy));
-    let liquidity_side: LiquiditySide = LiquiditySide::from(detail.exec_type.clone());
+    let liquidity_side: LiquiditySide = detail.exec_type.into();
     let ts_event = parse_millisecond_timestamp(detail.ts);
 
     Ok(FillReport::new(
@@ -591,6 +695,20 @@ pub fn okx_timeframe_as_bar_spec(timeframe: &str) -> anyhow::Result<BarSpecifica
         _ => anyhow::bail!("Invalid timeframe for `BarSpecification`, was {timeframe}"),
     };
     Ok(bar_spec)
+}
+
+/// Constructs a properly formatted BarType from OKX instrument ID and timeframe string.
+/// This ensures the BarType uses canonical Nautilus format instead of raw OKX strings.
+pub fn okx_bar_type_from_timeframe(
+    instrument_id: InstrumentId,
+    timeframe: &str,
+) -> anyhow::Result<BarType> {
+    let bar_spec = okx_timeframe_as_bar_spec(timeframe)?;
+    Ok(BarType::new(
+        instrument_id,
+        bar_spec,
+        AggregationSource::External,
+    ))
 }
 
 /// Converts OKX WebSocket channel to bar specification if it's a candle channel.
@@ -985,7 +1103,7 @@ pub fn parse_option_instrument(
     let asset_class = AssetClass::Cryptocurrency;
     let exchange = Some(Ustr::from("OKX"));
     let underlying = Ustr::from(&definition.uly);
-    let option_kind: OptionKind = definition.opt_type.clone().into();
+    let option_kind: OptionKind = definition.opt_type.into();
     let strike_price = Price::from(&definition.stk);
     let currency = definition
         .uly
@@ -1081,6 +1199,7 @@ pub fn parse_account_state(
 ////////////////////////////////////////////////////////////////////////////////
 // Tests
 ////////////////////////////////////////////////////////////////////////////////
+
 #[cfg(test)]
 mod tests {
     use nautilus_model::{
@@ -1257,7 +1376,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
         let order_report = parse_order_status_report(
-            okx_order,
+            &okx_order,
             account_id,
             instrument_id,
             2,
@@ -1470,13 +1589,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_order_side() {
-        assert_eq!(parse_order_side(&Some(OKXSide::Buy)), OrderSide::Buy);
-        assert_eq!(parse_order_side(&Some(OKXSide::Sell)), OrderSide::Sell);
-        assert_eq!(parse_order_side(&None), OrderSide::NoOrderSide);
-    }
-
-    #[rstest]
     fn test_parse_client_order_id() {
         let valid_id = "client_order_123";
         let result = parse_client_order_id(valid_id);
@@ -1558,5 +1670,38 @@ mod tests {
         assert_eq!(fill_report.last_px, Price::from("42219.50"));
         assert_eq!(fill_report.last_qty, Quantity::from("0.00100000"));
         assert_eq!(fill_report.liquidity_side, LiquiditySide::Taker);
+    }
+
+    #[test]
+    fn test_bar_type_identity_preserved_through_parse() {
+        use std::str::FromStr;
+
+        use crate::http::models::OKXCandlestick;
+
+        // Create a BarType
+        let bar_type = BarType::from_str("ETH-USDT-SWAP.OKX-1-MINUTE-LAST-EXTERNAL").unwrap();
+
+        // Create sample candlestick data
+        let raw_candlestick = OKXCandlestick(
+            "1721807460000".to_string(), // timestamp
+            "3177.9".to_string(),        // open
+            "3177.9".to_string(),        // high
+            "3177.7".to_string(),        // low
+            "3177.8".to_string(),        // close
+            "18.603".to_string(),        // volume
+            "59054.8231".to_string(),    // turnover
+            "18.603".to_string(),        // base_volume
+            "1".to_string(),             // count
+        );
+
+        // Parse the candlestick
+        let bar =
+            parse_candlestick(&raw_candlestick, bar_type, 1, 3, UnixNanos::default()).unwrap();
+
+        // Verify that the BarType is preserved exactly
+        assert_eq!(
+            bar.bar_type, bar_type,
+            "BarType must be preserved exactly through parsing"
+        );
     }
 }

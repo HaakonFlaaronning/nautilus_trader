@@ -20,21 +20,22 @@ use std::{
 };
 
 use nautilus_blockchain::{
-    config::BlockchainDataClientConfig, factories::BlockchainDataClientFactory,
+    config::{BlockchainDataClientConfig, DexPoolFilters},
+    factories::BlockchainDataClientFactory,
 };
 use nautilus_common::{
     actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
     enums::{Environment, LogColor},
     logging::log_info,
+    runtime::get_runtime,
 };
 use nautilus_core::env::get_env_var;
 use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    defi::{Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap, chain::chains},
+    defi::{Block, Blockchain, DexType, Pool, PoolLiquidityUpdate, PoolSwap, chain::chains},
     identifiers::{ClientId, InstrumentId, TraderId},
 };
-
 // Requires capnp installed on the machine
 // Run with `cargo run -p nautilus-blockchain --bin node_test --features hypersync`
 // To see additional tracing logs `export RUST_LOG=debug,h2=off`
@@ -45,8 +46,7 @@ use nautilus_model::{
 // If you need production-ready actors, create them in a separate production module.
 // ================================================================================================
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
@@ -60,16 +60,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let from_block = Some(348_860_000_u64); // Arbitrum
     let from_block = None; // No sync
 
+    let dex_pool_filter = DexPoolFilters::new(Some(true));
+
     let client_factory = BlockchainDataClientFactory::new();
     let client_config = BlockchainDataClientConfig::new(
         Arc::new(chain.clone()),
-        vec!["Arbitrum:UniswapV3".to_string()],
+        vec![DexType::UniswapV3],
         http_rpc_url,
         None, // RPC requests per second
         Some(wss_rpc_url),
         true, // Use HyperSync for live data
         // Some(from_block), // from_block
         from_block,
+        Some(dex_pool_filter),
         Some(PostgresConnectOptions::default()),
     );
 
@@ -78,26 +81,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_save_state(false)
         .add_data_client(
             None, // Use factory name
-            client_factory,
-            client_config,
+            Box::new(client_factory),
+            Box::new(client_config),
         )?
         .build()?;
 
     // Create and register a blockchain subscriber actor
     let client_id = ClientId::new(format!("BLOCKCHAIN-{}", chain.name));
 
-    let pools = vec![
-        InstrumentId::from("WETH/USDC-3000.UniswapV3:Arbitrum"), // Arbitrum WETH/USDC 0.30% pool
-    ];
+    let pools = vec![InstrumentId::from(
+        "0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443.Arbitrum:UniswapV3",
+    )];
 
     let actor_config = BlockchainSubscriberActorConfig::new(client_id, chain.name, pools);
     let actor = BlockchainSubscriberActor::new(actor_config);
 
     node.add_actor(actor)?;
 
-    node.run().await?;
-
-    Ok(())
+    Ok(get_runtime().block_on(async move { node.run().await })?)
 }
 
 /// Configuration for the blockchain subscriber actor.
@@ -301,70 +302,5 @@ impl BlockchainSubscriberActor {
     #[must_use]
     pub const fn pool_liquidity_update_count(&self) -> usize {
         self.received_pool_liquidity_updates.len()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyo3::pymethods]
-impl BlockchainSubscriberActor {
-    /// Creates a new `BlockchainSubscriberActor` instance.
-    #[new]
-    fn py_new(config: BlockchainSubscriberActorConfig) -> Self {
-        Self::new(config)
-    }
-
-    /// Returns the number of blocks received by this actor.
-    const fn py_block_count(&self) -> usize {
-        self.block_count()
-    }
-
-    /// Returns the number of pools received by this actor.
-    const fn py_pool_count(&self) -> usize {
-        self.pool_count()
-    }
-
-    /// Returns the number of swaps received by this actor.
-    const fn py_pool_swap_count(&self) -> usize {
-        self.pool_swap_count()
-    }
-
-    /// Returns the number of liquidity updates received by this actor.
-    const fn py_pool_liquidity_update_count(&self) -> usize {
-        self.pool_liquidity_update_count()
-    }
-
-    /// Returns the received blocks.
-    #[getter]
-    fn received_blocks(&self) -> Vec<Block> {
-        self.received_blocks.clone()
-    }
-
-    /// Returns the received pool swaps.
-    #[getter]
-    fn received_pool_swaps(&self) -> Vec<PoolSwap> {
-        self.received_pool_swaps.clone()
-    }
-
-    /// Returns the received pool liquidity updates.
-    #[getter]
-    fn received_pool_liquidity_updates(&self) -> Vec<PoolLiquidityUpdate> {
-        self.received_pool_liquidity_updates.clone()
-    }
-
-    /// Returns the received pools.
-    #[getter]
-    fn received_pools(&self) -> Vec<Pool> {
-        self.received_pools.clone()
-    }
-
-    /// Returns a string representation of the actor.
-    fn __repr__(&self) -> String {
-        format!(
-            "BlockchainSubscriberActor(blocks={}, swaps={}, liquidity_updates={}, pools={})",
-            self.block_count(),
-            self.pool_swap_count(),
-            self.pool_liquidity_update_count(),
-            self.pool_count()
-        )
     }
 }

@@ -21,25 +21,30 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 cython-compat = []
+defi = [
+  "dep:nautilus-blockchain",
+  "nautilus-blockchain/python",
+]
 extension-module = [
-  "pyo3/extension-module",
+  "nautilus-bitmex/extension-module",
+  "nautilus-blockchain?/extension-module",
+  "nautilus-coinbase-intx/extension-module",
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
   "nautilus-cryptography/extension-module",
+  "nautilus-databento/extension-module",
   "nautilus-execution/extension-module",
   "nautilus-indicators/extension-module",
   "nautilus-infrastructure/extension-module",
+  "nautilus-live/extension-module",
   "nautilus-model/extension-module",
+  "nautilus-okx/extension-module",
   "nautilus-persistence/extension-module",
   "nautilus-serialization/extension-module",
+  "nautilus-tardis/extension-module",
   "nautilus-testkit/extension-module",
   "nautilus-trading/extension-module",
-  "nautilus-live/extension-module",
-  "nautilus-blockchain/extension-module",
-  "nautilus-coinbase-intx/extension-module",
-  "nautilus-databento/extension-module",
-  "nautilus-okx/extension-module",
-  "nautilus-tardis/extension-module",
+  "pyo3/extension-module",
 ]
 ffi = [
   "nautilus-common/ffi",
@@ -51,13 +56,9 @@ high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization/high-precision",
 ]
-defi = [
-  "nautilus-blockchain/defi",
-]
-redis = ["nautilus-infrastructure/redis"]
-postgres = ["nautilus-infrastructure/postgres"]
 hypersync = ["nautilus-blockchain/hypersync"]
-python = []
+postgres = ["nautilus-infrastructure/postgres"]
+redis = ["nautilus-infrastructure/redis"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -79,7 +80,8 @@ nautilus-testkit = { workspace = true, features = ["python"] }
 nautilus-trading = { workspace = true, features = ["python"] }
 
 # Adapters
-nautilus-blockchain = { workspace = true, features = ["python"] }
+nautilus-bitmex = { workspace = true, features = ["python"] }
+nautilus-blockchain = { workspace = true, features = ["python"], optional = true }
 nautilus-coinbase-intx = { workspace = true, features = ["python"] }
 nautilus-databento = { workspace = true, features = ["python"] }
 nautilus-hyperliquid = { workspace = true, features = ["python"] }

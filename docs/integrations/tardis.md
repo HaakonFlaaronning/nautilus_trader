@@ -81,13 +81,13 @@ The Tardis integration ensures seamless compatibility with NautilusTrader’s cr
 by consistently normalizing symbols. Typically, NautilusTrader uses the native exchange naming conventions
 provided by Tardis. However, for certain exchanges, raw symbols are adjusted to adhere to the Nautilus symbology normalization, as outlined below:
 
-### Common Rules
+### Common rules
 
 - All symbols are converted to uppercase.
 - Market type suffixes are appended with a hyphen for some exchanges (see [exchange-specific normalizations](#exchange-specific-normalizations)).
 - Original exchange symbols are preserved in the Nautilus instrument definitions `raw_symbol` field.
 
-### Exchange-Specific Normalizations
+### Exchange-specific normalizations
 
 - **Binance**: Nautilus appends the suffix `-PERP` to all perpetual symbols.
 - **Bybit**: Nautilus uses specific product category suffixes, including `-SPOT`, `-LINEAR`, `-INVERSE`, `-OPTION`.
@@ -155,7 +155,7 @@ The following environment variables are used by Tardis and NautilusTrader.
 - `TARDIS_API_KEY`: API key for NautilusTrader Tardis clients.
 - `TARDIS_MACHINE_WS_URL` (optional): WebSocket URL for the `TardisMachineClient` in NautilusTrader.
 - `TARDIS_BASE_URL` (optional): Base URL for the `TardisHttpClient` in NautilusTrader.
-- `NAUTILUS_CATALOG_PATH` (optional): Root directory for writing replay data in the Nautilus catalog.
+- `NAUTILUS_PATH` (optional): Parent directory containing the `catalog/` subdirectory for writing replay data in the Nautilus catalog format.
 
 ## Running Tardis Machine historical replays
 
@@ -179,10 +179,10 @@ You can request data for the first day of each month without an API key. For all
 :::
 
 This process is optimized for direct output to a Nautilus Parquet data catalog.
-Ensure that the `NAUTILUS_CATALOG_PATH` environment variable is set to the root `/catalog/` directory.
-Parquet files will then be organized under `/catalog/data/` in the expected subdirectories corresponding to data type and instrument.
+Ensure that the `NAUTILUS_PATH` environment variable is set to the parent directory containing the `catalog/` subdirectory.
+Parquet files will then be organized under `<NAUTILUS_PATH>/catalog/data/` in the expected subdirectories corresponding to data type and instrument.
 
-If no `output_path` is specified in the configuration file and the `NAUTILUS_CATALOG_PATH` environment variable is unset, the system will default to the current working directory.
+If no `output_path` is specified in the configuration file and the `NAUTILUS_PATH` environment variable is unset, the system will default to the current working directory.
 
 ### Procedure
 
@@ -205,7 +205,7 @@ Next, ensure you have a configuration JSON file available.
 |:--------------------|:------------------|:------------------------------------------------------------------------------------|:------------------------------------------------------------------------------------------------------|
 | `tardis_ws_url`     | string (optional) | The Tardis Machine WebSocket URL.                                                   | If `null` then will use the `TARDIS_MACHINE_WS_URL` env var.                                          |
 | `normalize_symbols` | bool (optional)   | If Nautilus [symbol normalization](#symbology-and-normalization) should be applied. | If `null` then will default to `true`.                                                                |
-| `output_path`       | string (optional) | The output directory path to write Nautilus Parquet data to.                        | If `null` then will use the `NAUTILUS_CATALOG_PATH` env var, otherwise the current working directory. |
+| `output_path`       | string (optional) | The output directory path to write Nautilus Parquet data to.                        | If `null` then will use the `NAUTILUS_PATH` env var, otherwise the current working directory. |
 | `options`           | JSON[]            | An array of [ReplayNormalizedRequestOptions](https://docs.tardis.dev/api/tardis-machine#replay-normalized-options) objects.                                                                 |
 
 An example configuration file, `example_config.json`, is available [here](https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/adapters/tardis/bin/example_config.json):

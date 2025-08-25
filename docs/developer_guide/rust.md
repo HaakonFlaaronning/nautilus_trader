@@ -258,6 +258,7 @@ For modules with feature flags, document them clearly:
 //!
 //! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `extension-module`: Builds as a Python extension module (used with `python`).
 //! - `stubs`: Enables type stubs for use in testing scenarios.
 ```
 
@@ -387,6 +388,7 @@ Use consistent test module structure with section separators:
 ////////////////////////////////////////////////////////////////////////////////
 // Tests
 ////////////////////////////////////////////////////////////////////////////////
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -426,6 +428,119 @@ fn test_sma_with_single_input()
 fn test_symbol_is_composite()
 ```
 
+## Rust-Python Memory Management
+
+When working with PyO3 bindings, it's critical to understand and avoid reference cycles between Rust's `Arc` reference counting and Python's garbage collector.
+This section documents best practices for handling Python objects in Rust callback-holding structures.
+
+### The Reference Cycle Problem
+
+**Problem**: Using `Arc<PyObject>` in callback-holding structs creates circular references:
+
+1. **Rust `Arc` holds Python objects** → increases Python reference count.
+2. **Python objects might reference Rust objects** → creates cycles.
+3. **Neither side can be garbage collected** → memory leak.
+
+**Example of problematic pattern**:
+
+```rust
+// AVOID: This creates reference cycles
+struct CallbackHolder {
+    handler: Option<Arc<PyObject>>,  // ❌ Arc wrapper causes cycles
+}
+```
+
+### The Solution: GIL-Based Cloning
+
+**Solution**: Use plain `PyObject` with proper GIL-based cloning via `clone_py_object()`:
+
+```rust
+use nautilus_core::python::clone_py_object;
+
+// CORRECT: Use plain PyObject without Arc wrapper
+struct CallbackHolder {
+    handler: Option<PyObject>,  // ✅ No Arc wrapper
+}
+
+// Manual Clone implementation using clone_py_object
+impl Clone for CallbackHolder {
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.as_ref().map(clone_py_object),
+        }
+    }
+}
+```
+
+### Best Practices
+
+#### 1. Use `clone_py_object()` for Python object cloning
+
+```rust
+// When cloning Python callbacks
+let cloned_callback = clone_py_object(&original_callback);
+
+// In manual Clone implementations
+self.py_handler.as_ref().map(clone_py_object)
+```
+
+#### 2. Remove `#[derive(Clone)]` from callback-holding structs
+
+```rust
+// BEFORE: Automatic derive causes issues with PyObject
+#[derive(Clone)]  // ❌ Remove this
+struct Config {
+    handler: Option<PyObject>,
+}
+
+// AFTER: Manual implementation with proper cloning
+struct Config {
+    handler: Option<PyObject>,
+}
+
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Self {
+            // Clone regular fields normally
+            url: self.url.clone(),
+            // Use clone_py_object for Python objects
+            handler: self.handler.as_ref().map(clone_py_object),
+        }
+    }
+}
+```
+
+#### 3. Update function signatures to accept `PyObject`
+
+```rust
+// BEFORE: Arc wrapper in function signatures
+fn spawn_task(handler: Arc<PyObject>) { ... }  // ❌
+
+// AFTER: Plain PyObject
+fn spawn_task(handler: PyObject) { ... }  // ✅
+```
+
+#### 4. Avoid `Arc::new()` when creating Python callbacks
+
+```rust
+// BEFORE: Wrapping in Arc
+let callback = Arc::new(py_function);  // ❌
+
+// AFTER: Use directly
+let callback = py_function;  // ✅
+```
+
+### Why this works
+
+The `clone_py_object()` function:
+
+- **Acquires the Python GIL** before performing clone operations.
+- **Uses Python's native reference counting** via `clone_ref()`.
+- **Avoids Rust Arc wrappers** that interfere with Python GC.
+- **Maintains thread safety** through proper GIL management.
+
+This approach allows both Rust and Python garbage collectors to work correctly, eliminating memory leaks from reference cycles.
+
 ## Unsafe Rust
 
 It will be necessary to write `unsafe` Rust code to be able to achieve the value
@@ -450,8 +565,17 @@ and covering the invariants which the function expects the callers to uphold, an
 ```rust
 // SAFETY: Message bus is not meant to be passed between threads
 #[allow(unsafe_code)]
+
 unsafe impl Send for MessageBus {}
 ```
+
+- **Crate-level lint** – every crate that exposes FFI symbols enables
+  `#![deny(unsafe_op_in_unsafe_fn)]`. Even inside an `unsafe fn`, each pointer dereference or
+  other dangerous operation must be wrapped in its own `unsafe { … }` block.
+
+- **CVec contract** – for raw vectors that cross the FFI boundary read the
+  [FFI Memory Contract](ffi.md). Foreign code becomes the owner of the allocation and **must**
+  call the matching `vec_drop_*` function exactly once.
 
 ## Tooling configuration
 
@@ -499,14 +623,14 @@ You can adjust this if needed.
 
 ### Step 2: Set Breakpoints
 
-- **Python breakpoints:** Set in VS Code in the Python source files
-- **Rust breakpoints:** Set in VS Code in the Rust source files
+- **Python breakpoints:** Set in VS Code in the Python source files.
+- **Rust breakpoints:** Set in VS Code in the Rust source files.
 
 ### Step 3: Start Mixed Debugging
 
-1. In VS Code: Select **"Debug Jupyter + Rust (Mixed)"** configuration
-2. Start debugging (F5) or press the right arrow green button
-3. Both Python and Rust debuggers will attach to your Jupyter session
+1. In VS Code: Select **"Debug Jupyter + Rust (Mixed)"** configuration.
+2. Start debugging (F5) or press the right arrow green button.
+3. Both Python and Rust debuggers will attach to your Jupyter session.
 
 ### Step 4: Execute Code
 
@@ -516,9 +640,9 @@ Run your Jupyter notebook cells that call rust functions. The debugger will stop
 
 `setup_debugging()` creates these VS Code configurations:
 
-- **`Debug Jupyter + Rust (Mixed)`** - Mixed debugging for Jupyter notebooks
-- **`Jupyter Mixed Debugging (Python)`** - Python-only debugging for notebooks
-- **`Rust Debugger (for jupyter debugging)`** - Rust-only debugging for notebooks
+- **`Debug Jupyter + Rust (Mixed)`** - Mixed debugging for Jupyter notebooks.
+- **`Jupyter Mixed Debugging (Python)`** - Python-only debugging for notebooks.
+- **`Rust Debugger (for jupyter debugging)`** - Rust-only debugging for notebooks.
 
 ### Example
 

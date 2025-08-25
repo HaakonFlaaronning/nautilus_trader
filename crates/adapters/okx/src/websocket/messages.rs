@@ -15,7 +15,7 @@
 
 use derive_builder::Builder;
 use nautilus_model::{
-    data::{Data, OrderBookDeltas},
+    data::{Data, FundingRateUpdate, OrderBookDeltas},
     events::{AccountState, OrderCancelRejected, OrderModifyRejected, OrderRejected},
     instruments::InstrumentAny,
     reports::{FillReport, OrderStatusReport},
@@ -39,6 +39,7 @@ use crate::{
 pub enum NautilusWsMessage {
     Data(Vec<Data>),
     Deltas(OrderBookDeltas),
+    FundingRates(Vec<FundingRateUpdate>),
     Instrument(Box<InstrumentAny>),
     AccountUpdate(AccountState),
     OrderRejected(OrderRejected),
@@ -257,13 +258,26 @@ pub struct OKXFundingRateMsg {
     /// Instrument ID.
     pub inst_id: Ustr,
     /// Current funding rate.
-    pub funding_rate: String,
+    pub funding_rate: Ustr,
     /// Predicted next funding rate.
-    pub next_funding_rate: String,
+    pub next_funding_rate: Ustr,
     /// Next funding time, Unix timestamp format in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub funding_time: u64,
     /// Message timestamp, Unix timestamp format in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub ts: u64,
+}
+
+/// Mark price data for perpetual swaps.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXMarkPriceMsg {
+    /// Instrument ID.
+    pub inst_id: Ustr,
+    /// Current mark price.
+    pub mark_px: String,
+    /// Timestamp of the data generation, Unix timestamp format in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub ts: u64,
 }
@@ -286,19 +300,6 @@ pub struct OKXIndexPriceMsg {
     pub sod_utc0: String,
     /// The opening price of the day (UTC 8).
     pub sod_utc8: String,
-    /// Timestamp of the data generation, Unix timestamp format in milliseconds.
-    #[serde(deserialize_with = "deserialize_string_to_u64")]
-    pub ts: u64,
-}
-
-/// Mark price data for perpetual swaps.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OKXMarkPriceMsg {
-    /// Instrument ID.
-    pub inst_id: Ustr,
-    /// Current mark price.
-    pub mark_px: String,
     /// Timestamp of the data generation, Unix timestamp format in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub ts: u64,
@@ -485,7 +486,7 @@ pub struct OKXOrderMsg {
     /// Order ID.
     pub ord_id: Ustr,
     /// Order type.
-    pub ord_type: String,
+    pub ord_type: OKXOrderType,
     /// Profit and loss.
     pub pnl: String,
     /// Position side.
@@ -553,6 +554,15 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tgt_ccy: Option<String>,
+    /// Order tag for categorization.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Order expiry time in milliseconds (for GTD orders).
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expTime")]
+    pub exp_time: Option<String>,
 }
 
 /// Parameters for WebSocket cancel order operation (instType not included).

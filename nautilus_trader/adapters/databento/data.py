@@ -60,6 +60,8 @@ from nautilus_trader.data.messages import UnsubscribeInstrumentStatus
 from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeTradeTicks
+from nautilus_trader.live.cancellation import DEFAULT_FUTURE_CANCELLATION_TIMEOUT
+from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import DataType
@@ -224,7 +226,10 @@ class DatabentoDataClient(LiveMarketDataClient):
             self._update_dataset_ranges_task.cancel()
             self._update_dataset_ranges_task = None
 
-        # Close all live clients
+        await self._close_live_clients()
+        await self._cancel_pending_futures()
+
+    async def _close_live_clients(self) -> None:
         for dataset, live_client in self._live_clients.items():
             if not live_client.is_running():
                 continue
@@ -239,10 +244,13 @@ class DatabentoDataClient(LiveMarketDataClient):
             self._log.info(f"Stopping {dataset} MBO/L3 live feed", LogColor.BLUE)
             live_client.close()
 
-        try:
-            await asyncio.gather(*self._live_client_futures)
-        except asyncio.CancelledError:
-            pass  # Expected
+    async def _cancel_pending_futures(self) -> None:
+        await cancel_tasks_with_timeout(
+            self._live_client_futures,
+            self._log,
+            timeout_secs=DEFAULT_FUTURE_CANCELLATION_TIMEOUT,
+        )
+        self._live_client_futures.clear()
 
     async def _update_dataset_ranges(self) -> None:
         while True:
@@ -280,6 +288,14 @@ class DatabentoDataClient(LiveMarketDataClient):
             await asyncio.gather(*coros)
         except asyncio.CancelledError:
             self._log.debug("Canceled task 'buffer_mbo_subscriptions'")
+
+    def _log_future_exception_callback(self, future: asyncio.Future) -> None:
+        if future.cancelled():
+            return  # Normal cancellation
+
+        exc = future.exception()
+        if exc:
+            self._log.error(f"Future raised: {exc}")
 
     def _get_live_client(self, dataset: Dataset) -> nautilus_pyo3.DatabentoLiveClient:
         # Retrieve or initialize the 'general' live client for the specified dataset
@@ -326,6 +342,7 @@ class DatabentoDataClient(LiveMarketDataClient):
                     callback_pyo3=self._handle_msg_pyo3,  # Imbalance and Statistics messages
                 ),
             )
+            future.add_done_callback(self._log_future_exception_callback)
             self._live_client_futures.add(future)
             self._has_subscribed[dataset] = True
             self._log.info(f"Started {dataset} live feed", LogColor.BLUE)
@@ -457,7 +474,7 @@ class DatabentoDataClient(LiveMarketDataClient):
     async def _subscribe_instrument(self, command: SubscribeInstrument) -> None:
         try:
             dataset: Dataset = self._loader.get_dataset_for_venue(command.instrument_id.venue)
-            start: int | None = command.params.get("start")
+            start: int | None = command.params.get("start_ns")
 
             live_client = self._get_live_client(dataset)
             live_client.subscribe(
@@ -585,6 +602,7 @@ class DatabentoDataClient(LiveMarketDataClient):
                     callback_pyo3=self._handle_msg_pyo3,  # Imbalance and Statistics messages
                 ),
             )
+            future.add_done_callback(self._log_future_exception_callback)
             self._live_client_futures.add(future)
         except asyncio.CancelledError:
             self._log.warning(
@@ -620,16 +638,21 @@ class DatabentoDataClient(LiveMarketDataClient):
         try:
             await self._ensure_subscribed_for_instrument(command.instrument_id)
 
-            # allowed schema values: mbp-1, bbo-1s, bbo-1m
+            # allowed schema values: mbp-1, bbo-1s, bbo-1m, cmbp-1, cbbo-1s, cbbo-1m, tbbo, tcbbo
             schema: str | None = command.params.get("schema")
             if schema is None or schema not in [
                 DatabentoSchema.MBP_1.value,
                 DatabentoSchema.BBO_1S.value,
                 DatabentoSchema.BBO_1M.value,
+                DatabentoSchema.CMBP_1.value,
+                DatabentoSchema.CBBO_1S.value,
+                DatabentoSchema.CBBO_1M.value,
+                DatabentoSchema.TBBO.value,
+                DatabentoSchema.TCBBO.value,
             ]:
                 schema = DatabentoSchema.MBP_1.value
 
-            start: int | None = command.params.get("start")
+            start: int | None = command.params.get("start_ns")
             dataset: Dataset = self._loader.get_dataset_for_venue(command.instrument_id.venue)
             live_client = self._get_live_client(dataset)
             live_client.subscribe(
@@ -652,11 +675,22 @@ class DatabentoDataClient(LiveMarketDataClient):
 
             await self._ensure_subscribed_for_instrument(command.instrument_id)
 
-            start: int | None = command.params.get("start")
+            # allowed schema values: trades, tbbo, tcbbo, mbp-1, cmbp-1
+            schema: str | None = command.params.get("schema")
+            if schema is None or schema not in [
+                DatabentoSchema.TRADES.value,
+                DatabentoSchema.TBBO.value,
+                DatabentoSchema.TCBBO.value,
+                DatabentoSchema.MBP_1.value,  # MBP-1 can also emit trades
+                DatabentoSchema.CMBP_1.value,  # CMBP-1 can also emit trades
+            ]:
+                schema = DatabentoSchema.TRADES.value
+
+            start: int | None = command.params.get("start_ns")
             dataset: Dataset = self._loader.get_dataset_for_venue(command.instrument_id.venue)
             live_client = self._get_live_client(dataset)
             live_client.subscribe(
-                schema=DatabentoSchema.TRADES.value,
+                schema=schema,
                 instrument_ids=[instrument_id_to_pyo3(command.instrument_id)],
                 start=start,
             )
@@ -676,7 +710,7 @@ class DatabentoDataClient(LiveMarketDataClient):
                 self._log.error(f"Cannot subscribe: {e}")
                 return
 
-            start: int | None = command.params.get("start")
+            start: int | None = command.params.get("start_ns")
             live_client = self._get_live_client(dataset)
             live_client.subscribe(
                 schema=schema.value,
@@ -802,6 +836,8 @@ class DatabentoDataClient(LiveMarketDataClient):
             data_type=data_type,
             data=status,
             correlation_id=correlation_id,
+            start=None,
+            end=None,
             params=None,
         )
 
@@ -839,6 +875,8 @@ class DatabentoDataClient(LiveMarketDataClient):
             data_type=data_type,
             data=pyo3_imbalances,
             correlation_id=correlation_id,
+            start=None,
+            end=None,
             params=None,
         )
 
@@ -876,6 +914,8 @@ class DatabentoDataClient(LiveMarketDataClient):
             data_type=data_type,
             data=pyo3_statistics,
             correlation_id=correlation_id,
+            start=None,
+            end=None,
             params=None,
         )
 
@@ -971,7 +1011,10 @@ class DatabentoDataClient(LiveMarketDataClient):
             end = available_end
 
         # NOTE: instruments are "published" every day at midnight
-        start = request.start or end - pd.Timedelta(days=1)
+        start = request.start
+
+        if start == end:
+            end += pd.Timedelta(1, "ns")
 
         if request.limit > 0:
             self._log.warning(
@@ -983,13 +1026,18 @@ class DatabentoDataClient(LiveMarketDataClient):
             LogColor.BLUE,
         )
 
-        # allowed schema values: mbp-1, bbo-1s, bbo-1m
+        # allowed schema values: mbp-1, bbo-1s, bbo-1m, cmbp-1, cbbo-1s, cbbo-1m, tbbo, tcbbo
         schema: str | None = request.params.get("schema")
 
         if schema is None or schema not in [
             DatabentoSchema.MBP_1.value,
             DatabentoSchema.BBO_1S.value,
             DatabentoSchema.BBO_1M.value,
+            DatabentoSchema.CMBP_1.value,
+            DatabentoSchema.CBBO_1S.value,
+            DatabentoSchema.CBBO_1M.value,
+            DatabentoSchema.TBBO.value,
+            DatabentoSchema.TCBBO.value,
         ]:
             schema = DatabentoSchema.MBP_1.value
 
@@ -1021,7 +1069,10 @@ class DatabentoDataClient(LiveMarketDataClient):
             end = available_end
 
         # NOTE: instruments are "published" every day at midnight
-        start = request.start or end - pd.Timedelta(days=1)
+        start = request.start
+
+        if start == end:
+            end += pd.Timedelta(1, "ns")
 
         if request.limit > 0:
             self._log.warning(
@@ -1060,7 +1111,10 @@ class DatabentoDataClient(LiveMarketDataClient):
             end = available_end
 
         # NOTE: instruments are "published" every day at midnight
-        start = request.start or end - pd.Timedelta(days=1)
+        start = request.start
+
+        if start == end:
+            end += pd.Timedelta(1, "ns")
 
         if request.limit > 0:
             self._log.warning(

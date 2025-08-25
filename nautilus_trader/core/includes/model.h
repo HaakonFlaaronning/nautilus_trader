@@ -87,7 +87,7 @@
  * which has approximately 15-17 significant decimal digits. Beyond 16 decimal places,
  * floating-point arithmetic becomes unreliable due to rounding errors.
  *
- * For higher precision values (such as 18-decimal WEI values in DeFi), specialized
+ * For higher precision values (such as 18-decimal wei values in DeFi), specialized
  * constructors that work with integer representations should be used instead.
  */
 #define MAX_FLOAT_PRECISION 16
@@ -1740,6 +1740,10 @@ typedef struct OrderRejected_t {
      * If the event was generated during reconciliation.
      */
     uint8_t reconciliation;
+    /**
+     * If the order was rejected because it was post-only and would execute immediately as a taker.
+     */
+    uint8_t due_post_only;
 } OrderRejected_t;
 
 /**
@@ -2669,7 +2673,8 @@ struct OrderRejected_t order_rejected_new(struct TraderId_t trader_id,
                                           UUID4_t event_id,
                                           uint64_t ts_event,
                                           uint64_t ts_init,
-                                          uint8_t reconciliation);
+                                          uint8_t reconciliation,
+                                          uint8_t due_post_only);
 
 /**
  * FFI wrapper for interned string statistics.

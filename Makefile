@@ -13,6 +13,19 @@ M = $(shell printf "$(BLUE)>$(RESET)") # Message prefix for commands
 # Verbose options for specific targets (defaults to true, can be overridden)
 VERBOSE ?= true
 
+# FAIL_FAST controls whether `cargo nextest` should stop after the first test
+# failure. When set to `true` the `--no-fail-fast` flag is omitted so tests
+# abort on the first failure. When `false` (the default) the flag is included
+# allowing the full test suite to run.
+FAIL_FAST ?= false
+
+# Select the appropriate flag for `cargo nextest` depending on FAIL_FAST.
+ifeq ($(FAIL_FAST),true)
+FAIL_FAST_FLAG :=
+else
+FAIL_FAST_FLAG := --no-fail-fast
+endif
+
 # > Colors
 RED    := $(shell tput -Txterm setaf 1)
 GREEN  := $(shell tput -Txterm setaf 2)
@@ -90,17 +103,18 @@ clean-builds:  #-- Clean distribution and target directories
 	$Q rm -rf dist target 2>/dev/null || true
 
 .PHONY: clean-build-artifacts
-clean-build-artifacts:  #-- Clean compiled artifacts (.so, .dll, .pyc files)
+clean-build-artifacts:  #-- Clean compiled artifacts (.so, .dll, .pyc, .c files)
 	@echo "Cleaning build artifacts..."
 	# Clean Rust build artifacts (keep final libraries)
 	find target -name "*.rlib" -delete 2>/dev/null || true
 	find target -name "*.rmeta" -delete 2>/dev/null || true
 	rm -rf target/*/build target/*/deps 2>/dev/null || true
 	# Clean Python build artifacts
-	rm -rf build/ 2>/dev/null || true
-	find . -type d -name "__pycache__" -not -path "./.venv*" -print0 | xargs -0 rm -rf
-	find . -type f -a \( -name "*.pyc" -o -name "*.pyo" \) -not -path "./.venv*" -print0 | xargs -0 rm -f
-	find . -type f -a \( -name "*.so" -o -name "*.dll" -o -name "*.dylib" \) -not -path "./.venv*" -print0 | xargs -0 rm -f
+	find . -type d -name "__pycache__" -not -path "./.venv*" -print0 | xargs -0 -r rm -rf
+	find . -type f -name "*.c" -not -path "./.venv*" -not -path "./target/*" -print0 | xargs -0 -r rm -f
+	find . -type f -a \( -name "*.pyc" -o -name "*.pyo" \) -not -path "./.venv*" -print0 | xargs -0 -r rm -f
+	find . -type f -a \( -name "*.so" -o -name "*.dll" -o -name "*.dylib" \) -not -path "./.venv*" -print0 | xargs -0 -r rm -f
+	rm -rf build/ cython_debug/ 2>/dev/null || true
 	# Clean test artifacts
 	rm -rf .coverage .benchmarks 2>/dev/null || true
 
@@ -220,10 +234,10 @@ cargo-test: check-nextest-installed
 cargo-test:  #-- Run all Rust tests with ffi,python,high-precision,defi features
 ifeq ($(VERBOSE),true)
 	$(info $(M) Running Rust tests with verbose output...)
-	cargo nextest run --workspace --features "ffi,python,high-precision,defi" --no-fail-fast --cargo-profile nextest --verbose
+	cargo nextest run --workspace --features "ffi,python,high-precision,defi" $(FAIL_FAST_FLAG) --cargo-profile nextest --verbose
 else
 	$(info $(M) Running Rust tests (showing summary and failures only)...)
-	cargo nextest run --workspace --features "ffi,python,high-precision,defi" --no-fail-fast --cargo-profile nextest --status-level fail --final-status-level flaky
+	cargo nextest run --workspace --features "ffi,python,high-precision,defi" $(FAIL_FAST_FLAG) --cargo-profile nextest --status-level fail --final-status-level flaky
 endif
 
 .PHONY: cargo-test-lib
@@ -231,21 +245,21 @@ cargo-test-lib: RUST_BACKTRACE=1
 cargo-test-lib: HIGH_PRECISION=true
 cargo-test-lib: check-nextest-installed
 cargo-test-lib:  #-- Run Rust library tests only with high precision
-	cargo nextest run --lib --workspace --no-default-features --features "ffi,python,high-precision,defi,stubs" --no-fail-fast --cargo-profile nextest
+	cargo nextest run --lib --workspace --no-default-features --features "ffi,python,high-precision,defi,stubs" $(FAIL_FAST_FLAG) --cargo-profile nextest
 
 .PHONY: cargo-test-standard-precision
 cargo-test-standard-precision: RUST_BACKTRACE=1
 cargo-test-standard-precision: HIGH_PRECISION=false
 cargo-test-standard-precision: check-nextest-installed
 cargo-test-standard-precision:  #-- Run Rust tests with standard precision (64-bit)
-	cargo nextest run --workspace --features "ffi,python" --no-fail-fast --cargo-profile nextest
+	cargo nextest run --workspace --features "ffi,python" $(FAIL_FAST_FLAG) --cargo-profile nextest
 
 .PHONY: cargo-test-debug
 cargo-test-debug: RUST_BACKTRACE=1
 cargo-test-debug: HIGH_PRECISION=true
 cargo-test-debug: check-nextest-installed
 cargo-test-debug:  #-- Run Rust tests in debug mode with high precision
-	cargo nextest run --workspace --features "ffi,python,high-precision,defi" --no-fail-fast
+	cargo nextest run --workspace --features "ffi,python,high-precision,defi" $(FAIL_FAST_FLAG)
 
 .PHONY: cargo-test-standard-precision-debug
 cargo-test-standard-precision-debug: RUST_BACKTRACE=1
@@ -278,21 +292,21 @@ cargo-test-crate-%: RUST_BACKTRACE=1
 cargo-test-crate-%: HIGH_PRECISION=true
 cargo-test-crate-%: check-nextest-installed
 cargo-test-crate-%:  #-- Run Rust tests for a specific crate (usage: make cargo-test-crate-<crate_name>)
-	cargo nextest run --lib --no-fail-fast --cargo-profile nextest -p $* $(if $(FEATURES),--features "$(FEATURES)")
+	cargo nextest run --lib $(FAIL_FAST_FLAG) --cargo-profile nextest -p $* $(if $(FEATURES),--features "$(FEATURES)")
 
 .PHONY: cargo-test-coverage-crate-%
 cargo-test-coverage-crate-%: RUST_BACKTRACE=1
 cargo-test-coverage-crate-%: HIGH_PRECISION=true
 cargo-test-coverage-crate-%: check-nextest-installed check-llvm-cov-installed
 cargo-test-coverage-crate-%:  #-- Run Rust tests with coverage reporting for a specific crate (usage: make cargo-test-coverage-crate-<crate_name>)
-	cargo llvm-cov nextest --lib --no-fail-fast --cargo-profile nextest -p $* $(if $(FEATURES),--features "$(FEATURES)")
+	cargo llvm-cov nextest --lib $(FAIL_FAST_FLAG) --cargo-profile nextest -p $* $(if $(FEATURES),--features "$(FEATURES)")
 
 #------------------------------------------------------------------------------
 # Benchmarks
 #------------------------------------------------------------------------------
 
 # List of crates whose criterion/iai benches run in the performance workflow
-CI_BENCH_CRATES := nautilus-core nautilus-model nautilus-common
+CI_BENCH_CRATES := nautilus-core nautilus-model nautilus-common nautilus-live
 
 # NOTE:
 # - We invoke `cargo bench` *once per crate* to avoid the well-known
@@ -363,14 +377,9 @@ init-db:  #-- Initialize PostgreSQL database schema
 #== Python Testing
 
 .PHONY: pytest
-pytest:  #-- Run Python tests with pytest
-ifeq ($(VERBOSE),true)
-	$(info $(M) Running Python tests with verbose output...)
-	uv run --active --no-sync pytest --new-first --failed-first -v -n logical --dist=loadgroup
-else
-	$(info $(M) Running Python tests (showing failures and summary only)...)
-	uv run --active --no-sync pytest --new-first --failed-first --tb=short -n logical --dist=loadgroup
-endif
+pytest:  #-- Run Python tests with pytest in parallel with immediate failure reporting
+	$(info $(M) Running Python tests in parallel with immediate failure reporting...)
+	uv run --active --no-sync pytest --new-first --failed-first --tb=line -n logical --dist=loadgroup --maxfail=50 --durations=0 --durations-min=10.0 $(if $(filter true,$(VERBOSE)),-v,)
 
 .PHONY: pytest-memory-tracking
 pytest-memory-tracking:  #-- Run Python tests with memory tracking enabled
@@ -394,7 +403,8 @@ help:  #-- Show this help message and exit
 	@printf "Nautilus Trader Makefile\n\n"
 	@printf "$(GREEN)Usage:$(RESET) make $(CYAN)<target>$(RESET)\n\n"
 	@printf "$(GRAY)Tips: Use $(CYAN)make <target> V=1$(GRAY) for verbose output$(RESET)\n"
-	@printf "$(GRAY)      Use $(CYAN)make <target> VERBOSE=false$(GRAY) to disable verbose output for build-debug, cargo-test, and pytest$(RESET)\n\n"
+	@printf "$(GRAY)      Use $(CYAN)make <target> VERBOSE=false$(GRAY) to disable verbose output for build-debug, cargo-test, and pytest$(RESET)\n"
+	@printf "$(GRAY)      Use $(CYAN)make pytest VERBOSE=true$(GRAY) to run tests with verbose output$(RESET)\n\n"
 
 	@printf "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣴⣶⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
 	@printf "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣾⣿⣿⣿⠀⢸⣿⣿⣿⣿⣶⣶⣤⣀⠀⠀⠀⠀⠀\n"

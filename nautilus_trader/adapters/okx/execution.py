@@ -17,7 +17,6 @@ import asyncio
 from typing import Any
 
 from nautilus_trader.adapters.okx.config import OKXExecClientConfig
-from nautilus_trader.adapters.okx.constants import OKX_SUPPORTED_ORDER_TYPES
 from nautilus_trader.adapters.okx.constants import OKX_VENUE
 from nautilus_trader.adapters.okx.providers import OKXInstrumentProvider
 from nautilus_trader.cache.cache import Cache
@@ -52,8 +51,10 @@ from nautilus_trader.model.events import OrderModifyRejected
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.functions import order_side_to_pyo3
 from nautilus_trader.model.functions import order_type_to_pyo3
+from nautilus_trader.model.functions import time_in_force_to_pyo3
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.orders import Order
 
 
@@ -170,6 +171,9 @@ class OKXExecutionClient(LiveExecutionClient):
             ),
         )
         self._ws_client_futures.add(future)
+
+        # Wait for connection to be established
+        await self._ws_client.wait_until_active(timeout_secs=10.0)
         self._log.info(f"Connected to {self._ws_client.url}", LogColor.BLUE)
         self._log.info(f"Private websocket API key {self._ws_client.api_key}", LogColor.BLUE)
         self._log.info("OKX API key authenticated", LogColor.GREEN)
@@ -191,21 +195,29 @@ class OKXExecutionClient(LiveExecutionClient):
         await self._ws_client.subscribe_account()
 
     async def _disconnect(self) -> None:
-        # Delay to allow websocket to send any unsubscribe messages
-        await asyncio.sleep(1.0)
-
-        # Shutdown websockets
-        if self._ws_client is not None and not self._ws_client.is_closed():
+        # Shutdown websocket
+        if not self._ws_client.is_closed():
             self._log.info("Disconnecting websocket")
-            close_result = self._ws_client.close()
-            if close_result is not None:
-                await close_result
+
+            await self._ws_client.close()
+
             self._log.info(f"Disconnected from {self._ws_client.url}", LogColor.BLUE)
 
-        # Cancel all client futures
+        # Cancel any pending futures
         for future in self._ws_client_futures:
             if not future.done():
                 future.cancel()
+
+        if self._ws_client_futures:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._ws_client_futures, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except TimeoutError:
+                self._log.warning("Timeout while waiting for websockets shutdown to complete")
+
+        self._ws_client_futures.clear()
 
     async def _cache_instruments(self) -> None:
         # Ensures instrument definitions are available for correct
@@ -548,17 +560,11 @@ class OKXExecutionClient(LiveExecutionClient):
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order
 
-        if order.order_type not in OKX_SUPPORTED_ORDER_TYPES:
-            self._log.error(
-                f"OKX does not support {order.order_type_string()} order types",
-            )
-            return
-
         if order.is_closed:
-            self._log.warning(f"Cannot submit already closed order, {order}")
+            self._log.warning(f"Cannot submit already closed order: {order}")
             return
 
-        # Generate order submitted event, to ensure correct ordering of event
+        # Generate OrderSubmitted event here to ensure correct event sequencing
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -580,6 +586,15 @@ class OKXExecutionClient(LiveExecutionClient):
             else None
         )
 
+        pyo3_time_in_force = (
+            time_in_force_to_pyo3(order.time_in_force) if order.time_in_force else None
+        )
+        pyo3_expire_time = (
+            order.expire_time_ns
+            if hasattr(order, "expire_time_ns") and order.expire_time_ns != 0
+            else None
+        )
+
         await self._ws_client.submit_order(
             trader_id=pyo3_trader_id,
             strategy_id=pyo3_strategy_id,
@@ -591,12 +606,17 @@ class OKXExecutionClient(LiveExecutionClient):
             quantity=pyo3_quantity,
             price=pyo3_price,
             trigger_price=pyo3_trigger_price,
+            time_in_force=pyo3_time_in_force,
+            expire_time_ns=pyo3_expire_time,
             post_only=order.is_post_only,
             reduce_only=order.is_reduce_only,
-            position_side=None,  # Will be determined by the Rust client
+            quote_quantity=order.is_quote_quantity,
         )
 
     # -- WEBSOCKET HANDLERS -----------------------------------------------------------------------
+
+    def _is_external_order(self, client_order_id: ClientOrderId) -> bool:
+        return not client_order_id or not self._cache.strategy_id_for_order(client_order_id)
 
     def _handle_msg(self, msg: Any) -> None:
         if isinstance(msg, nautilus_pyo3.OKXWebSocketError):
@@ -659,6 +679,10 @@ class OKXExecutionClient(LiveExecutionClient):
 
     def _handle_order_status_report_pyo3(self, msg: nautilus_pyo3.OrderStatusReport) -> None:
         report = OrderStatusReport.from_pyo3(msg)
+
+        if self._is_external_order(report.client_order_id):
+            self._send_order_status_report(report)
+            return
 
         order = self._cache.order(report.client_order_id)
         if order is None:
@@ -728,8 +752,9 @@ class OKXExecutionClient(LiveExecutionClient):
         Handle PyO3 FillReport (both fills channel and order status derived).
         """
         report = FillReport.from_pyo3(msg)
-        if report.client_order_id is None:
-            self._log.warning(f"No ClientOrderId to process {report}")
+
+        if self._is_external_order(report.client_order_id):
+            self._send_fill_report(report)
             return
 
         order = self._cache.order(report.client_order_id)

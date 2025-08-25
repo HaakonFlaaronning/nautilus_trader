@@ -16,21 +16,30 @@
 from decimal import Decimal
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
+cimport numpy as np
 from cpython.datetime cimport datetime
 from cpython.datetime cimport timedelta
 from libc.stdint cimport uint64_t
 
+from datetime import timedelta
+
 from nautilus_trader.core.datetime import unix_nanos_to_dt
+
+from nautilus_trader.cache.base cimport CacheFacade
 from nautilus_trader.common.component cimport Clock
+from nautilus_trader.common.component cimport Component
 from nautilus_trader.common.component cimport Logger
+from nautilus_trader.common.component cimport MessageBus
 from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.core.datetime cimport dt_to_unix_nanos
 from nautilus_trader.core.rust.core cimport millis_to_nanos
 from nautilus_trader.core.rust.core cimport secs_to_nanos
 from nautilus_trader.core.rust.model cimport FIXED_SCALAR
+from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.core.rust.model cimport QuantityRaw
 from nautilus_trader.model.data cimport Bar
 from nautilus_trader.model.data cimport BarAggregation
@@ -38,7 +47,10 @@ from nautilus_trader.model.data cimport BarType
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
 from nautilus_trader.model.functions cimport bar_aggregation_to_str
+from nautilus_trader.model.greeks cimport GreeksCalculator
+from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.instruments.base cimport Instrument
+from nautilus_trader.model.instruments.option_spread cimport OptionSpread
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 
@@ -738,8 +750,11 @@ cdef class TimeBarAggregator(BarAggregator):
         self._timestamp_on_close = timestamp_on_close
         self._skip_first_non_full_bar = skip_first_non_full_bar
         self._build_with_no_updates = build_with_no_updates
-        self._time_bars_origin_offset = time_bars_origin_offset
         self._bar_build_delay = bar_build_delay
+        self._time_bars_origin_offset = time_bars_origin_offset or 0
+
+        if type(self._time_bars_origin_offset) is int:
+            self._time_bars_origin_offset = pd.Timedelta(self._time_bars_origin_offset)
 
         self._timer_name = None
         self._build_on_next_tick = False
@@ -772,65 +787,15 @@ cdef class TimeBarAggregator(BarAggregator):
         aggregation = self.bar_type.spec.aggregation
 
         if aggregation == BarAggregation.MILLISECOND:
-            start_time = now.floor(freq="s")
-
-            if self._time_bars_origin_offset is not None:
-                start_time += self._time_bars_origin_offset
-
-            if now < start_time:
-                start_time -= pd.Timedelta(seconds=1)
-
-            while start_time <= now:
-                start_time += pd.Timedelta(milliseconds=step)
-
-            start_time -= pd.Timedelta(milliseconds=step)
+            start_time = find_closest_smaller_time(now, self._time_bars_origin_offset, pd.Timedelta(milliseconds=step))
         elif aggregation == BarAggregation.SECOND:
-            start_time = now.floor(freq="min")
-
-            if self._time_bars_origin_offset is not None:
-                start_time += self._time_bars_origin_offset
-
-            if now < start_time:
-                start_time -= pd.Timedelta(minutes=1)
-
-            while start_time <= now:
-                start_time += pd.Timedelta(seconds=step)
-
-            start_time -= pd.Timedelta(seconds=step)
+            start_time = find_closest_smaller_time(now, self._time_bars_origin_offset, pd.Timedelta(seconds=step))
         elif aggregation == BarAggregation.MINUTE:
-            start_time = now.floor(freq="h")
-
-            if self._time_bars_origin_offset is not None:
-                start_time += self._time_bars_origin_offset
-
-            if now < start_time:
-                start_time -= pd.Timedelta(hours=1)
-
-            while start_time <= now:
-                start_time += pd.Timedelta(minutes=step)
-
-            start_time -= pd.Timedelta(minutes=step)
+            start_time = find_closest_smaller_time(now, self._time_bars_origin_offset, pd.Timedelta(minutes=step))
         elif aggregation == BarAggregation.HOUR:
-            start_time = now.floor(freq="d")
-
-            if self._time_bars_origin_offset is not None:
-                start_time += self._time_bars_origin_offset
-
-            if now < start_time:
-                start_time -= pd.Timedelta(days=1)
-
-            while start_time <= now:
-                start_time += pd.Timedelta(hours=step)
-
-            start_time -= pd.Timedelta(hours=step)
+            start_time = find_closest_smaller_time(now, self._time_bars_origin_offset, pd.Timedelta(hours=step))
         elif aggregation == BarAggregation.DAY:
-            start_time = now.floor(freq="d")
-
-            if self._time_bars_origin_offset is not None:
-                start_time += self._time_bars_origin_offset
-
-            if now < start_time:
-                start_time -= pd.Timedelta(days=1)
+            start_time = find_closest_smaller_time(now, self._time_bars_origin_offset, pd.Timedelta(days=step))
         elif aggregation == BarAggregation.WEEK:
             start_time = (now - pd.Timedelta(days=now.dayofweek)).floor(freq="d")
 
@@ -1114,3 +1079,15 @@ cdef class TimeBarAggregator(BarAggregator):
             )
 
             self.next_close_ns = dt_to_unix_nanos(alert_time)
+
+
+def find_closest_smaller_time(now: pd.Timestamp, daily_time_origin: pd.Timedelta, period: pd.Timedelta) -> pd.Timestamp:
+    day_start = now.floor(freq="d")
+    base_time = day_start + daily_time_origin
+
+    time_difference = now - base_time
+    num_periods = time_difference // period
+
+    closest_time = base_time + num_periods * period
+
+    return closest_time

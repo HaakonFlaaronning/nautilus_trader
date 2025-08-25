@@ -15,7 +15,7 @@
 
 //! System-level components and orchestration for [NautilusTrader](http://nautilustrader.io).
 //!
-//! The *system* crate provides the core system architecture for orchestrating trading systems,
+//! The `nautilus-system` crate provides the core system architecture for orchestrating trading systems,
 //! including the kernel that manages all engines, configuration management,
 //! and system-level factories for creating components:
 //!
@@ -41,6 +41,7 @@
 //! or as part of a Rust only build.
 //!
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

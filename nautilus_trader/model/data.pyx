@@ -5770,3 +5770,184 @@ cdef class IndexPriceUpdate(Data):
             self.ts_event,
             self.ts_init,
         )
+
+
+cdef class FundingRateUpdate(Data):
+    """
+    Represents a funding rate update for a perpetual swap instrument.
+
+    Parameters
+    ----------
+    instrument_id : InstrumentId
+        The instrument ID for the funding rate.
+    rate : Decimal
+        The current funding rate.
+    next_funding_ns : int, optional
+        UNIX timestamp (nanoseconds) of the next funding payment (if available).
+    ts_event : int
+        UNIX timestamp (nanoseconds) when the update occurred.
+    ts_init : int
+        UNIX timestamp (nanoseconds) when the data object was initialized.
+
+    """
+
+    def __init__(
+        self,
+        InstrumentId instrument_id not None,
+        rate not None,
+        uint64_t ts_event,
+        uint64_t ts_init,
+        next_funding_ns = None,
+    ) -> None:
+        self.instrument_id = instrument_id
+        self.rate = rate
+        self.next_funding_ns = next_funding_ns
+        self._ts_event = ts_event
+        self._ts_init = ts_init
+
+    def __eq__(self, FundingRateUpdate other) -> bool:
+        return (
+            self.instrument_id == other.instrument_id
+            and self.rate == other.rate
+            and self.next_funding_ns == other.next_funding_ns
+        )
+
+    def __hash__(self) -> int:
+        return hash((
+            self.instrument_id,
+            self.rate,
+            self.next_funding_ns,
+        ))
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}("
+            f"instrument_id={self.instrument_id}, "
+            f"rate={self.rate}, "
+            f"next_funding_ns={self.next_funding_ns}, "
+            f"ts_event={self._ts_event}, "
+            f"ts_init={self._ts_init})"
+        )
+
+    @property
+    def ts_event(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the data event occurred.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._ts_event
+
+    @property
+    def ts_init(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the object was initialized.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._ts_init
+
+    @staticmethod
+    cdef FundingRateUpdate from_dict_c(dict values):
+        Condition.not_none(values, "values")
+        return FundingRateUpdate(
+            instrument_id=InstrumentId.from_str_c(values["instrument_id"]),
+            rate=values["rate"],
+            ts_event=values["ts_event"],
+            ts_init=values["ts_init"],
+            next_funding_ns=values.get("next_funding_ns"),
+        )
+
+    @staticmethod
+    cdef dict to_dict_c(FundingRateUpdate obj):
+        Condition.not_none(obj, "obj")
+        result = {
+            "type": type(obj).__name__,
+            "instrument_id": str(obj.instrument_id),
+            "rate": obj.rate,
+            "ts_event": obj.ts_event,
+            "ts_init": obj.ts_init,
+        }
+        if obj.next_funding_ns is not None:
+            result["next_funding_ns"] = obj.next_funding_ns
+        return result
+
+    @staticmethod
+    def from_dict(dict values) -> FundingRateUpdate:
+        """
+        Return a funding rate update from the given dict values.
+
+        Parameters
+        ----------
+        values : dict[str, object]
+            The values for initialization.
+
+        Returns
+        -------
+        FundingRateUpdate
+
+        """
+        return FundingRateUpdate.from_dict_c(values)
+
+    @staticmethod
+    def to_dict(FundingRateUpdate obj) -> dict[str, object]:
+        """
+        Return a dictionary representation of this object.
+
+        Returns
+        -------
+        dict[str, object]
+
+        """
+        return FundingRateUpdate.to_dict_c(obj)
+
+    @staticmethod
+    def from_pyo3_list(list pyo3_funding_rates) -> list[FundingRateUpdate]:
+        """
+        Return legacy Cython funding rate updates converted from the given pyo3 Rust objects.
+
+        Parameters
+        ----------
+        pyo3_funding_rates : list[nautilus_pyo3.FundingRateUpdate]
+            The pyo3 Rust funding rate updates to convert from.
+
+        Returns
+        -------
+        list[FundingRateUpdate]
+
+        """
+        cdef list[FundingRateUpdate] output = []
+
+        for pyo3_funding_rate in pyo3_funding_rates:
+            output.append(FundingRateUpdate.from_pyo3(pyo3_funding_rate))
+
+        return output
+
+    @staticmethod
+    def from_pyo3(pyo3_funding_rate) -> FundingRateUpdate:
+        """
+        Return a legacy Cython funding rate update converted from the given pyo3 Rust object.
+
+        Parameters
+        ----------
+        pyo3_funding_rate : nautilus_pyo3.FundingRateUpdate
+            The pyo3 Rust funding rate update to convert from.
+
+        Returns
+        -------
+        FundingRateUpdate
+
+        """
+        return FundingRateUpdate(
+            instrument_id=InstrumentId.from_str(pyo3_funding_rate.instrument_id.value),
+            rate=pyo3_funding_rate.rate,
+            next_funding_ns=pyo3_funding_rate.next_funding_ns,
+            ts_event=pyo3_funding_rate.ts_event,
+            ts_init=pyo3_funding_rate.ts_init,
+        )

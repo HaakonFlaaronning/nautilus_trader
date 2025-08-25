@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::{
     data::{BarType, Data, OrderBookDeltas_API},
-    enums::{OrderSide, OrderType, PositionSide},
+    enums::{OrderSide, OrderType, PositionSide, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     python::{
         data::data_to_pycapsule,
@@ -143,6 +143,22 @@ impl OKXWebSocketClient {
         self.is_closed()
     }
 
+    #[pyo3(name = "get_subscriptions")]
+    fn py_get_subscriptions(&self, instrument_id: InstrumentId) -> Vec<String> {
+        let channels = self.get_subscriptions(instrument_id);
+
+        // Convert to OKX channel names
+        channels
+            .iter()
+            .map(|c| {
+                serde_json::to_value(c)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| c.to_string())
+            })
+            .collect()
+    }
+
     #[pyo3(name = "connect")]
     fn py_connect<'py>(
         &mut self,
@@ -178,6 +194,11 @@ impl OKXWebSocketClient {
                             call_python(py, &callback, py_obj);
                         }
                     }),
+                    NautilusWsMessage::FundingRates(msg) => {
+                        for data in msg {
+                            call_python_with_data(&callback, |py| data.into_py_any(py));
+                        }
+                    }
                     NautilusWsMessage::OrderRejected(msg) => {
                         call_python_with_data(&callback, |py| msg.into_py_any(py))
                     }
@@ -220,15 +241,33 @@ impl OKXWebSocketClient {
         })
     }
 
+    #[pyo3(name = "wait_until_active")]
+    fn py_wait_until_active<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .wait_until_active(timeout_secs)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "close")]
-    fn py_close(&mut self) -> PyResult<()> {
-        get_runtime().block_on(async {
-            if let Err(e) = self.close().await {
+    fn py_close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.close().await {
                 log::error!("Error on close: {e}");
             }
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 
     #[pyo3(name = "subscribe_instruments")]
@@ -263,8 +302,8 @@ impl OKXWebSocketClient {
         })
     }
 
-    #[pyo3(name = "subscribe_order_book")]
-    fn py_subscribe_order_book<'py>(
+    #[pyo3(name = "subscribe_book")]
+    fn py_subscribe_book<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
@@ -272,8 +311,56 @@ impl OKXWebSocketClient {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Err(e) = client.subscribe_order_book(instrument_id).await {
+            if let Err(e) = client.subscribe_book(instrument_id).await {
                 log::error!("Failed to subscribe to order book: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "subscribe_book50_l2_tbt")]
+    fn py_subscribe_book50_l2_tbt<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_books50_l2_tbt(instrument_id).await {
+                log::error!("Failed to subscribe to books50_tbt: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "subscribe_book_l2_tbt")]
+    fn py_subscribe_book_l2_tbt<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_book_l2_tbt(instrument_id).await {
+                log::error!("Failed to subscribe to books_l2_tbt: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "subscribe_book_depth5")]
+    fn py_subscribe_book_depth5<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_book_depth5(instrument_id).await {
+                log::error!("Failed to subscribe to books5: {e}");
             }
             Ok(())
         })
@@ -328,8 +415,8 @@ impl OKXWebSocketClient {
         })
     }
 
-    #[pyo3(name = "unsubscribe_order_book")]
-    fn py_unsubscribe_order_book<'py>(
+    #[pyo3(name = "unsubscribe_book")]
+    fn py_unsubscribe_book<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
@@ -337,8 +424,56 @@ impl OKXWebSocketClient {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Err(e) = client.unsubscribe_order_book(instrument_id).await {
+            if let Err(e) = client.unsubscribe_book(instrument_id).await {
                 log::error!("Failed to unsubscribe from order book: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_book_depth5")]
+    fn py_unsubscribe_book_depth5<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_book_depth5(instrument_id).await {
+                log::error!("Failed to unsubscribe from books5: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_book50_l2_tbt")]
+    fn py_unsubscribe_book50_l2_tbt<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_book50_l2_tbt(instrument_id).await {
+                log::error!("Failed to unsubscribe from books50_l2_tbt: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_book_l2_tbt")]
+    fn py_unsubscribe_book_l2_tbt<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_book_l2_tbt(instrument_id).await {
+                log::error!("Failed to unsubscribe from books_l2_tbt: {e}");
             }
             Ok(())
         })
@@ -489,6 +624,38 @@ impl OKXWebSocketClient {
         })
     }
 
+    #[pyo3(name = "subscribe_funding_rates")]
+    fn py_subscribe_funding_rates<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_funding_rates(instrument_id).await {
+                log::error!("Failed to subscribe to funding rates: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_funding_rates")]
+    fn py_unsubscribe_funding_rates<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_funding_rates(instrument_id).await {
+                log::error!("Failed to unsubscribe from funding rates: {e}");
+            }
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "subscribe_orders")]
     fn py_subscribe_orders<'py>(
         &self,
@@ -588,11 +755,14 @@ impl OKXWebSocketClient {
         order_side,
         order_type,
         quantity,
+        time_in_force=None,
+        expire_time_ns=None,
         price=None,
         trigger_price=None,
         post_only=None,
         reduce_only=None,
-        position_side=None
+        quote_quantity=None,
+        position_side=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
@@ -606,10 +776,13 @@ impl OKXWebSocketClient {
         order_side: OrderSide,
         order_type: OrderType,
         quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        expire_time_ns: Option<u64>,
         price: Option<Price>,
         trigger_price: Option<Price>,
         post_only: Option<bool>,
         reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
         position_side: Option<PositionSide>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -625,10 +798,13 @@ impl OKXWebSocketClient {
                     order_side,
                     order_type,
                     quantity,
+                    time_in_force,
+                    expire_time_ns,
                     price,
                     trigger_price,
                     post_only,
                     reduce_only,
+                    quote_quantity,
                     position_side,
                 )
                 .await

@@ -15,7 +15,7 @@
 
 //! Greeks calculator for options and futures.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc};
 
 use anyhow;
 use derive_builder::Builder;
@@ -76,7 +76,7 @@ impl GreeksFilterCallback {
     }
 }
 
-impl std::fmt::Debug for GreeksFilterCallback {
+impl Debug for GreeksFilterCallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Function(_) => f.write_str("GreeksFilterCallback::Function"),
@@ -399,10 +399,8 @@ impl GreeksCalculator {
         let underlying_instrument_id = InstrumentId::from(underlying_str.as_str());
 
         // Use cached greeks if requested
-        if use_cached_greeks {
-            if let Some(cached_greeks) = cache.greeks(&instrument_id) {
-                greeks_data = Some(cached_greeks);
-            }
+        if use_cached_greeks && let Some(cached_greeks) = cache.greeks(&instrument_id) {
+            greeks_data = Some(cached_greeks);
         }
 
         if greeks_data.is_none() {
@@ -635,10 +633,10 @@ impl GreeksCalculator {
             );
 
             let mut beta = 1.0;
-            if let Some(weights) = beta_weights {
-                if let Some(&weight) = weights.get(&underlying_instrument_id) {
-                    beta = weight;
-                }
+            if let Some(weights) = beta_weights
+                && let Some(&weight) = weights.get(&underlying_instrument_id)
+            {
+                beta = weight;
             }
 
             if let Some(ref mut idx_price) = index_price {
@@ -668,11 +666,11 @@ impl GreeksCalculator {
         }
 
         // Apply time weighting to vega if vega_time_weight_base is provided
-        if let Some(time_base) = vega_time_weight_base {
-            if expiry_in_days > 0 {
-                let time_weight = (time_base as f64 / expiry_in_days as f64).sqrt();
-                vega *= time_weight;
-            }
+        if let Some(time_base) = vega_time_weight_base
+            && expiry_in_days > 0
+        {
+            let time_weight = (time_base as f64 / expiry_in_days as f64).sqrt();
+            vega *= time_weight;
         }
 
         (delta, gamma, vega)

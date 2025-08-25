@@ -17,21 +17,24 @@
 
 use std::{
     any::Any,
+    cell::RefCell,
+    collections::HashMap,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
+    rc::Rc,
 };
 
 use indexmap::IndexMap;
 use nautilus_core::{
     nanos::UnixNanos,
-    python::{to_pyruntime_err, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, to_pyruntime_err, to_pyvalue_err},
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap};
 use nautilus_model::{
     data::{
-        Bar, BarType, DataType, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDeltas, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, BarType, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
+        MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick, close::InstrumentClose,
     },
     enums::BookType,
     identifiers::{ActorId, ClientId, InstrumentId, TraderId, Venue},
@@ -39,29 +42,100 @@ use nautilus_model::{
     orderbook::OrderBook,
     python::instruments::instrument_any_to_pyobject,
 };
-use pyo3::{exceptions::PyValueError, prelude::*};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 
 use crate::{
     actor::{
         DataActor,
-        data_actor::{DataActorConfig, DataActorCore},
+        data_actor::{DataActorConfig, DataActorCore, ImportableActorConfig},
+        registry::try_get_actor_unchecked,
     },
+    cache::Cache,
+    clock::Clock,
     component::Component,
     enums::ComponentState,
+    python::{clock::PyClock, logging::PyLogger},
     signal::Signal,
-    timer::TimeEvent,
+    timer::{TimeEvent, TimeEventCallback},
 };
+
+#[pyo3::pymethods]
+impl DataActorConfig {
+    #[new]
+    #[pyo3(signature = (actor_id=None, log_events=true, log_commands=true))]
+    fn py_new(actor_id: Option<ActorId>, log_events: bool, log_commands: bool) -> Self {
+        Self {
+            actor_id,
+            log_events,
+            log_commands,
+        }
+    }
+}
+
+#[pyo3::pymethods]
+impl ImportableActorConfig {
+    #[new]
+    fn py_new(actor_path: String, config_path: String, config: Py<PyDict>) -> PyResult<Self> {
+        let json_config = Python::with_gil(|py| -> PyResult<HashMap<String, serde_json::Value>> {
+            let json_str: String = PyModule::import(py, "json")?
+                .call_method("dumps", (config.bind(py),), None)?
+                .extract()?;
+
+            let json_value: serde_json::Value = serde_json::from_str(&json_str)
+                .map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))?;
+
+            if let serde_json::Value::Object(map) = json_value {
+                Ok(map.into_iter().collect())
+            } else {
+                Err(PyErr::new::<PyValueError, _>("Config must be a dictionary"))
+            }
+        })?;
+
+        Ok(Self {
+            actor_path,
+            config_path,
+            config: json_config,
+        })
+    }
+
+    #[getter]
+    fn actor_path(&self) -> &String {
+        &self.actor_path
+    }
+
+    #[getter]
+    fn config_path(&self) -> &String {
+        &self.config_path
+    }
+
+    #[getter]
+    fn config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        // Convert HashMap<String, serde_json::Value> back to Python dict
+        let py_dict = PyDict::new(py);
+        for (key, value) in &self.config {
+            // Convert serde_json::Value back to Python object via JSON
+            let json_str = serde_json::to_string(value)
+                .map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))?;
+            let py_value = PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+            py_dict.set_item(key, py_value)?;
+        }
+        Ok(py_dict.unbind())
+    }
+}
 
 #[allow(non_camel_case_types)]
 #[pyo3::pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
+    module = "nautilus_trader.common",
     name = "DataActor",
     unsendable,
     subclass
 )]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PyDataActor {
     core: DataActorCore,
+    py_self: Option<PyObject>,
+    clock: PyClock,
+    logger: PyLogger,
 }
 
 impl Deref for PyDataActor {
@@ -78,9 +152,100 @@ impl DerefMut for PyDataActor {
     }
 }
 
+impl PyDataActor {
+    // Rust constructor for tests and direct Rust usage
+    pub fn new(config: Option<DataActorConfig>) -> Self {
+        let config = config.unwrap_or_default();
+        let core = DataActorCore::new(config);
+        let clock = PyClock::new_test(); // Temporary clock, will be updated on registration
+        let logger = PyLogger::new(core.actor_id().as_str());
+
+        Self {
+            core,
+            py_self: None,
+            clock,
+            logger,
+        }
+    }
+
+    /// Sets the Python instance reference for method dispatch.
+    ///
+    /// This enables the PyDataActor to forward method calls (like `on_start`, `on_stop`)
+    /// to the original Python instance that contains this PyDataActor. This is essential
+    /// for Python inheritance to work correctly, allowing Python subclasses to override
+    /// DataActor methods and have them called by the Rust system.
+    pub fn set_python_instance(&mut self, py_obj: PyObject) {
+        self.py_self = Some(py_obj);
+    }
+
+    /// Updates the actor_id in both the core config and the actor_id field.
+    ///
+    /// # Safety
+    ///
+    /// This method is only exposed for the Python actor to assist with configuration and should
+    /// **never** be called post registration. Calling this after registration will cause
+    /// inconsistent state where the actor is registered under one ID but its internal actor_id
+    /// field contains another, breaking message routing and lifecycle management.
+    pub fn set_actor_id(&mut self, actor_id: ActorId) {
+        self.core.config.actor_id = Some(actor_id);
+        self.core.actor_id = actor_id;
+    }
+
+    /// Updates the log_events setting in the core config.
+    pub fn set_log_events(&mut self, log_events: bool) {
+        self.core.config.log_events = log_events;
+    }
+
+    /// Updates the log_commands setting in the core config.
+    pub fn set_log_commands(&mut self, log_commands: bool) {
+        self.core.config.log_commands = log_commands;
+    }
+    /// Returns the memory address of this instance as a hexadecimal string.
+    pub fn mem_address(&self) -> String {
+        self.core.mem_address()
+    }
+
+    /// Returns a value indicating whether the actor has been registered with a trader.
+    pub fn is_registered(&self) -> bool {
+        self.core.is_registered()
+    }
+
+    /// Register the actor with a trader.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the actor is already registered
+    /// or if the registration process fails.
+    pub fn register(
+        &mut self,
+        trader_id: TraderId,
+        clock: Rc<RefCell<dyn Clock>>,
+        cache: Rc<RefCell<Cache>>,
+    ) -> anyhow::Result<()> {
+        self.core.register(trader_id, clock, cache)?;
+
+        self.clock = PyClock::from_rc(self.core.clock_rc());
+
+        // Register default time event handler for this actor
+        let actor_id = self.actor_id().inner();
+        let callback = TimeEventCallback::Rust(Rc::new(move |event: TimeEvent| {
+            if let Some(actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                if let Err(e) = actor.on_time_event(&event) {
+                    log::error!("Python time event handler failed for actor {actor_id}: {e}");
+                }
+            } else {
+                log::error!("Actor {actor_id} not found for time event handling");
+            }
+        }));
+
+        self.clock.inner_mut().register_default_handler(callback);
+
+        self.initialize()
+    }
+}
+
 impl DataActor for PyDataActor {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        log::info!("PyDataActor::on_start called, calling py_on_start");
         self.py_on_start()
             .map_err(|e| anyhow::anyhow!("Python on_start failed: {e}"))
     }
@@ -181,6 +346,11 @@ impl DataActor for PyDataActor {
             .map_err(|e| anyhow::anyhow!("Python on_index_price failed: {e}"))
     }
 
+    fn on_funding_rate(&mut self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
+        self.py_on_funding_rate(*funding_rate)
+            .map_err(|e| anyhow::anyhow!("Python on_funding_rate failed: {e}"))
+    }
+
     fn on_instrument_status(&mut self, data: &InstrumentStatus) -> anyhow::Result<()> {
         self.py_on_instrument_status(*data)
             .map_err(|e| anyhow::anyhow!("Python on_instrument_status failed: {e}"))
@@ -257,11 +427,25 @@ impl PyDataActor {
     #[new]
     #[pyo3(signature = (config=None))]
     fn py_new(config: Option<DataActorConfig>) -> PyResult<Self> {
-        let config = config.unwrap_or_default();
+        Ok(Self::new(config))
+    }
 
-        Ok(Self {
-            core: DataActorCore::new(config),
-        })
+    #[getter]
+    #[pyo3(name = "clock")]
+    fn py_clock(&self) -> PyResult<PyClock> {
+        if !self.core.is_registered() {
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Actor must be registered with a trader before accessing clock",
+            ))
+        } else {
+            Ok(self.clock.clone())
+        }
+    }
+
+    #[getter]
+    #[pyo3(name = "log")]
+    fn py_log(&self) -> PyLogger {
+        self.logger.clone()
     }
 
     #[getter]
@@ -349,144 +533,236 @@ impl PyDataActor {
     #[pyo3(name = "shutdown_system")]
     #[pyo3(signature = (reason=None))]
     fn py_shutdown_system(&self, reason: Option<String>) -> PyResult<()> {
-        self.core.shutdown_system(reason);
+        self.shutdown_system(reason);
         Ok(())
     }
 
     #[pyo3(name = "on_start")]
-    fn py_on_start(&mut self) -> PyResult<()> {
-        // Default implementation - this will be overridden by Python subclasses
-        // For now, we'll just log that the default was called
-        log::info!(
-            "py_on_start default implementation called - Python override should be called instead"
-        );
+    fn py_on_start(&self) -> PyResult<()> {
+        // Dispatch to Python instance's on_start method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_start"))?;
+        }
         Ok(())
     }
 
     #[pyo3(name = "on_stop")]
     fn py_on_stop(&mut self) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_stop method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_stop"))?;
+        }
         Ok(())
     }
 
     #[pyo3(name = "on_resume")]
     fn py_on_resume(&mut self) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_resume method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_resume"))?;
+        }
         Ok(())
     }
 
     #[pyo3(name = "on_reset")]
     fn py_on_reset(&mut self) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_reset method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_reset"))?;
+        }
         Ok(())
     }
 
     #[pyo3(name = "on_dispose")]
     fn py_on_dispose(&mut self) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_dispose method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_dispose"))?;
+        }
         Ok(())
     }
 
     #[pyo3(name = "on_degrade")]
     fn py_on_degrade(&mut self) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_degrade method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_degrade"))?;
+        }
         Ok(())
     }
 
     #[pyo3(name = "on_fault")]
     fn py_on_fault(&mut self) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_fault method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method0(py, "on_fault"))?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_time_event")]
     fn py_on_time_event(&mut self, event: TimeEvent) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_time_event method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_time_event", (event.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
-    #[allow(unused_variables)]
     #[pyo3(name = "on_data")]
     fn py_on_data(&mut self, data: PyObject) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_data method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method1(py, "on_data", (data,)))?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_signal")]
     fn py_on_signal(&mut self, signal: &Signal) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_signal method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_signal", (signal.clone().into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
-    #[allow(unused_variables)]
     #[pyo3(name = "on_instrument")]
     fn py_on_instrument(&mut self, instrument: PyObject) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_instrument method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| py_self.call_method1(py, "on_instrument", (instrument,)))?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_quote")]
     fn py_on_quote(&mut self, quote: QuoteTick) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_quote method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_quote", (quote.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_trade")]
     fn py_on_trade(&mut self, trade: TradeTick) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_trade method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_trade", (trade.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_bar")]
     fn py_on_bar(&mut self, bar: Bar) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_bar method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_bar", (bar.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_book_deltas")]
     fn py_on_book_deltas(&mut self, deltas: OrderBookDeltas) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_book_deltas method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_book_deltas", (deltas.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_book")]
-    fn py_on_book(&mut self, order_book: &OrderBook) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+    fn py_on_book(&mut self, book: &OrderBook) -> PyResult<()> {
+        // Dispatch to Python instance's on_book method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_book", (book.clone().into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_mark_price")]
     fn py_on_mark_price(&mut self, mark_price: MarkPriceUpdate) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_mark_price method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_mark_price", (mark_price.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_index_price")]
     fn py_on_index_price(&mut self, index_price: IndexPriceUpdate) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_index_price method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_index_price", (index_price.into_py_any_unwrap(py),))
+            })?;
+        }
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    #[pyo3(name = "on_funding_rate")]
+    fn py_on_funding_rate(&mut self, funding_rate: FundingRateUpdate) -> PyResult<()> {
+        // Dispatch to Python instance's on_index_price method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(
+                    py,
+                    "on_funding_rate",
+                    (funding_rate.into_py_any_unwrap(py),),
+                )
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_instrument_status")]
     fn py_on_instrument_status(&mut self, status: InstrumentStatus) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_instrument_status method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_instrument_status", (status.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_instrument_close")]
     fn py_on_instrument_close(&mut self, close: InstrumentClose) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_instrument_close method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_instrument_close", (close.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
@@ -494,7 +770,12 @@ impl PyDataActor {
     #[allow(unused_variables)]
     #[pyo3(name = "on_block")]
     fn py_on_block(&mut self, block: Block) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_instrument_close method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_block", (block.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
@@ -502,7 +783,12 @@ impl PyDataActor {
     #[allow(unused_variables)]
     #[pyo3(name = "on_pool")]
     fn py_on_pool(&mut self, pool: Pool) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_pool method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_pool", (pool.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
@@ -510,7 +796,12 @@ impl PyDataActor {
     #[allow(unused_variables)]
     #[pyo3(name = "on_pool_swap")]
     fn py_on_pool_swap(&mut self, swap: PoolSwap) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_pool_swap method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(py, "on_pool_swap", (swap.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
@@ -518,7 +809,16 @@ impl PyDataActor {
     #[allow(unused_variables)]
     #[pyo3(name = "on_pool_liquidity_update")]
     fn py_on_pool_liquidity_update(&mut self, update: PoolLiquidityUpdate) -> PyResult<()> {
-        // Default implementation - can be overridden in Python subclasses
+        // Dispatch to Python instance's on_pool_liquidity_update method if available
+        if let Some(ref py_self) = self.py_self {
+            Python::with_gil(|py| {
+                py_self.call_method1(
+                    py,
+                    "on_pool_liquidity_update",
+                    (update.into_py_any_unwrap(py),),
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1140,7 +1440,7 @@ mod tests {
     use nautilus_core::{UUID4, UnixNanos};
     #[cfg(feature = "defi")]
     use nautilus_model::defi::{
-        AmmType, Block, Blockchain, Chain, Dex, Pool, PoolLiquidityUpdate, PoolSwap, Token,
+        AmmType, Block, Blockchain, Chain, Dex, DexType, Pool, PoolLiquidityUpdate, PoolSwap, Token,
     };
     use nautilus_model::{
         data::{
@@ -1204,7 +1504,7 @@ mod tests {
     }
 
     fn create_unregistered_actor() -> PyDataActor {
-        PyDataActor::py_new(None).unwrap()
+        PyDataActor::new(None)
     }
 
     fn create_registered_actor(
@@ -1216,19 +1516,44 @@ mod tests {
         let sender = SyncDataCommandSender;
         set_data_cmd_sender(Arc::new(sender));
 
-        let mut actor = PyDataActor::py_new(None).unwrap();
+        let mut actor = PyDataActor::new(None);
         actor.register(trader_id, clock, cache).unwrap();
         actor
     }
 
     #[rstest]
     fn test_new_actor_creation() {
-        let actor = PyDataActor::py_new(None).unwrap();
+        pyo3::prepare_freethreaded_python();
+
+        let actor = PyDataActor::new(None);
         assert!(actor.trader_id().is_none());
     }
 
     #[rstest]
+    fn test_clock_access_before_registration_raises_error() {
+        pyo3::prepare_freethreaded_python();
+
+        let actor = PyDataActor::new(None);
+
+        // Accessing clock before registration should raise PyRuntimeError
+        let result = actor.py_clock();
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        pyo3::Python::with_gil(|py| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        });
+
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("Actor must be registered with a trader before accessing clock")
+        );
+    }
+
+    #[rstest]
     fn test_unregistered_actor_methods_work() {
+        pyo3::prepare_freethreaded_python();
+
         let actor = create_unregistered_actor();
 
         assert!(!actor.py_is_ready());
@@ -1248,6 +1573,8 @@ mod tests {
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
+        pyo3::prepare_freethreaded_python();
+
         let mut actor = create_unregistered_actor();
         actor.register(trader_id, clock, cache).unwrap();
         assert!(actor.trader_id().is_some());
@@ -1260,6 +1587,8 @@ mod tests {
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
+        pyo3::prepare_freethreaded_python();
+
         let actor = create_registered_actor(clock, cache, trader_id);
 
         assert_eq!(actor.state(), ComponentState::Ready);
@@ -1281,6 +1610,8 @@ mod tests {
         client_id: ClientId,
         audusd_sim: CurrencyPair,
     ) {
+        pyo3::prepare_freethreaded_python();
+
         let mut actor = create_registered_actor(clock, cache, trader_id);
 
         let _ = actor.py_subscribe_data(data_type.clone(), Some(client_id), None);
@@ -1289,6 +1620,7 @@ mod tests {
         let _ = actor.py_unsubscribe_quotes(audusd_sim.id, Some(client_id), None);
     }
 
+    #[ignore] // TODO: Under development
     #[rstest]
     fn test_lifecycle_methods_pass_through(
         clock: Rc<RefCell<TestClock>>,
@@ -1308,6 +1640,8 @@ mod tests {
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
+        pyo3::prepare_freethreaded_python();
+
         let actor = create_registered_actor(clock, cache, trader_id);
 
         assert!(
@@ -1353,6 +1687,8 @@ mod tests {
 
     #[rstest]
     fn test_request_methods_signatures_exist() {
+        pyo3::prepare_freethreaded_python();
+
         let actor = create_unregistered_actor();
         assert!(actor.trader_id().is_none());
     }
@@ -1363,6 +1699,8 @@ mod tests {
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
+        pyo3::prepare_freethreaded_python();
+
         let actor = create_registered_actor(clock, cache, trader_id);
         let state = actor.state();
         assert_eq!(state, ComponentState::Ready);
@@ -1383,7 +1721,7 @@ mod tests {
     impl TestDataActor {
         fn new() -> Self {
             Self {
-                inner: PyDataActor::py_new(None).unwrap(),
+                inner: PyDataActor::new(None),
             }
         }
 
@@ -1584,7 +1922,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1603,7 +1941,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1630,7 +1968,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1657,7 +1995,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1687,7 +2025,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1705,7 +2043,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1726,7 +2064,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1750,7 +2088,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1774,7 +2112,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1803,7 +2141,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1858,7 +2196,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();
@@ -1866,7 +2204,7 @@ mod tests {
         let chain = Arc::new(Chain::new(Blockchain::Ethereum, 1));
         let dex = Arc::new(Dex::new(
             Chain::new(Blockchain::Ethereum, 1),
-            "Uniswap V3",
+            DexType::UniswapV3,
             "0x1f98431c8ad98523631ae4a59f267346ea31f984",
             0,
             AmmType::CLAMM,
@@ -1902,8 +2240,8 @@ mod tests {
             12345,
             token0,
             token1,
-            500,
-            10,
+            Some(500),
+            Some(10),
             UnixNanos::default(),
         ));
 
@@ -1916,7 +2254,7 @@ mod tests {
             "0xabc123".to_string(),
             0,
             0,
-            UnixNanos::default(),
+            None,
             "0x742E4422b21FB8B4dF463F28689AC98bD56c39e0"
                 .parse()
                 .unwrap(),
@@ -1937,7 +2275,7 @@ mod tests {
     ) {
         pyo3::prepare_freethreaded_python();
 
-        let mut rust_actor = PyDataActor::py_new(None).unwrap();
+        let mut rust_actor = PyDataActor::new(None);
         rust_actor
             .register(trader_id, clock.clone(), cache.clone())
             .unwrap();

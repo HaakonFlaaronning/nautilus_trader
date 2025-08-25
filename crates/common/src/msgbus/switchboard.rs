@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::num::NonZeroUsize;
+
 use ahash::AHashMap;
 #[cfg(feature = "defi")]
 use nautilus_model::defi::Blockchain;
@@ -67,11 +69,14 @@ pub fn get_book_depth10_topic(instrument_id: InstrumentId) -> MStr<Topic> {
 }
 
 #[must_use]
-pub fn get_book_snapshots_topic(instrument_id: InstrumentId) -> MStr<Topic> {
+pub fn get_book_snapshots_topic(
+    instrument_id: InstrumentId,
+    interval_ms: NonZeroUsize,
+) -> MStr<Topic> {
     get_message_bus()
         .borrow_mut()
         .switchboard
-        .get_book_snapshots_topic(instrument_id)
+        .get_book_snapshots_topic(instrument_id, interval_ms)
 }
 
 #[must_use]
@@ -112,6 +117,14 @@ pub fn get_index_price_topic(instrument_id: InstrumentId) -> MStr<Topic> {
         .borrow_mut()
         .switchboard
         .get_index_price_topic(instrument_id)
+}
+
+#[must_use]
+pub fn get_funding_rate_topic(instrument_id: InstrumentId) -> MStr<Topic> {
+    get_message_bus()
+        .borrow_mut()
+        .switchboard
+        .get_funding_rate_topic(instrument_id)
 }
 
 #[must_use]
@@ -212,6 +225,7 @@ pub struct MessagingSwitchboard {
     bar_topics: AHashMap<BarType, MStr<Topic>>,
     mark_price_topics: AHashMap<InstrumentId, MStr<Topic>>,
     index_price_topics: AHashMap<InstrumentId, MStr<Topic>>,
+    funding_rate_topics: AHashMap<InstrumentId, MStr<Topic>>,
     instrument_status_topics: AHashMap<InstrumentId, MStr<Topic>>,
     instrument_close_topics: AHashMap<InstrumentId, MStr<Topic>>,
     event_orders_topics: AHashMap<StrategyId, MStr<Topic>>,
@@ -242,6 +256,7 @@ impl Default for MessagingSwitchboard {
             trade_topics: AHashMap::new(),
             mark_price_topics: AHashMap::new(),
             index_price_topics: AHashMap::new(),
+            funding_rate_topics: AHashMap::new(),
             bar_topics: AHashMap::new(),
             instrument_status_topics: AHashMap::new(),
             instrument_close_topics: AHashMap::new(),
@@ -351,14 +366,18 @@ impl MessagingSwitchboard {
     }
 
     #[must_use]
-    pub fn get_book_snapshots_topic(&mut self, instrument_id: InstrumentId) -> MStr<Topic> {
+    pub fn get_book_snapshots_topic(
+        &mut self,
+        instrument_id: InstrumentId,
+        interval_ms: NonZeroUsize,
+    ) -> MStr<Topic> {
         *self
             .book_snapshots_topics
             .entry(instrument_id)
             .or_insert_with(|| {
                 format!(
-                    "data.book.snapshots.{}.{}",
-                    instrument_id.venue, instrument_id.symbol
+                    "data.book.snapshots.{}.{}.{}",
+                    instrument_id.venue, instrument_id.symbol, interval_ms
                 )
                 .into()
             })
@@ -416,6 +435,19 @@ impl MessagingSwitchboard {
             .or_insert_with(|| {
                 format!(
                     "data.index_prices.{}.{}",
+                    instrument_id.venue, instrument_id.symbol
+                )
+                .into()
+            })
+    }
+
+    pub fn get_funding_rate_topic(&mut self, instrument_id: InstrumentId) -> MStr<Topic> {
+        *self
+            .funding_rate_topics
+            .entry(instrument_id)
+            .or_insert_with(|| {
+                format!(
+                    "data.funding_rates.{}.{}",
                     instrument_id.venue, instrument_id.symbol
                 )
                 .into()
@@ -589,8 +621,9 @@ mod tests {
         mut switchboard: MessagingSwitchboard,
         instrument_id: InstrumentId,
     ) {
-        let expected_topic = "data.book.snapshots.XCME.ESZ24".into();
-        let result = switchboard.get_book_snapshots_topic(instrument_id);
+        let expected_topic = "data.book.snapshots.XCME.ESZ24.1000".into();
+        let interval_ms = NonZeroUsize::new(1000).unwrap();
+        let result = switchboard.get_book_snapshots_topic(instrument_id, interval_ms);
         assert_eq!(result, expected_topic);
         assert!(
             switchboard

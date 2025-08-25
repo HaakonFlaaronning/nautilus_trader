@@ -48,8 +48,8 @@ use nautilus_model::defi::Pool;
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{
-        Bar, BarType, GreeksData, QuoteTick, TradeTick, YieldCurveData,
-        prices::{IndexPriceUpdate, MarkPriceUpdate},
+        Bar, BarType, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate, QuoteTick,
+        TradeTick, YieldCurveData,
     },
     enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType, TriggerType},
     identifiers::{
@@ -57,7 +57,10 @@ use nautilus_model::{
         OrderListId, PositionId, StrategyId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
-    orderbook::{OrderBook, own::OwnOrderBook},
+    orderbook::{
+        OrderBook,
+        own::{OwnOrderBook, should_handle_own_book_order},
+    },
     orders::{Order, OrderAny, OrderList},
     position::Position,
     types::{Currency, Money, Price, Quantity},
@@ -86,6 +89,7 @@ pub struct Cache {
     mark_xrates: AHashMap<(Currency, Currency), f64>,
     mark_prices: AHashMap<InstrumentId, VecDeque<MarkPriceUpdate>>,
     index_prices: AHashMap<InstrumentId, VecDeque<IndexPriceUpdate>>,
+    funding_rates: AHashMap<InstrumentId, FundingRateUpdate>,
     bars: AHashMap<BarType, VecDeque<Bar>>,
     greeks: AHashMap<InstrumentId, GreeksData>,
     yield_curves: AHashMap<String, YieldCurveData>,
@@ -158,6 +162,7 @@ impl Cache {
             mark_xrates: AHashMap::new(),
             mark_prices: AHashMap::new(),
             index_prices: AHashMap::new(),
+            funding_rates: AHashMap::new(),
             bars: AHashMap::new(),
             greeks: AHashMap::new(),
             yield_curves: AHashMap::new(),
@@ -402,10 +407,11 @@ impl Cache {
             }
 
             // 12: Build index.orders_emulated -> {ClientOrderId}
-            if let Some(emulation_trigger) = order.emulation_trigger() {
-                if emulation_trigger != TriggerType::NoTrigger && !order.is_closed() {
-                    self.index.orders_emulated.insert(*client_order_id);
-                }
+            if let Some(emulation_trigger) = order.emulation_trigger()
+                && emulation_trigger != TriggerType::NoTrigger
+                && !order.is_closed()
+            {
+                self.index.orders_emulated.insert(*client_order_id);
             }
 
             // 13: Build index.orders_inflight -> {ClientOrderId}
@@ -892,24 +898,23 @@ impl Cache {
         let buffer_ns = secs_to_nanos(buffer_secs as f64);
 
         'outer: for client_order_id in self.index.orders_closed.clone() {
-            if let Some(order) = self.orders.get(&client_order_id) {
-                if let Some(ts_closed) = order.ts_closed() {
-                    if ts_closed + buffer_ns <= ts_now {
-                        // Check any linked orders (contingency orders)
-                        if let Some(linked_order_ids) = order.linked_order_ids() {
-                            for linked_order_id in linked_order_ids {
-                                if let Some(linked_order) = self.orders.get(linked_order_id) {
-                                    if linked_order.is_open() {
-                                        // Do not purge if linked order still open
-                                        continue 'outer;
-                                    }
-                                }
-                            }
+            if let Some(order) = self.orders.get(&client_order_id)
+                && let Some(ts_closed) = order.ts_closed()
+                && ts_closed + buffer_ns <= ts_now
+            {
+                // Check any linked orders (contingency orders)
+                if let Some(linked_order_ids) = order.linked_order_ids() {
+                    for linked_order_id in linked_order_ids {
+                        if let Some(linked_order) = self.orders.get(linked_order_id)
+                            && linked_order.is_open()
+                        {
+                            // Do not purge if linked order still open
+                            continue 'outer;
                         }
-
-                        self.purge_order(client_order_id);
                     }
                 }
+
+                self.purge_order(client_order_id);
             }
         }
     }
@@ -928,12 +933,11 @@ impl Cache {
         let buffer_ns = secs_to_nanos(buffer_secs as f64);
 
         for position_id in self.index.positions_closed.clone() {
-            if let Some(position) = self.positions.get(&position_id) {
-                if let Some(ts_closed) = position.ts_closed {
-                    if ts_closed + buffer_ns <= ts_now {
-                        self.purge_position(position_id);
-                    }
-                }
+            if let Some(position) = self.positions.get(&position_id)
+                && let Some(ts_closed) = position.ts_closed
+                && ts_closed + buffer_ns <= ts_now
+            {
+                self.purge_position(position_id);
             }
         }
     }
@@ -943,10 +947,10 @@ impl Cache {
     /// All `OrderFilled` events for the order will also be purged from any associated position.
     pub fn purge_order(&mut self, client_order_id: ClientOrderId) {
         // Purge events from associated position if exists
-        if let Some(position_id) = self.index.order_position.get(&client_order_id) {
-            if let Some(position) = self.positions.get_mut(position_id) {
-                position.purge_events_for_order(client_order_id);
-            }
+        if let Some(position_id) = self.index.order_position.get(&client_order_id)
+            && let Some(position) = self.positions.get_mut(position_id)
+        {
+            position.purge_events_for_order(client_order_id);
         }
 
         if let Some(order) = self.orders.remove(&client_order_id) {
@@ -972,19 +976,18 @@ impl Cache {
             }
 
             // Remove from position orders index if associated with a position
-            if let Some(position_id) = order.position_id() {
-                if let Some(position_orders) = self.index.position_orders.get_mut(&position_id) {
-                    position_orders.remove(&client_order_id);
-                }
+            if let Some(position_id) = order.position_id()
+                && let Some(position_orders) = self.index.position_orders.get_mut(&position_id)
+            {
+                position_orders.remove(&client_order_id);
             }
 
             // Remove from exec algorithm orders index if it has an exec algorithm
-            if let Some(exec_algorithm_id) = order.exec_algorithm_id() {
-                if let Some(exec_algorithm_orders) =
+            if let Some(exec_algorithm_id) = order.exec_algorithm_id()
+                && let Some(exec_algorithm_orders) =
                     self.index.exec_algorithm_orders.get_mut(&exec_algorithm_id)
-                {
-                    exec_algorithm_orders.remove(&client_order_id);
-                }
+            {
+                exec_algorithm_orders.remove(&client_order_id);
             }
 
             log::info!("Purged order {client_order_id}");
@@ -1169,10 +1172,10 @@ impl Cache {
     pub fn add_order_book(&mut self, book: OrderBook) -> anyhow::Result<()> {
         log::debug!("Adding `OrderBook` {}", book.instrument_id);
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                database.add_order_book(&book)?;
-            }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            database.add_order_book(&book)?;
         }
 
         self.books.insert(book.instrument_id, book);
@@ -1247,6 +1250,26 @@ impl Cache {
         Ok(())
     }
 
+    /// Adds the `funding_rate` update to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the funding rate update to the backing database fails.
+    pub fn add_funding_rate(&mut self, funding_rate: FundingRateUpdate) -> anyhow::Result<()> {
+        log::debug!(
+            "Adding `FundingRateUpdate` for {}",
+            funding_rate.instrument_id
+        );
+
+        if self.config.save_market_data {
+            // TODO: Placeholder and return Result for consistency
+        }
+
+        self.funding_rates
+            .insert(funding_rate.instrument_id, funding_rate);
+        Ok(())
+    }
+
     /// Adds the `quote` tick to the cache.
     ///
     /// # Errors
@@ -1255,10 +1278,10 @@ impl Cache {
     pub fn add_quote(&mut self, quote: QuoteTick) -> anyhow::Result<()> {
         log::debug!("Adding `QuoteTick` {}", quote.instrument_id);
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                database.add_quote(&quote)?;
-            }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            database.add_quote(&quote)?;
         }
 
         let quotes_deque = self
@@ -1280,11 +1303,11 @@ impl Cache {
         let instrument_id = quotes[0].instrument_id;
         log::debug!("Adding `QuoteTick`[{}] {instrument_id}", quotes.len());
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                for quote in quotes {
-                    database.add_quote(quote)?;
-                }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            for quote in quotes {
+                database.add_quote(quote)?;
             }
         }
 
@@ -1307,10 +1330,10 @@ impl Cache {
     pub fn add_trade(&mut self, trade: TradeTick) -> anyhow::Result<()> {
         log::debug!("Adding `TradeTick` {}", trade.instrument_id);
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                database.add_trade(&trade)?;
-            }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            database.add_trade(&trade)?;
         }
 
         let trades_deque = self
@@ -1332,11 +1355,11 @@ impl Cache {
         let instrument_id = trades[0].instrument_id;
         log::debug!("Adding `TradeTick`[{}] {instrument_id}", trades.len());
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                for trade in trades {
-                    database.add_trade(trade)?;
-                }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            for trade in trades {
+                database.add_trade(trade)?;
             }
         }
 
@@ -1359,10 +1382,10 @@ impl Cache {
     pub fn add_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
         log::debug!("Adding `Bar` {}", bar.bar_type);
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                database.add_bar(&bar)?;
-            }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            database.add_bar(&bar)?;
         }
 
         let bars = self
@@ -1384,11 +1407,11 @@ impl Cache {
         let bar_type = bars[0].bar_type;
         log::debug!("Adding `Bar`[{}] {bar_type}", bars.len());
 
-        if self.config.save_market_data {
-            if let Some(database) = &mut self.database {
-                for bar in bars {
-                    database.add_bar(bar)?;
-                }
+        if self.config.save_market_data
+            && let Some(database) = &mut self.database
+        {
+            for bar in bars {
+                database.add_bar(bar)?;
             }
         }
 
@@ -1411,10 +1434,10 @@ impl Cache {
     pub fn add_greeks(&mut self, greeks: GreeksData) -> anyhow::Result<()> {
         log::debug!("Adding `GreeksData` {}", greeks.instrument_id);
 
-        if self.config.save_market_data {
-            if let Some(_database) = &mut self.database {
-                // TODO: Implement database.add_greeks(&greeks) when database adapter is updated
-            }
+        if self.config.save_market_data
+            && let Some(_database) = &mut self.database
+        {
+            // TODO: Implement database.add_greeks(&greeks) when database adapter is updated
         }
 
         self.greeks.insert(greeks.instrument_id, greeks);
@@ -1434,10 +1457,10 @@ impl Cache {
     pub fn add_yield_curve(&mut self, yield_curve: YieldCurveData) -> anyhow::Result<()> {
         log::debug!("Adding `YieldCurveData` {}", yield_curve.curve_name);
 
-        if self.config.save_market_data {
-            if let Some(_database) = &mut self.database {
-                // TODO: Implement database.add_yield_curve(&yield_curve) when database adapter is updated
-            }
+        if self.config.save_market_data
+            && let Some(_database) = &mut self.database
+        {
+            // TODO: Implement database.add_yield_curve(&yield_curve) when database adapter is updated
         }
 
         self.yield_curves
@@ -1535,15 +1558,16 @@ impl Cache {
         venue_order_id: &VenueOrderId,
         overwrite: bool,
     ) -> anyhow::Result<()> {
-        if let Some(existing_venue_order_id) = self.index.client_order_ids.get(client_order_id) {
-            if !overwrite && existing_venue_order_id != venue_order_id {
-                anyhow::bail!(
-                    "Existing {existing_venue_order_id} for {client_order_id}
+        if let Some(existing_venue_order_id) = self.index.client_order_ids.get(client_order_id)
+            && !overwrite
+            && existing_venue_order_id != venue_order_id
+        {
+            anyhow::bail!(
+                "Existing {existing_venue_order_id} for {client_order_id}
                     did not match the given {venue_order_id}.
                     If you are writing a test then try a different `venue_order_id`,
                     otherwise this is probably a bug."
-                );
-            }
+            );
         }
 
         self.index
@@ -1828,6 +1852,13 @@ impl Cache {
             };
         }
 
+        // Update own book
+        if self.own_order_book(&order.instrument_id()).is_some()
+            && should_handle_own_book_order(order)
+        {
+            self.update_own_order_book(order);
+        }
+
         if let Some(database) = &mut self.database {
             database.update_order(order.last_event())?;
             // TODO: Implement order snapshots
@@ -1856,6 +1887,7 @@ impl Cache {
     /// Returns an error if updating the position in the database fails.
     pub fn update_position(&mut self, position: &Position) -> anyhow::Result<()> {
         // Update open/closed state
+
         if position.is_open() {
             self.index.positions_open.insert(position.id);
             self.index.positions_closed.remove(&position.id);
@@ -1871,6 +1903,9 @@ impl Cache {
             //     database.snapshot_order_state(order)?;
             // }
         }
+
+        self.positions.insert(position.id, position.clone());
+
         Ok(())
     }
 
@@ -2563,10 +2598,10 @@ impl Cache {
         let query = self.build_order_query_filter_set(venue, instrument_id, strategy_id);
         let exec_algorithm_order_ids = self.index.exec_algorithm_orders.get(exec_algorithm_id);
 
-        if let Some(query) = query {
-            if let Some(exec_algorithm_order_ids) = exec_algorithm_order_ids {
-                let _exec_algorithm_order_ids = exec_algorithm_order_ids.intersection(&query);
-            }
+        if let Some(query) = query
+            && let Some(exec_algorithm_order_ids) = exec_algorithm_order_ids
+        {
+            let _exec_algorithm_order_ids = exec_algorithm_order_ids.intersection(&query);
         }
 
         if let Some(exec_algorithm_order_ids) = exec_algorithm_order_ids {
@@ -2952,6 +2987,12 @@ impl Cache {
             .and_then(|index_prices| index_prices.front())
     }
 
+    /// Gets a reference to the funding rate update for the `instrument_id`.
+    #[must_use]
+    pub fn funding_rate(&self, instrument_id: &InstrumentId) -> Option<&FundingRateUpdate> {
+        self.funding_rates.get(instrument_id)
+    }
+
     /// Gets a reference to the latest bar for the `bar_type`.
     #[must_use]
     pub fn bar(&self, bar_type: &BarType) -> Option<&Bar> {
@@ -3227,5 +3268,45 @@ impl Cache {
             .values()
             .filter(|account| &account.id() == account_id)
             .collect()
+    }
+
+    /// Updates the own order book with an order.
+    ///
+    /// This method adds, updates, or removes an order from the own order book
+    /// based on the order's current state.
+    pub fn update_own_order_book(&mut self, order: &OrderAny) {
+        let instrument_id = order.instrument_id();
+
+        // Get or create the own order book for this instrument
+        let own_book = self
+            .own_books
+            .entry(instrument_id)
+            .or_insert_with(|| OwnOrderBook::new(instrument_id));
+
+        // Convert order to own book order
+        let own_book_order = order.to_own_book_order();
+
+        if order.is_closed() {
+            // Remove the order from the own book if it's closed
+            if let Err(e) = own_book.delete(own_book_order) {
+                log::debug!(
+                    "Failed to delete order {} from own book: {}",
+                    order.client_order_id(),
+                    e
+                );
+            } else {
+                log::debug!("Deleted order {} from own book", order.client_order_id());
+            }
+        } else {
+            // Add or update the order in the own book
+            own_book.update(own_book_order).unwrap_or_else(|e| {
+                log::debug!(
+                    "Failed to update order {} in own book: {}",
+                    order.client_order_id(),
+                    e
+                );
+            });
+            log::debug!("Updated order {} in own book", order.client_order_id());
+        }
     }
 }

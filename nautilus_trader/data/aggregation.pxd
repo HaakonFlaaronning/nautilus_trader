@@ -17,13 +17,17 @@ from cpython.datetime cimport timedelta
 from libc.stdint cimport uint8_t
 from libc.stdint cimport uint64_t
 
+from nautilus_trader.cache.base cimport CacheFacade
 from nautilus_trader.common.component cimport Clock
+from nautilus_trader.common.component cimport Component
 from nautilus_trader.common.component cimport Logger
 from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.model.data cimport Bar
 from nautilus_trader.model.data cimport BarType
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
+from nautilus_trader.model.greeks cimport GreeksCalculator
+from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 

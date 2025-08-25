@@ -13,21 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-// Under development
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-#![allow(clippy::too_many_arguments)]
-
 use std::{
-    any::{Any, TypeId},
-    cell::{Ref, RefCell, RefMut, UnsafeCell},
-    collections::HashSet,
+    any::Any,
+    cell::{Ref, RefCell, RefMut},
+    collections::HashMap,
     fmt::Debug,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     rc::Rc,
-    sync::Arc,
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -38,22 +31,21 @@ use nautilus_core::{UUID4, UnixNanos, correctness::check_predicate_true};
 use nautilus_model::defi::{Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap};
 use nautilus_model::{
     data::{
-        Bar, BarType, DataType, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDeltas, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, BarType, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
+        MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick, close::InstrumentClose,
     },
     enums::BookType,
     identifiers::{ActorId, ClientId, ComponentId, InstrumentId, TraderId, Venue},
-    instruments::{Instrument, InstrumentAny},
+    instruments::InstrumentAny,
     orderbook::OrderBook,
 };
 use ustr::Ustr;
-use uuid::Uuid;
 
 #[cfg(feature = "indicators")]
 use super::indicators::Indicators;
 use super::{
     Actor,
-    registry::{get_actor, get_actor_unchecked, try_get_actor_unchecked},
+    registry::{get_actor_unchecked, try_get_actor_unchecked},
 };
 #[cfg(feature = "defi")]
 use crate::msgbus::switchboard::{
@@ -71,22 +63,22 @@ use crate::{
             InstrumentsResponse, QuotesResponse, RequestBars, RequestBookSnapshot, RequestCommand,
             RequestCustomData, RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades,
             SubscribeBars, SubscribeBookDeltas, SubscribeBookSnapshots, SubscribeCommand,
-            SubscribeCustomData, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
             SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
             UnsubscribeBookDeltas, UnsubscribeBookSnapshots, UnsubscribeCommand,
-            UnsubscribeCustomData, UnsubscribeIndexPrices, UnsubscribeInstrument,
-            UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
-            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+            UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
+            UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
         system::ShutdownSystem,
     },
     msgbus::{
-        self, MStr, Pattern, Topic, get_message_bus,
-        handler::{MessageHandler, ShareableMessageHandler, TypedMessageHandler},
+        self, MStr, Topic, get_message_bus,
+        handler::{ShareableMessageHandler, TypedMessageHandler},
         switchboard::{
-            self, MessagingSwitchboard, get_bars_topic, get_book_deltas_topic,
-            get_book_snapshots_topic, get_custom_topic, get_index_price_topic,
+            MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_snapshots_topic,
+            get_custom_topic, get_funding_rate_topic, get_index_price_topic,
             get_instrument_close_topic, get_instrument_status_topic, get_instrument_topic,
             get_instruments_topic, get_mark_price_topic, get_quotes_topic, get_trades_topic,
         },
@@ -120,18 +112,19 @@ impl Default for DataActorConfig {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyo3::pymethods]
-impl DataActorConfig {
-    #[new]
-    #[pyo3(signature = (actor_id=None, log_events=true, log_commands=true))]
-    fn py_new(actor_id: Option<ActorId>, log_events: bool, log_commands: bool) -> Self {
-        Self {
-            actor_id,
-            log_events,
-            log_commands,
-        }
-    }
+/// Configuration for creating actors from importable paths.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common")
+)]
+pub struct ImportableActorConfig {
+    /// The fully qualified name of the Actor class.
+    pub actor_path: String,
+    /// The fully qualified name of the Actor config class.
+    pub config_path: String,
+    /// The actor configuration as a dictionary.
+    pub config: HashMap<String, serde_json::Value>,
 }
 
 type RequestCallback = Box<dyn Fn(UUID4) + Send + Sync>; // TODO: TBD
@@ -153,6 +146,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if loading the actor state fails.
+    #[allow(unused_variables)]
     fn on_load(&mut self, state: IndexMap<String, Vec<u8>>) -> anyhow::Result<()> {
         Ok(())
     }
@@ -245,6 +239,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the time event fails.
+    #[allow(unused_variables)]
     fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
         Ok(())
     }
@@ -254,6 +249,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the data fails.
+    #[allow(unused_variables)]
     fn on_data(&mut self, data: &dyn Any) -> anyhow::Result<()> {
         Ok(())
     }
@@ -263,6 +259,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the signal fails.
+    #[allow(unused_variables)]
     fn on_signal(&mut self, signal: &Signal) -> anyhow::Result<()> {
         Ok(())
     }
@@ -272,6 +269,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the instrument fails.
+    #[allow(unused_variables)]
     fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
         Ok(())
     }
@@ -281,6 +279,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the book deltas fails.
+    #[allow(unused_variables)]
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         Ok(())
     }
@@ -290,6 +289,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the book fails.
+    #[allow(unused_variables)]
     fn on_book(&mut self, order_book: &OrderBook) -> anyhow::Result<()> {
         Ok(())
     }
@@ -299,6 +299,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the quote fails.
+    #[allow(unused_variables)]
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         Ok(())
     }
@@ -308,6 +309,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the trade fails.
+    #[allow(unused_variables)]
     fn on_trade(&mut self, tick: &TradeTick) -> anyhow::Result<()> {
         Ok(())
     }
@@ -317,6 +319,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the bar fails.
+    #[allow(unused_variables)]
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         Ok(())
     }
@@ -326,6 +329,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the mark price update fails.
+    #[allow(unused_variables)]
     fn on_mark_price(&mut self, mark_price: &MarkPriceUpdate) -> anyhow::Result<()> {
         Ok(())
     }
@@ -335,7 +339,18 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the index price update fails.
+    #[allow(unused_variables)]
     fn on_index_price(&mut self, index_price: &IndexPriceUpdate) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Actions to be performed when receiving a funding rate update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the funding rate update fails.
+    #[allow(unused_variables)]
+    fn on_funding_rate(&mut self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -344,6 +359,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the instrument status update fails.
+    #[allow(unused_variables)]
     fn on_instrument_status(&mut self, data: &InstrumentStatus) -> anyhow::Result<()> {
         Ok(())
     }
@@ -353,6 +369,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the instrument close update fails.
+    #[allow(unused_variables)]
     fn on_instrument_close(&mut self, update: &InstrumentClose) -> anyhow::Result<()> {
         Ok(())
     }
@@ -363,6 +380,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the block fails.
+    #[allow(unused_variables)]
     fn on_block(&mut self, block: &Block) -> anyhow::Result<()> {
         Ok(())
     }
@@ -373,6 +391,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the pool fails.
+    #[allow(unused_variables)]
     fn on_pool(&mut self, pool: &Pool) -> anyhow::Result<()> {
         Ok(())
     }
@@ -383,6 +402,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the pool swap fails.
+    #[allow(unused_variables)]
     fn on_pool_swap(&mut self, swap: &PoolSwap) -> anyhow::Result<()> {
         Ok(())
     }
@@ -393,6 +413,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the pool liquidity update fails.
+    #[allow(unused_variables)]
     fn on_pool_liquidity_update(&mut self, update: &PoolLiquidityUpdate) -> anyhow::Result<()> {
         Ok(())
     }
@@ -402,6 +423,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the historical data fails.
+    #[allow(unused_variables)]
     fn on_historical_data(&mut self, data: &dyn Any) -> anyhow::Result<()> {
         Ok(())
     }
@@ -411,6 +433,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the historical quotes fails.
+    #[allow(unused_variables)]
     fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -420,6 +443,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the historical trades fails.
+    #[allow(unused_variables)]
     fn on_historical_trades(&mut self, trades: &[TradeTick]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -429,6 +453,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the historical bars fails.
+    #[allow(unused_variables)]
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -438,6 +463,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the historical mark prices fails.
+    #[allow(unused_variables)]
     fn on_historical_mark_prices(&mut self, mark_prices: &[MarkPriceUpdate]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -447,6 +473,7 @@ pub trait DataActor:
     /// # Errors
     ///
     /// Returns an error if handling the historical index prices fails.
+    #[allow(unused_variables)]
     fn on_historical_index_prices(
         &mut self,
         index_prices: &[IndexPriceUpdate],
@@ -599,6 +626,20 @@ pub trait DataActor:
         }
 
         if let Err(e) = self.on_index_price(index_price) {
+            log_error(&e);
+        }
+    }
+
+    /// Handles a received funding rate update.
+    fn handle_funding_rate(&mut self, funding_rate: &FundingRateUpdate) {
+        log_received(&funding_rate);
+
+        if self.not_running() {
+            log_not_running(&funding_rate);
+            return;
+        }
+
+        if let Err(e) = self.on_funding_rate(funding_rate) {
             log_error(&e);
         }
     }
@@ -906,7 +947,7 @@ pub trait DataActor:
         Self: 'static + Debug + Sized,
     {
         let actor_id = self.actor_id().inner();
-        let topic = get_book_snapshots_topic(instrument_id);
+        let topic = get_book_snapshots_topic(instrument_id, interval_ms);
 
         let handler = ShareableMessageHandler(Rc::new(TypedMessageHandler::from(
             move |book: &OrderBook| {
@@ -1024,6 +1065,34 @@ pub trait DataActor:
         )));
 
         DataActorCore::subscribe_index_prices(
+            self,
+            topic,
+            handler,
+            instrument_id,
+            client_id,
+            params,
+        );
+    }
+
+    /// Subscribe to streaming [`FundingRateUpdate`] data for the `instrument_id`.
+    fn subscribe_funding_rates(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        params: Option<IndexMap<String, String>>,
+    ) where
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.actor_id().inner();
+        let topic = get_funding_rate_topic(instrument_id);
+
+        let handler = ShareableMessageHandler(Rc::new(TypedMessageHandler::from(
+            move |funding_rate: &FundingRateUpdate| {
+                get_actor_unchecked::<Self>(&actor_id).handle_funding_rate(funding_rate);
+            },
+        )));
+
+        DataActorCore::subscribe_funding_rates(
             self,
             topic,
             handler,
@@ -1307,6 +1376,18 @@ pub trait DataActor:
         Self: 'static + Debug + Sized,
     {
         DataActorCore::unsubscribe_index_prices(self, instrument_id, client_id, params);
+    }
+
+    /// Unsubscribe from streaming [`FundingRateUpdate`] data for the `instrument_id`.
+    fn unsubscribe_funding_rates(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        params: Option<IndexMap<String, String>>,
+    ) where
+        Self: 'static + Debug + Sized,
+    {
+        DataActorCore::unsubscribe_funding_rates(self, instrument_id, client_id, params);
     }
 
     /// Unsubscribe from streaming [`InstrumentStatus`] data for the `instrument_id`.
@@ -1610,6 +1691,7 @@ where
         self.actor_id.inner()
     }
 
+    #[allow(unused_variables)]
     fn handle(&mut self, msg: &dyn Any) {
         // Default empty implementation - concrete actors can override if needed
     }
@@ -1634,7 +1716,7 @@ where
 
     fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
         self.state = self.state.transition(&trigger)?;
-        log::info!("{}", self.state);
+        log::info!("{}", self.state.variant_name());
         Ok(())
     }
 
@@ -1691,6 +1773,7 @@ where
 }
 
 /// Core functionality for all actors.
+#[allow(dead_code)] // TODO: Under development (pending_requests, signal_classes)
 pub struct DataActorCore {
     /// The actor identifier.
     pub actor_id: ActorId,
@@ -1719,27 +1802,37 @@ impl Debug for DataActorCore {
     }
 }
 
-// TODO: Actors aren't meant to be cloned, this satisfies Python trait bounds for now
-impl Clone for DataActorCore {
-    fn clone(&self) -> Self {
-        Self {
-            actor_id: self.actor_id,
-            config: self.config.clone(),
-            trader_id: self.trader_id,
-            clock: self.clock.clone(),
-            cache: self.cache.clone(),
-            state: self.state,
-            warning_events: self.warning_events.clone(),
-            pending_requests: AHashMap::new(), // Reset pending requests for cloned actor
-            signal_classes: self.signal_classes.clone(),
-            #[cfg(feature = "indicators")]
-            indicators: self.indicators.clone(),
-            topic_handlers: self.topic_handlers.clone(),
+impl DataActorCore {
+    /// Adds a subscription handler for the `topic`.
+    ///
+    //// Logs a warning if the actor is already subscribed to the topic.
+    fn add_subscription(&mut self, topic: MStr<Topic>, handler: ShareableMessageHandler) {
+        if self.topic_handlers.contains_key(&topic) {
+            log::warn!(
+                "Actor {} attempted duplicate subscription to topic '{topic}'",
+                self.actor_id,
+            );
+            return;
+        }
+
+        self.topic_handlers.insert(topic, handler.clone());
+        msgbus::subscribe_topic(topic, handler, None);
+    }
+
+    /// Removes a subscription handler for the `topic` if present.
+    ///
+    /// Logs a warning if the actor is not currently subscribed to the topic.
+    fn remove_subscription(&mut self, topic: MStr<Topic>) {
+        if let Some(handler) = self.topic_handlers.remove(&topic) {
+            msgbus::unsubscribe_topic(topic, handler.clone());
+        } else {
+            log::warn!(
+                "Actor {} attempted to unsubscribe from topic '{topic}' when not subscribed",
+                self.actor_id,
+            );
         }
     }
-}
 
-impl DataActorCore {
     /// Creates a new [`DataActorCore`] instance.
     pub fn new(config: DataActorConfig) -> Self {
         let actor_id = config
@@ -1762,11 +1855,23 @@ impl DataActorCore {
         }
     }
 
+    /// Returns the memory address of this instance as a hexadecimal string.
+    #[must_use]
+    pub fn mem_address(&self) -> String {
+        format!("{self:p}")
+    }
+
+    /// Returns the actors state.
+    pub fn state(&self) -> ComponentState {
+        self.state
+    }
+
     /// Returns the trader ID this actor is registered to.
     pub fn trader_id(&self) -> Option<TraderId> {
         self.trader_id
     }
 
+    /// Returns the actors ID.
     pub fn actor_id(&self) -> ActorId {
         self.actor_id
     }
@@ -1776,6 +1881,7 @@ impl DataActorCore {
         ActorId::from(format!("{}-{memory_address}", stringify!(DataActor)))
     }
 
+    /// Returns a UNIX nanoseconds timestamp from the actors internal clock.
     pub fn timestamp_ns(&self) -> UnixNanos {
         self.clock_ref().timestamp_ns()
     }
@@ -1795,6 +1901,18 @@ impl DataActorCore {
                 )
             })
             .borrow_mut()
+    }
+
+    /// Returns a clone of the reference-counted clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor has not yet been registered (clock is `None`).
+    pub fn clock_rc(&self) -> Rc<RefCell<dyn Clock>> {
+        self.clock
+            .as_ref()
+            .expect("DataActor must be registered before accessing clock")
+            .clone()
     }
 
     fn clock_ref(&self) -> Ref<'_, dyn Clock> {
@@ -1868,9 +1986,13 @@ impl DataActorCore {
         log::debug!("Deregistered event type '{event_type}' from warning logs")
     }
 
+    pub fn is_registered(&self) -> bool {
+        self.trader_id.is_some()
+    }
+
     fn check_registered(&self) {
         assert!(
-            self.trader_id.is_some(),
+            self.is_registered(),
             "Actor has not been registered with a Trader"
         );
     }
@@ -1889,6 +2011,7 @@ impl DataActorCore {
         msgbus::send_any(endpoint, command.as_any())
     }
 
+    #[allow(dead_code)] // TODO: Under development
     fn send_data_req(&self, request: RequestCommand) {
         if self.config.log_commands {
             log::info!("{REQ}{SEND} {request:?}");
@@ -1923,27 +2046,6 @@ impl DataActorCore {
 
     // -- SUBSCRIPTIONS ---------------------------------------------------------------------------
 
-    fn get_or_create_handler_for_topic<F>(
-        &mut self,
-        topic: MStr<Topic>,
-        create_handler: F,
-    ) -> ShareableMessageHandler
-    where
-        F: FnOnce() -> ShareableMessageHandler,
-    {
-        if let Some(existing_handler) = self.topic_handlers.get(&topic) {
-            existing_handler.clone()
-        } else {
-            let new_handler = create_handler();
-            self.topic_handlers.insert(topic, new_handler.clone());
-            new_handler
-        }
-    }
-
-    fn get_handler_for_topic(&self, topic: MStr<Topic>) -> Option<ShareableMessageHandler> {
-        self.topic_handlers.get(&topic).cloned()
-    }
-
     /// Helper method for registering data subscriptions from the trait.
     ///
     /// # Panics
@@ -1967,8 +2069,7 @@ impl DataActorCore {
         }
 
         let topic = get_custom_topic(&data_type);
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         // If no client ID specified, just subscribe to the topic
         if client_id.is_none() {
@@ -1998,8 +2099,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::Quotes(SubscribeQuotes {
             instrument_id,
@@ -2024,8 +2124,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::Instruments(SubscribeInstruments {
             client_id,
@@ -2049,8 +2148,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::Instrument(SubscribeInstrument {
             instrument_id,
@@ -2079,8 +2177,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::BookDeltas(SubscribeBookDeltas {
             instrument_id,
@@ -2098,6 +2195,7 @@ impl DataActorCore {
     }
 
     /// Helper method for registering book snapshots subscriptions from the trait.
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_book_at_interval(
         &mut self,
         topic: MStr<Topic>,
@@ -2111,8 +2209,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::BookSnapshots(SubscribeBookSnapshots {
             instrument_id,
@@ -2140,8 +2237,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::Trades(SubscribeTrades {
             instrument_id,
@@ -2167,8 +2263,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::Bars(SubscribeBars {
             bar_type,
@@ -2194,8 +2289,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::MarkPrices(SubscribeMarkPrices {
             instrument_id,
@@ -2220,10 +2314,34 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::IndexPrices(SubscribeIndexPrices {
+            instrument_id,
+            client_id,
+            venue: Some(instrument_id.venue),
+            command_id: UUID4::new(),
+            ts_init: self.timestamp_ns(),
+            params,
+        });
+
+        self.send_data_cmd(DataCommand::Subscribe(command));
+    }
+
+    /// Helper method for registering funding rates subscriptions from the trait.
+    pub fn subscribe_funding_rates(
+        &mut self,
+        topic: MStr<Topic>,
+        handler: ShareableMessageHandler,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        params: Option<IndexMap<String, String>>,
+    ) {
+        self.check_registered();
+
+        self.add_subscription(topic, handler);
+
+        let command = SubscribeCommand::FundingRates(SubscribeFundingRates {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
@@ -2246,8 +2364,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
             instrument_id,
@@ -2272,8 +2389,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = SubscribeCommand::InstrumentClose(SubscribeInstrumentClose {
             instrument_id,
@@ -2301,8 +2417,7 @@ impl DataActorCore {
 
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = DefiSubscribeCommand::Blocks(SubscribeBlocks {
             chain,
@@ -2329,8 +2444,7 @@ impl DataActorCore {
 
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = DefiSubscribeCommand::Pool(SubscribePool {
             instrument_id,
@@ -2357,8 +2471,7 @@ impl DataActorCore {
 
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = DefiSubscribeCommand::PoolSwaps(SubscribePoolSwaps {
             instrument_id,
@@ -2385,8 +2498,7 @@ impl DataActorCore {
 
         self.check_registered();
 
-        self.topic_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_topic(topic, handler, None);
+        self.add_subscription(topic, handler);
 
         let command = DefiSubscribeCommand::PoolLiquidityUpdates(SubscribePoolLiquidityUpdates {
             instrument_id,
@@ -2401,7 +2513,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from data.
     pub fn unsubscribe_data(
-        &self,
+        &mut self,
         data_type: DataType,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2409,9 +2521,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_custom_topic(&data_type);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         if client_id.is_none() {
             return;
@@ -2431,7 +2541,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from instruments.
     pub fn unsubscribe_instruments(
-        &self,
+        &mut self,
         venue: Venue,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2439,9 +2549,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_instruments_topic(venue);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::Instruments(UnsubscribeInstruments {
             client_id,
@@ -2456,7 +2564,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from instrument.
     pub fn unsubscribe_instrument(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2464,9 +2572,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_instrument_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::Instrument(UnsubscribeInstrument {
             instrument_id,
@@ -2482,7 +2588,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from book deltas.
     pub fn unsubscribe_book_deltas(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2490,9 +2596,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_book_deltas_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::BookDeltas(UnsubscribeBookDeltas {
             instrument_id,
@@ -2516,10 +2620,8 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        let topic = get_book_snapshots_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        let topic = get_book_snapshots_topic(instrument_id, interval_ms);
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::BookSnapshots(UnsubscribeBookSnapshots {
             instrument_id,
@@ -2535,7 +2637,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from quotes.
     pub fn unsubscribe_quotes(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2543,9 +2645,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_quotes_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::Quotes(UnsubscribeQuotes {
             instrument_id,
@@ -2561,7 +2661,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from trades.
     pub fn unsubscribe_trades(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2569,9 +2669,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_trades_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::Trades(UnsubscribeTrades {
             instrument_id,
@@ -2595,9 +2693,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_bars_topic(bar_type);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::Bars(UnsubscribeBars {
             bar_type,
@@ -2613,7 +2709,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from mark prices.
     pub fn unsubscribe_mark_prices(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2621,9 +2717,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_mark_price_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::MarkPrices(UnsubscribeMarkPrices {
             instrument_id,
@@ -2639,7 +2733,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from index prices.
     pub fn unsubscribe_index_prices(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2647,9 +2741,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_index_price_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::IndexPrices(UnsubscribeIndexPrices {
             instrument_id,
@@ -2663,9 +2755,33 @@ impl DataActorCore {
         self.send_data_cmd(DataCommand::Unsubscribe(command));
     }
 
+    /// Helper method for unsubscribing from funding rates.
+    pub fn unsubscribe_funding_rates(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        params: Option<IndexMap<String, String>>,
+    ) {
+        self.check_registered();
+
+        let topic = get_funding_rate_topic(instrument_id);
+        self.remove_subscription(topic);
+
+        let command = UnsubscribeCommand::FundingRates(UnsubscribeFundingRates {
+            instrument_id,
+            client_id,
+            venue: Some(instrument_id.venue),
+            command_id: UUID4::new(),
+            ts_init: self.timestamp_ns(),
+            params,
+        });
+
+        self.send_data_cmd(DataCommand::Unsubscribe(command));
+    }
+
     /// Helper method for unsubscribing from instrument status.
     pub fn unsubscribe_instrument_status(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2673,9 +2789,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_instrument_status_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus {
             instrument_id,
@@ -2691,7 +2805,7 @@ impl DataActorCore {
 
     /// Helper method for unsubscribing from instrument close.
     pub fn unsubscribe_instrument_close(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<IndexMap<String, String>>,
@@ -2699,9 +2813,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_instrument_close_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = UnsubscribeCommand::InstrumentClose(UnsubscribeInstrumentClose {
             instrument_id,
@@ -2728,9 +2840,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_defi_blocks_topic(chain);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = DefiUnsubscribeCommand::Blocks(UnsubscribeBlocks {
             chain,
@@ -2756,9 +2866,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_defi_pool_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = DefiUnsubscribeCommand::Pool(UnsubscribePool {
             instrument_id,
@@ -2784,9 +2892,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_defi_pool_swaps_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command = DefiUnsubscribeCommand::PoolSwaps(UnsubscribePoolSwaps {
             instrument_id,
@@ -2812,9 +2918,7 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = get_defi_liquidity_topic(instrument_id);
-        if let Some(handler) = self.topic_handlers.get(&topic) {
-            msgbus::unsubscribe_topic(topic, handler.clone());
-        };
+        self.remove_subscription(topic);
 
         let command =
             DefiUnsubscribeCommand::PoolLiquidityUpdates(UnsubscribePoolLiquidityUpdates {
@@ -2833,6 +2937,7 @@ impl DataActorCore {
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_data(
         &self,
         data_type: DataType,
@@ -2852,14 +2957,17 @@ impl DataActorCore {
         let command = RequestCommand::Data(RequestCustomData {
             client_id,
             data_type,
+            start,
+            end,
+            limit,
             request_id,
             ts_init: self.timestamp_ns(),
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -2896,9 +3004,9 @@ impl DataActorCore {
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -2935,9 +3043,9 @@ impl DataActorCore {
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -2969,9 +3077,9 @@ impl DataActorCore {
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -2983,6 +3091,7 @@ impl DataActorCore {
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_quotes(
         &self,
         instrument_id: InstrumentId,
@@ -3010,9 +3119,9 @@ impl DataActorCore {
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -3024,6 +3133,7 @@ impl DataActorCore {
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_trades(
         &self,
         instrument_id: InstrumentId,
@@ -3051,9 +3161,9 @@ impl DataActorCore {
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -3065,6 +3175,7 @@ impl DataActorCore {
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_bars(
         &self,
         bar_type: BarType,
@@ -3092,9 +3203,9 @@ impl DataActorCore {
             params,
         });
 
-        let msgbus = get_message_bus()
+        get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler);
+            .register_response_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 

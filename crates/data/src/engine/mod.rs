@@ -75,10 +75,8 @@ use nautilus_model::defi::Blockchain;
 use nautilus_model::defi::DefiData;
 use nautilus_model::{
     data::{
-        Bar, BarType, Data, DataType, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick,
-        TradeTick,
-        close::InstrumentClose,
-        prices::{IndexPriceUpdate, MarkPriceUpdate},
+        Bar, BarType, Data, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentClose,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
     },
     enums::{AggregationSource, BarAggregation, BookType, PriceType, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
@@ -284,7 +282,7 @@ impl DataEngine {
         }
     }
 
-    /// Disposes the engine, stopping all clients and cancelling any timers.
+    /// Disposes the engine, stopping all clients and canceling any timers.
     pub fn dispose(&mut self) {
         for client in self.get_clients_mut() {
             if let Err(e) = client.dispose() {
@@ -447,6 +445,12 @@ impl DataEngine {
     #[must_use]
     pub fn subscribed_index_prices(&self) -> Vec<InstrumentId> {
         self.collect_subscriptions(|client| &client.subscriptions_index_prices)
+    }
+
+    /// Returns all instrument IDs for which funding rate subscriptions exist.
+    #[must_use]
+    pub fn subscribed_funding_rates(&self) -> Vec<InstrumentId> {
+        self.collect_subscriptions(|client| &client.subscriptions_funding_rates)
     }
 
     /// Returns all instrument IDs for which status subscriptions exist.
@@ -694,7 +698,7 @@ impl DataEngine {
 
     /// Processes a dynamically-typed data message.
     ///
-    /// Currently supports `InstrumentAny`; unrecognized types are logged as errors.
+    /// Currently supports `InstrumentAny` and `FundingRateUpdate`; unrecognized types are logged as errors.
     pub fn process(&mut self, data: &dyn Any) {
         // TODO: Eventually these could be added to the `Data` enum? process here for now
         if let Some(data) = data.downcast_ref::<Data>() {
@@ -710,6 +714,8 @@ impl DataEngine {
 
         if let Some(instrument) = data.downcast_ref::<InstrumentAny>() {
             self.handle_instrument(instrument.clone());
+        } else if let Some(funding_rate) = data.downcast_ref::<FundingRateUpdate>() {
+            self.handle_funding_rate(*funding_rate);
         } else {
             log::error!("Cannot process data {data:?}, type is unrecognized");
         }
@@ -931,6 +937,21 @@ impl DataEngine {
         msgbus::publish(topic, &index_price as &dyn Any);
     }
 
+    /// Handles a funding rate update by adding it to the cache and publishing to the message bus.
+    pub fn handle_funding_rate(&mut self, funding_rate: FundingRateUpdate) {
+        if let Err(e) = self
+            .cache
+            .as_ref()
+            .borrow_mut()
+            .add_funding_rate(funding_rate)
+        {
+            log_error_on_cache_insert(&e);
+        }
+
+        let topic = switchboard::get_funding_rate_topic(funding_rate.instrument_id);
+        msgbus::publish(topic, &funding_rate as &dyn Any);
+    }
+
     fn handle_instrument_close(&mut self, close: InstrumentClose) {
         let topic = switchboard::get_instrument_close_topic(close.instrument_id);
         msgbus::publish(topic, &close as &dyn Any);
@@ -984,7 +1005,7 @@ impl DataEngine {
         if first_for_interval {
             // Initialize snapshotter and schedule its timer
             let interval_ns = millis_to_nanos(cmd.interval_ms.get() as f64);
-            let topic = switchboard::get_book_snapshots_topic(cmd.instrument_id);
+            let topic = switchboard::get_book_snapshots_topic(cmd.instrument_id, cmd.interval_ms);
 
             let snap_info = BookSnapshotInfo {
                 instrument_id: cmd.instrument_id,
@@ -1054,7 +1075,7 @@ impl DataEngine {
         let topics = vec![
             switchboard::get_book_deltas_topic(cmd.instrument_id),
             switchboard::get_book_depth10_topic(cmd.instrument_id),
-            switchboard::get_book_snapshots_topic(cmd.instrument_id),
+            // TODO: Unsubscribe from snapshots?
         ];
 
         self.maintain_book_updater(&cmd.instrument_id, &topics);
@@ -1072,7 +1093,7 @@ impl DataEngine {
         let topics = vec![
             switchboard::get_book_deltas_topic(cmd.instrument_id),
             switchboard::get_book_depth10_topic(cmd.instrument_id),
-            switchboard::get_book_snapshots_topic(cmd.instrument_id),
+            // TODO: Unsubscribe from snapshots?
         ];
 
         self.maintain_book_updater(&cmd.instrument_id, &topics);
@@ -1102,7 +1123,7 @@ impl DataEngine {
         let topics = vec![
             switchboard::get_book_deltas_topic(cmd.instrument_id),
             switchboard::get_book_depth10_topic(cmd.instrument_id),
-            switchboard::get_book_snapshots_topic(cmd.instrument_id),
+            // TODO: Unsubscribe from snapshots (add interval_ms to message?)
         ];
 
         self.maintain_book_updater(&cmd.instrument_id, &topics);
@@ -1152,7 +1173,10 @@ impl DataEngine {
 
     fn maintain_book_snapshotter(&mut self, instrument_id: &InstrumentId) {
         if let Some(snapshotter) = self.book_snapshotters.get(instrument_id) {
-            let topic = switchboard::get_book_snapshots_topic(*instrument_id);
+            let topic = switchboard::get_book_snapshots_topic(
+                *instrument_id,
+                snapshotter.snap_info.interval_ms,
+            );
 
             // Check remaining snapshot subscriptions, if none then remove snapshotter
             if msgbus::subscriptions_count(topic.as_str()) == 0 {
@@ -1291,6 +1315,12 @@ impl DataEngine {
         let size_precision = instrument.size_precision();
 
         if bar_type.spec().is_time_aggregated() {
+            // Get time_bars_origin_offset from config
+            let time_bars_origin_offset = config
+                .time_bars_origins
+                .get(&bar_type.spec().aggregation)
+                .map(|duration| chrono::TimeDelta::from_std(*duration).unwrap_or_default());
+
             Box::new(TimeBarAggregator::new(
                 bar_type,
                 price_precision,
@@ -1301,7 +1331,7 @@ impl DataEngine {
                 config.time_bars_build_with_no_updates,
                 config.time_bars_timestamp_on_close,
                 config.time_bars_interval_type,
-                None,  // TODO: Implement
+                time_bars_origin_offset,
                 20,    // TODO: TBD, composite bar build delay
                 false, // TODO: skip_first_non_full_bar, make it config dependent
             ))

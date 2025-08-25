@@ -17,9 +17,9 @@ use ahash::AHashMap;
 use nautilus_core::nanos::UnixNanos;
 use nautilus_model::{
     data::{
-        Bar, BarSpecification, BarType, BookOrder, Data, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10, QuoteTick,
-        TradeTick, depth::DEPTH10_LEN,
+        Bar, BarSpecification, BarType, BookOrder, Data, FundingRateUpdate, IndexPriceUpdate,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10,
+        QuoteTick, TradeTick, depth::DEPTH10_LEN,
     },
     enums::{
         AggregationSource, AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus,
@@ -28,7 +28,7 @@ use nautilus_model::{
     identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money},
+    types::{Currency, Money, Price, Quantity},
 };
 use ustr::Ustr;
 
@@ -44,12 +44,12 @@ use crate::{
         enums::{OKXBookAction, OKXCandleConfirm, OKXOrderStatus, OKXOrderType},
         models::OKXInstrument,
         parse::{
-            okx_channel_to_bar_spec, parse_client_order_id, parse_fee, parse_instrument_any,
-            parse_message_vec, parse_millisecond_timestamp, parse_order_side, parse_price,
+            okx_channel_to_bar_spec, parse_client_order_id, parse_fee, parse_funding_rate_msg,
+            parse_instrument_any, parse_message_vec, parse_millisecond_timestamp, parse_price,
             parse_quantity,
         },
     },
-    websocket::messages::{ExecutionReport, NautilusWsMessage},
+    websocket::messages::{ExecutionReport, NautilusWsMessage, OKXFundingRateMsg},
 };
 
 /// Parses vector of OKX book messages into Nautilus order book deltas.
@@ -173,6 +173,35 @@ pub fn parse_index_price_msg_vec(
         |msg| parse_index_price_msg(msg, *instrument_id, price_precision, ts_init),
         Data::IndexPriceUpdate,
     )
+}
+
+/// Parses vector of OKX funding rate messages into Nautilus funding rate updates.
+/// Includes caching to filter out duplicate funding rates.
+pub fn parse_funding_rate_msg_vec(
+    data: serde_json::Value,
+    instrument_id: &InstrumentId,
+    ts_init: UnixNanos,
+    funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
+) -> anyhow::Result<Vec<FundingRateUpdate>> {
+    let msgs: Vec<OKXFundingRateMsg> = serde_json::from_value(data)?;
+
+    let mut result = Vec::with_capacity(msgs.len());
+    for msg in &msgs {
+        let cache_key = (msg.funding_rate, msg.funding_time);
+
+        if let Some(cached) = funding_cache.get(&msg.inst_id)
+            && *cached == cache_key
+        {
+            continue; // Skip duplicate
+        }
+
+        // New or changed funding rate, update cache and parse
+        funding_cache.insert(msg.inst_id, cache_key);
+        let funding_rate = parse_funding_rate_msg(msg, *instrument_id, ts_init)?;
+        result.push(funding_rate);
+    }
+
+    Ok(result)
 }
 
 /// Parses vector of OKX candle messages into Nautilus bars.
@@ -330,13 +359,14 @@ pub fn parse_book10_msg(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDepth10> {
-    // Initialize arrays with default empty orders
+    // Initialize arrays - need to fill all 10 levels even if we have fewer
     let mut bids: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
     let mut asks: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
     let mut bid_counts: [u32; DEPTH10_LEN] = [0; DEPTH10_LEN];
     let mut ask_counts: [u32; DEPTH10_LEN] = [0; DEPTH10_LEN];
 
     // Parse available bid levels (up to 10)
+    let bid_len = msg.bids.len().min(DEPTH10_LEN);
     for (i, level) in msg.bids.iter().take(DEPTH10_LEN).enumerate() {
         let price = parse_price(&level.price, price_precision)?;
         let size = parse_quantity(&level.size, size_precision)?;
@@ -347,7 +377,19 @@ pub fn parse_book10_msg(
         bid_counts[i] = orders_count;
     }
 
+    // Fill remaining bid slots with empty Buy orders (not NULL orders)
+    for i in bid_len..DEPTH10_LEN {
+        bids[i] = BookOrder::new(
+            OrderSide::Buy,
+            Price::zero(price_precision),
+            Quantity::zero(size_precision),
+            0,
+        );
+        bid_counts[i] = 0;
+    }
+
     // Parse available ask levels (up to 10)
+    let ask_len = msg.asks.len().min(DEPTH10_LEN);
     for (i, level) in msg.asks.iter().take(DEPTH10_LEN).enumerate() {
         let price = parse_price(&level.price, price_precision)?;
         let size = parse_quantity(&level.size, size_precision)?;
@@ -358,7 +400,16 @@ pub fn parse_book10_msg(
         ask_counts[i] = orders_count;
     }
 
-    // Arrays are already fixed size, no conversion needed
+    // Fill remaining ask slots with empty Sell orders (not NULL orders)
+    for i in ask_len..DEPTH10_LEN {
+        asks[i] = BookOrder::new(
+            OrderSide::Sell,
+            Price::zero(price_precision),
+            Quantity::zero(size_precision),
+            0,
+        );
+        ask_counts[i] = 0;
+    }
 
     let ts_event = parse_millisecond_timestamp(msg.ts);
 
@@ -410,7 +461,7 @@ pub fn parse_trade_msg(
 ) -> anyhow::Result<TradeTick> {
     let price = parse_price(&msg.px, price_precision)?;
     let size = parse_quantity(&msg.sz, size_precision)?;
-    let aggressor_side = AggressorSide::from(msg.side.clone());
+    let aggressor_side: AggressorSide = msg.side.into();
     let trade_id = TradeId::new(&msg.trade_id);
     let ts_event = parse_millisecond_timestamp(msg.ts);
 
@@ -523,28 +574,11 @@ pub fn parse_order_status_report(
 ) -> anyhow::Result<OrderStatusReport> {
     let client_order_id = parse_client_order_id(&msg.cl_ord_id);
     let venue_order_id = VenueOrderId::new(msg.ord_id);
-    let order_side = parse_order_side(&Some(msg.side.clone()));
+    let order_side: OrderSide = msg.side.into();
 
-    let okx_order_type = match msg.ord_type.as_str() {
-        "market" => OKXOrderType::Market,
-        "limit" => OKXOrderType::Limit,
-        "post_only" => OKXOrderType::PostOnly,
-        "fok" => OKXOrderType::Fok,
-        "ioc" => OKXOrderType::Ioc,
-        "optimal_limit_ioc" => OKXOrderType::OptimalLimitIoc,
-        "mmp" => OKXOrderType::Mmp,
-        "mmp_and_post_only" => OKXOrderType::MmpAndPostOnly,
-        _ => OKXOrderType::Limit, // Default fallback
-    };
-    let order_type: OrderType = okx_order_type.clone().into();
-
-    let size_precision = instrument.size_precision();
-    let quantity = parse_quantity(&msg.sz, size_precision)?;
-    let filled_qty = parse_quantity(&msg.acc_fill_sz.clone().unwrap_or_default(), size_precision)?;
-    let order_status: OrderStatus = msg.state.clone().into();
-
-    let ts_accepted = parse_millisecond_timestamp(msg.c_time);
-    let ts_last = parse_millisecond_timestamp(msg.u_time);
+    let okx_order_type = msg.ord_type;
+    let order_type: OrderType = msg.ord_type.into();
+    let order_status: OrderStatus = msg.state.into();
 
     let time_in_force = match okx_order_type {
         OKXOrderType::Fok => TimeInForce::Fok,
@@ -552,7 +586,14 @@ pub fn parse_order_status_report(
         _ => TimeInForce::Gtc,
     };
 
-    let report = OrderStatusReport::new(
+    let size_precision = instrument.size_precision();
+    let quantity = parse_quantity(&msg.sz, size_precision)?;
+    let filled_qty = parse_quantity(&msg.acc_fill_sz.clone().unwrap_or_default(), size_precision)?;
+
+    let ts_accepted = parse_millisecond_timestamp(msg.c_time);
+    let ts_last = parse_millisecond_timestamp(msg.u_time);
+
+    let mut report = OrderStatusReport::new(
         account_id,
         instrument.id(),
         client_order_id,
@@ -569,6 +610,31 @@ pub fn parse_order_status_report(
         None, // Generate UUID4 automatically
     );
 
+    if !msg.px.is_empty() {
+        let price_precision = instrument.price_precision();
+        if let Ok(price) = parse_price(&msg.px, price_precision) {
+            report = report.with_price(price);
+        }
+    }
+
+    if !msg.avg_px.is_empty() {
+        report = report.with_avg_px(msg.avg_px.parse::<f64>()?);
+    }
+
+    if msg.ord_type == OKXOrderType::PostOnly {
+        report = report.with_post_only(true);
+    }
+
+    if msg.reduce_only == "true" {
+        report = report.with_reduce_only(true);
+    }
+
+    if let Some(reason) = &msg.cancel_source_reason
+        && !reason.is_empty()
+    {
+        report = report.with_cancel_reason(reason.clone());
+    }
+
     Ok(report)
 }
 
@@ -583,7 +649,7 @@ pub fn parse_fill_report(
     let client_order_id = parse_client_order_id(&msg.cl_ord_id);
     let venue_order_id = VenueOrderId::new(msg.ord_id);
     let trade_id = TradeId::from(msg.trade_id.as_str());
-    let order_side = parse_order_side(&Some(msg.side.clone()));
+    let order_side: OrderSide = msg.side.into();
 
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
@@ -598,7 +664,7 @@ pub fn parse_fill_report(
         total_fee
     };
 
-    let liquidity_side: LiquiditySide = LiquiditySide::from(msg.exec_type.clone());
+    let liquidity_side: LiquiditySide = msg.exec_type.into();
     let ts_event = parse_millisecond_timestamp(msg.fill_time);
 
     let report = FillReport::new(
@@ -621,7 +687,13 @@ pub fn parse_fill_report(
     Ok(report)
 }
 
-/// Parses OKX WebSocket message data based on channel type.
+/// Parses OKX WebSocket message payloads into Nautilus data structures.
+///
+/// # Panics
+///
+/// Panics only in the case where `okx_channel_to_bar_spec(channel)` returns
+/// `None` after a prior `is_some` check – an unreachable scenario indicating a
+/// logic error.
 pub fn parse_ws_message_data(
     channel: &OKXWsChannel,
     data: serde_json::Value,
@@ -629,6 +701,7 @@ pub fn parse_ws_message_data(
     price_precision: u8,
     size_precision: u8,
     ts_init: UnixNanos,
+    funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
 ) -> anyhow::Result<Option<NautilusWsMessage>> {
     match channel {
         OKXWsChannel::Instruments => {
@@ -683,8 +756,12 @@ pub fn parse_ws_message_data(
                 parse_index_price_msg_vec(data, instrument_id, price_precision, ts_init)?;
             Ok(Some(NautilusWsMessage::Data(data_vec)))
         }
+        OKXWsChannel::FundingRate => {
+            let data_vec = parse_funding_rate_msg_vec(data, instrument_id, ts_init, funding_cache)?;
+            Ok(Some(NautilusWsMessage::FundingRates(data_vec)))
+        }
         channel if okx_channel_to_bar_spec(channel).is_some() => {
-            let bar_spec = okx_channel_to_bar_spec(channel).unwrap();
+            let bar_spec = okx_channel_to_bar_spec(channel).expect("bar_spec checked above");
             let data_vec = parse_candle_msg_vec(
                 data,
                 instrument_id,
@@ -734,6 +811,7 @@ mod tests {
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
     use ustr::Ustr;
 
     use super::*;
@@ -765,7 +843,22 @@ mod tests {
         assert_eq!(deltas.sequence, 123456);
         assert_eq!(deltas.ts_event, UnixNanos::from(1597026383085000000));
         assert_eq!(deltas.ts_init, UnixNanos::default());
-        // TODO: Complete parsing testing of remaining fields
+
+        // Verify some individual deltas are parsed correctly
+        assert!(!deltas.deltas.is_empty());
+        // Snapshot should have both bid and ask deltas
+        let bid_deltas: Vec<_> = deltas
+            .deltas
+            .iter()
+            .filter(|d| d.order.side == OrderSide::Buy)
+            .collect();
+        let ask_deltas: Vec<_> = deltas
+            .deltas
+            .iter()
+            .filter(|d| d.order.side == OrderSide::Sell)
+            .collect();
+        assert!(!bid_deltas.is_empty());
+        assert!(!ask_deltas.is_empty());
     }
 
     #[rstest]
@@ -794,7 +887,22 @@ mod tests {
         assert_eq!(deltas.sequence, 123457);
         assert_eq!(deltas.ts_event, UnixNanos::from(1597026383085000000));
         assert_eq!(deltas.ts_init, UnixNanos::default());
-        // TODO: Complete parsing testing of remaining fields
+
+        // Verify some individual deltas are parsed correctly
+        assert!(!deltas.deltas.is_empty());
+        // Update should also have both bid and ask deltas
+        let bid_deltas: Vec<_> = deltas
+            .deltas
+            .iter()
+            .filter(|d| d.order.side == OrderSide::Buy)
+            .collect();
+        let ask_deltas: Vec<_> = deltas
+            .deltas
+            .iter()
+            .filter(|d| d.order.side == OrderSide::Sell)
+            .collect();
+        assert!(!bid_deltas.is_empty());
+        assert!(!ask_deltas.is_empty());
     }
 
     #[rstest]
@@ -888,6 +996,31 @@ mod tests {
         assert_eq!(bar.volume, Quantity::from(45247));
         assert_eq!(bar.ts_event, UnixNanos::from(1597026383085000000));
         assert_eq!(bar.ts_init, UnixNanos::default());
+    }
+
+    #[rstest]
+    fn test_parse_funding_rate() {
+        let json_data = load_test_json("ws_funding_rate.json");
+        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+
+        let okx_funding_rates: Vec<crate::websocket::messages::OKXFundingRateMsg> = match msg {
+            OKXWebSocketEvent::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            _ => panic!("Expected a `Data` variant"),
+        };
+
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let funding_rate =
+            parse_funding_rate_msg(&okx_funding_rates[0], instrument_id, UnixNanos::default())
+                .unwrap();
+
+        assert_eq!(funding_rate.instrument_id, instrument_id);
+        assert_eq!(funding_rate.rate, Decimal::new(1, 4));
+        assert_eq!(
+            funding_rate.next_funding_ns,
+            Some(UnixNanos::from(1744590349506000000))
+        );
+        assert_eq!(funding_rate.ts_event, UnixNanos::from(1744590349506000000));
+        assert_eq!(funding_rate.ts_init, UnixNanos::default());
     }
 
     #[rstest]
@@ -1428,7 +1561,7 @@ mod tests {
             inst_type: crate::common::enums::OKXInstrumentType::Swap,
             lever: "2.0".to_string(),
             ord_id: Ustr::from("1234567890"),
-            ord_type: "market".to_string(),
+            ord_type: OKXOrderType::Market,
             pnl: "0".to_string(),
             pos_side: "long".to_string(),
             px: "".to_string(),
@@ -1475,7 +1608,7 @@ mod tests {
             inst_type: crate::common::enums::OKXInstrumentType::Swap,
             lever: "2.0".to_string(),
             ord_id: Ustr::from("1234567890"),
-            ord_type: "market".to_string(),
+            ord_type: OKXOrderType::Market,
             pnl: "0".to_string(),
             pos_side: "long".to_string(),
             px: "".to_string(),
