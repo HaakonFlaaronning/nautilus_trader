@@ -18,7 +18,8 @@ import concurrent.futures
 import platform
 import signal
 import socket
-import time
+
+# import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -65,7 +66,6 @@ from nautilus_trader.config import StrategyFactory
 from nautilus_trader.config import StreamingConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
-from nautilus_trader.core.datetime import nanos_to_millis
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.algorithm import ExecAlgorithm
@@ -168,7 +168,7 @@ class NautilusKernel:
         self._ts_created: int = self._clock.timestamp_ns()
         self._ts_started: int | None = None
         self._ts_shutdown: int | None = None
-        ts_build = time.time_ns()
+        # ts_build = time.time_ns()
 
         register_component_clock(self._instance_id, self._clock)
 
@@ -252,8 +252,7 @@ class NautilusKernel:
                     )
             elif self._environment == Environment.LIVE:
                 raise InvalidConfiguration(
-                    "`LoggingConfig.bypass_logging` was set `True` "
-                    "when not safe to bypass logging in a LIVE context",
+                    "`LoggingConfig.bypass_logging` was set `True` when not safe to bypass logging in a LIVE context",
                 )
 
         self._log: Logger = Logger(name=name)
@@ -539,8 +538,8 @@ class NautilusKernel:
         self._is_running = False
         self._is_stopping = False
 
-        build_time_ms = nanos_to_millis(time.time_ns() - ts_build)
-        self._log.info(f"Initialized in {build_time_ms}ms")
+        # build_time_ms = nanos_to_millis(time.time_ns() - ts_build)
+        # self._log.info(f"Initialized in {build_time_ms}ms")
 
     def __del__(self) -> None:
         if hasattr(self, "_writer") and self._writer and not self._writer.is_closed:
@@ -1223,8 +1222,7 @@ class NautilusKernel:
             except RuntimeError as e:
                 if "Event loop stopped before Future completed" in str(e):
                     self._log.warning(
-                        "Loop stopped during cleanup; some tasks may not "
-                        "be properly canceled or awaited",
+                        "Loop stopped during cleanup; some tasks may not be properly canceled or awaited",
                     )
                 else:
                     raise
@@ -1280,8 +1278,7 @@ class NautilusKernel:
 
     async def _await_engines_connected(self) -> bool:
         self._log.info(
-            f"Awaiting engine connections and initializations "
-            f"({self._config.timeout_connection}s timeout)...",
+            f"Awaiting engine connections and initializations ({self._config.timeout_connection}s timeout)...",
             color=LogColor.BLUE,
         )
 
@@ -1299,8 +1296,7 @@ class NautilusKernel:
 
     async def _await_engines_disconnected(self) -> None:
         self._log.info(
-            f"Awaiting engine disconnections "
-            f"({self._config.timeout_disconnection}s timeout)...",
+            f"Awaiting engine disconnections ({self._config.timeout_disconnection}s timeout)...",
             color=LogColor.BLUE,
         )
 
@@ -1315,8 +1311,7 @@ class NautilusKernel:
 
     async def _await_execution_reconciliation(self) -> bool:
         self._log.info(
-            f"Awaiting execution state reconciliation "
-            f"({self._config.timeout_reconciliation}s timeout)...",
+            f"Awaiting execution state reconciliation ({self._config.timeout_reconciliation}s timeout)...",
             color=LogColor.BLUE,
         )
 
@@ -1331,7 +1326,7 @@ class NautilusKernel:
 
     async def _await_portfolio_initialization(self) -> bool:
         self._log.info(
-            "Awaiting portfolio initialization " f"({self._config.timeout_portfolio}s timeout)...",
+            f"Awaiting portfolio initialization ({self._config.timeout_portfolio}s timeout)...",
             color=LogColor.BLUE,
         )
 
