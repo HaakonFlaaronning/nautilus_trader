@@ -41,7 +41,6 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from cpython.datetime cimport datetime
 from libc.stdint cimport uint64_t
 
-from nautilus_trader.backtest.models cimport SpreadQuoteAggregator
 from nautilus_trader.cache.cache cimport Cache
 from nautilus_trader.common.component cimport CMD
 from nautilus_trader.common.component cimport RECV
@@ -62,6 +61,7 @@ from nautilus_trader.core.rust.model cimport BookType
 from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.core.uuid cimport UUID4
 from nautilus_trader.data.aggregation cimport BarAggregator
+from nautilus_trader.data.aggregation cimport RenkoBarAggregator
 from nautilus_trader.data.aggregation cimport TickBarAggregator
 from nautilus_trader.data.aggregation cimport TimeBarAggregator
 from nautilus_trader.data.aggregation cimport ValueBarAggregator
@@ -75,6 +75,7 @@ from nautilus_trader.data.messages cimport RequestBars
 from nautilus_trader.data.messages cimport RequestData
 from nautilus_trader.data.messages cimport RequestInstrument
 from nautilus_trader.data.messages cimport RequestInstruments
+from nautilus_trader.data.messages cimport RequestOrderBookDepth
 from nautilus_trader.data.messages cimport RequestOrderBookSnapshot
 from nautilus_trader.data.messages cimport RequestQuoteTicks
 from nautilus_trader.data.messages cimport RequestTradeTicks
@@ -116,6 +117,7 @@ from nautilus_trader.model.data cimport OrderBookDeltas
 from nautilus_trader.model.data cimport OrderBookDepth10
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
+from nautilus_trader.model.data cimport bar_aggregation_not_implemented_message
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ComponentId
 from nautilus_trader.model.identifiers cimport InstrumentId
@@ -169,7 +171,6 @@ cdef class DataEngine(Component):
         self._catalogs: dict[str, ParquetDataCatalog] = {}
         self._order_book_intervals: dict[tuple[InstrumentId, int], list[Callable[[OrderBook], None]]] = {}
         self._bar_aggregators: dict[BarType, BarAggregator] = {}
-        self._spread_quote_aggregators: dict[InstrumentId, SpreadQuoteAggregator] = {}
         self._synthetic_quote_feeds: dict[InstrumentId, list[SyntheticInstrument]] = {}
         self._synthetic_trade_feeds: dict[InstrumentId, list[SyntheticInstrument]] = {}
         self._subscribed_synthetic_quotes: list[InstrumentId] = []
@@ -178,6 +179,7 @@ cdef class DataEngine(Component):
         self._snapshot_info: dict[str, SnapshotInfo] = {}
         self._query_group_n_responses: dict[UUID4, int] = {}
         self._query_group_responses: dict[UUID4, list] = {}
+        self._query_group_requests: dict[UUID4, RequestData] = {}
 
         self._topic_cache_instruments: dict[InstrumentId, str] = {}
         self._topic_cache_deltas: dict[InstrumentId, str] = {}
@@ -205,6 +207,7 @@ cdef class DataEngine(Component):
         self._time_bars_build_delay = config.time_bars_build_delay
         self._validate_data_sequence = config.validate_data_sequence
         self._buffer_deltas = config.buffer_deltas
+        self._emit_quotes_from_book_depths = config.emit_quotes_from_book_depths
 
         if config.external_clients:
             self._external_clients = set(config.external_clients)
@@ -694,9 +697,6 @@ cdef class DataEngine(Component):
             if isinstance(aggregator, TimeBarAggregator):
                 aggregator.stop()
 
-        for aggregator in self._spread_quote_aggregators.values():
-            aggregator.stop()
-
         self._on_stop()
 
     cpdef void _reset(self):
@@ -706,13 +706,13 @@ cdef class DataEngine(Component):
 
         self._order_book_intervals.clear()
         self._bar_aggregators.clear()
-        self._spread_quote_aggregators.clear()
         self._synthetic_quote_feeds.clear()
         self._synthetic_trade_feeds.clear()
         self._subscribed_synthetic_quotes.clear()
         self._subscribed_synthetic_trades.clear()
         self._buffered_deltas_map.clear()
         self._snapshot_info.clear()
+        self._query_group_requests.clear()
 
         self._clock.cancel_timers()
         self.command_count = 0
@@ -920,7 +920,7 @@ cdef class DataEngine(Component):
                 client.subscribe_order_book_deltas(command)
         elif command.data_type.type == OrderBookDepth10:
             if command.instrument_id not in client.subscribed_order_book_snapshots():
-                client.subscribe_order_book_snapshots(command)
+                client.subscribe_order_book_depth(command)
         else:  # pragma: no cover (design-time error)
             raise TypeError(f"Invalid book data type, was {command.data_type}")
 
@@ -1018,11 +1018,6 @@ cdef class DataEngine(Component):
 
         if command.instrument_id.is_synthetic():
             self._handle_subscribe_synthetic_quote_ticks(command.instrument_id)
-            return
-
-        # Handle spread instruments (like bar aggregators, work in any context)
-        if command.instrument_id.is_spread() and self._is_backtest_client(client):
-            self._start_spread_quote_aggregator(client, command)
             return
 
         Condition.not_none(client, "client")
@@ -1236,6 +1231,9 @@ cdef class DataEngine(Component):
             if command.data_type.type == OrderBookDelta:
                 if command.instrument_id in client.subscribed_order_book_deltas():
                     client.unsubscribe_order_book_deltas(command)
+            elif command.data_type.type == OrderBookDepth10:
+                if command.instrument_id in client.subscribed_order_book_snapshots():
+                    client.unsubscribe_order_book_depth(command)
             else:
                 if command.instrument_id in client.subscribed_order_book_snapshots():
                     client.unsubscribe_order_book_snapshots(command)
@@ -1263,12 +1261,6 @@ cdef class DataEngine(Component):
 
     cpdef void _handle_unsubscribe_quote_ticks(self, MarketDataClient client, UnsubscribeQuoteTicks command):
         Condition.not_none(command.instrument_id, "instrument_id")
-
-        # Handle spread instruments (like bar aggregators, work in any context)
-        if command.instrument_id.is_spread() and self._is_backtest_client(client):
-            self._stop_spread_quote_aggregator(client, command)
-            return
-
         Condition.not_none(client, "client")
 
         if not self._msgbus.has_subscribers(
@@ -1394,6 +1386,8 @@ cdef class DataEngine(Component):
             self._handle_request_instrument(client, request)
         elif isinstance(request, RequestOrderBookSnapshot):
             self._handle_request_order_book_snapshot(client, request)
+        elif isinstance(request, RequestOrderBookDepth):
+            self._handle_request_order_book_depth(client, request)
         elif isinstance(request, RequestQuoteTicks):
             self._handle_request_quote_ticks(client, request)
         elif isinstance(request, RequestTradeTicks):
@@ -1437,6 +1431,9 @@ cdef class DataEngine(Component):
             return  # No client to handle request
 
         client.request_order_book_snapshot(request)
+
+    cpdef void _handle_request_order_book_depth(self, DataClient client, RequestOrderBookDepth request):
+        self._handle_date_range_request(client, request)
 
     cpdef void _handle_request_quote_ticks(self, DataClient client, RequestQuoteTicks request):
         self._handle_date_range_request(client, request)
@@ -1513,7 +1510,7 @@ cdef class DataEngine(Component):
             self._handle_response(response)
             return
 
-        self._new_query_group(request.id, n_requests)
+        self._new_query_group(request, n_requests)
 
         # Catalog query
         if has_catalog_data and not skip_catalog_data:
@@ -1539,6 +1536,8 @@ cdef class DataEngine(Component):
             client.request_quote_ticks(request)
         elif isinstance(request, RequestTradeTicks):
             client.request_trade_ticks(request)
+        elif isinstance(request, RequestOrderBookDepth):
+            client.request_order_book_depth(request)
         else:
             try:
                 client.request(request)
@@ -1606,6 +1605,12 @@ cdef class DataEngine(Component):
                 data = catalog.bars(
                     instrument_ids=[str(bar_type.instrument_id)],
                     bar_type=str(bar_type),
+                    start=ts_start,
+                    end=ts_end,
+                )
+            elif isinstance(request, RequestOrderBookDepth):
+                data = catalog.order_book_depth10(
+                    instrument_ids=[str(request.instrument_id)],
                     start=ts_start,
                     end=ts_end,
                 )
@@ -1786,10 +1791,18 @@ cdef class DataEngine(Component):
             )
 
     cpdef void _handle_order_book_depth(self, OrderBookDepth10 depth):
+        # Publish the depth data
         self._msgbus.publish_c(
             topic=self._get_depth_topic(depth.instrument_id),
             msg=depth,
         )
+
+        cdef QuoteTick quote_tick
+
+        if self._emit_quotes_from_book_depths:
+            quote_tick = depth.to_quote_tick()
+            if quote_tick is not None:
+                self._handle_quote_tick(quote_tick)
 
     cpdef void _handle_quote_tick(self, QuoteTick tick):
         self._cache.add_quote_tick(tick)
@@ -1908,41 +1921,36 @@ cdef class DataEngine(Component):
         self.response_count += 1
 
         # We may need to join responses from a catalog and a client
-        response_2 = self._handle_query_group(response)
+        grouped_response = self._handle_query_group(response)
 
-        if response_2 is None:
+        if grouped_response is None:
             return
 
         cdef bint query_past_data = response.params.get("subscription_name") is None
 
-        if query_past_data or response_2.data_type.type == Instrument:
-            if response_2.data_type.type == Instrument:
-                update_catalog = response_2.params.get("update_catalog", False)
-                force_update_catalog = response_2.params.get("force_update_catalog", False)
-                self._handle_instruments(response_2.data, update_catalog, force_update_catalog)
-            elif response_2.data_type.type == QuoteTick:
-                if response_2.params.get("bars_market_data_type"):
-                    response_2.data = self._handle_aggregated_bars(response_2)
-                    response_2.data_type = DataType(Bar)
-                else:
-                    self._handle_quote_ticks(response_2.data)
-            elif response_2.data_type.type == TradeTick:
-                if response_2.params.get("bars_market_data_type"):
-                    response_2.data = self._handle_aggregated_bars(response_2)
-                    response_2.data_type = DataType(Bar)
-                else:
-                    self._handle_trade_ticks(response_2.data)
-            elif response_2.data_type.type == Bar:
-                if response_2.params.get("bars_market_data_type"):
-                    response_2.data = self._handle_aggregated_bars(response_2)
-                else:
-                    self._handle_bars(response_2.data, response_2.data_type.metadata.get("partial"))
+        if query_past_data or grouped_response.data_type.type == Instrument:
+            if grouped_response.data_type.type == Instrument:
+                update_catalog = grouped_response.params.get("update_catalog", False)
+                force_update_catalog = grouped_response.params.get("force_update_catalog", False)
+                self._handle_instruments(grouped_response.data, update_catalog, force_update_catalog)
+            elif grouped_response.params.get("bars_market_data_type"):
+                grouped_response.data = self._handle_aggregated_bars(grouped_response)
+                grouped_response.data_type = DataType(Bar)
+            elif grouped_response.data_type.type == QuoteTick:
+                self._handle_quote_ticks(grouped_response.data)
+            elif grouped_response.data_type.type == TradeTick:
+                self._handle_trade_ticks(grouped_response.data)
+            elif grouped_response.data_type.type == Bar:
+                self._handle_bars(grouped_response.data, grouped_response.data_type.metadata.get("partial"))
+            elif grouped_response.data_type.type == OrderBookDepth10:
+                self._handle_order_book_depths(grouped_response.data)
             # Note: custom data will use the callback submitted by the user in actor.request_data
 
-        self._msgbus.response(response_2)
+        self._msgbus.response(grouped_response)
 
-    cpdef void _new_query_group(self, UUID4 correlation_id, int n_components):
-        self._query_group_n_responses[correlation_id] = n_components
+    cpdef void _new_query_group(self, RequestData request, int n_components):
+        self._query_group_n_responses[request.id] = n_components
+        self._query_group_requests[request.id] = request
 
     cpdef DataResponse _handle_query_group(self, DataResponse response):
         # Closure is not allowed in cpdef functions so we call a cdef function
@@ -2008,9 +2016,17 @@ cdef class DataEngine(Component):
             result += response.data
 
         result.sort(key=lambda x: x.ts_init)
+
+        # Use the original request from the group to ensure the correct response
+        # parameters are returned to the caller.
+        original_request = self._query_group_requests[correlation_id]
         response.data = result
+        response.start = original_request.start
+        response.end = original_request.end
+
         del self._query_group_n_responses[correlation_id]
         del self._query_group_responses[correlation_id]
+        del self._query_group_requests[correlation_id]
 
         return response
 
@@ -2104,6 +2120,14 @@ cdef class DataEngine(Component):
 
     cpdef void _handle_trade_ticks(self, list ticks):
         self._cache.add_trade_ticks(ticks)
+
+    cpdef void _handle_order_book_depths(self, list depths):
+        # Add order book depths to cache if needed
+        # Note: Currently no cache method for order book depths, but we can add individual depths
+        cdef OrderBookDepth10 depth
+        for depth in depths:
+            # Individual depths are handled by _handle_order_book_depth which publishes to msgbus
+            self._handle_order_book_depth(depth)
 
     cpdef void _handle_bars(self, list bars, Bar partial):
         self._cache.add_bars(bars)
@@ -2504,11 +2528,15 @@ cdef class DataEngine(Component):
                 bar_type=bar_type,
                 handler=self.process,
             )
+        elif bar_type.spec.aggregation == BarAggregation.RENKO:
+            aggregator = RenkoBarAggregator(
+                instrument=instrument,
+                bar_type=bar_type,
+                handler=self.process,
+            )
         else:
-            raise RuntimeError(  # pragma: no cover (design-time error)
-                f"Cannot start aggregator: "  # pragma: no cover (design-time error)
-                f"BarAggregation.{bar_type.spec.aggregation_string_c()} "  # pragma: no cover (design-time error)
-                f"not supported in open-source"  # pragma: no cover (design-time error)
+            raise NotImplementedError(  # pragma: no cover (design-time error)
+                bar_aggregation_not_implemented_message(bar_type.spec.aggregation)
             )
 
         return aggregator
@@ -2573,65 +2601,6 @@ cdef class DataEngine(Component):
 
         # Remove from aggregators
         del self._bar_aggregators[command.bar_type.standard()]
-
-    cpdef void _start_spread_quote_aggregator(self, MarketDataClient client, SubscribeQuoteTicks command):
-        spread_instrument_id = command.instrument_id
-
-        if spread_instrument_id in self._spread_quote_aggregators:
-            return
-
-        update_interval_seconds = command.params.get("update_interval_seconds", 60)
-        aggregator = SpreadQuoteAggregator(
-            spread_instrument_id=spread_instrument_id,
-            handler=self.process,
-            msgbus=self._msgbus,
-            cache=self._cache,
-            clock=self._clock,
-            update_interval_seconds=update_interval_seconds,
-        )
-        self._spread_quote_aggregators[spread_instrument_id] = aggregator
-
-        # Subscribe to quotes for component instruments
-        components = spread_instrument_id.to_list()
-
-        for component_id, _ in components:
-            subscribe = SubscribeQuoteTicks(
-                instrument_id=component_id,
-                client_id=command.client_id,
-                venue=command.venue,
-                command_id=command.id,
-                ts_init=command.ts_init,
-                params=command.params,
-            )
-            self._handle_subscribe_quote_ticks(client, subscribe)
-
-    cpdef void _stop_spread_quote_aggregator(self, MarketDataClient client, UnsubscribeQuoteTicks command):
-        spread_instrument_id = command.instrument_id
-        aggregator = self._spread_quote_aggregators.get(spread_instrument_id)
-
-        if aggregator is None:
-            self._log.warning(
-                f"Cannot stop spread quote aggregator: no aggregator found for {spread_instrument_id}",
-            )
-            return
-
-        aggregator.stop()
-
-        # Unsubscribe from component instruments
-        components = spread_instrument_id.to_list()
-
-        for component_id, _ in components:
-            unsubscribe = UnsubscribeQuoteTicks(
-                instrument_id=component_id,
-                client_id=command.client_id,
-                venue=command.venue,
-                command_id=command.id,
-                ts_init=command.ts_init,
-                params=command.params,
-            )
-            self._handle_unsubscribe_quote_ticks(client, unsubscribe)
-
-        del self._spread_quote_aggregators[spread_instrument_id]
 
     cpdef void _update_synthetics_with_quote(self, list synthetics, QuoteTick update):
         cdef SyntheticInstrument synthetic

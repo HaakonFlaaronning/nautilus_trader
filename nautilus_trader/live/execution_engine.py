@@ -22,6 +22,8 @@ from collections import Counter
 from decimal import Decimal
 from typing import Any, Final, cast
 
+import pandas as pd
+
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -31,11 +33,13 @@ from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import millis_to_nanos
+from nautilus_trader.core.datetime import secs_to_nanos
 from nautilus_trader.core.fsm import InvalidStateTrigger
 from nautilus_trader.core.message import Command
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.execution.messages import GenerateExecutionMassStatus
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import QueryOrder
@@ -45,8 +49,16 @@ from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.enqueue import ThrottledEnqueuer
+from nautilus_trader.live.reconciliation import calculate_reconciliation_price
+from nautilus_trader.live.reconciliation import create_inferred_order_filled_event
+from nautilus_trader.live.reconciliation import create_order_accepted_event
+from nautilus_trader.live.reconciliation import create_order_canceled_event
+from nautilus_trader.live.reconciliation import create_order_expired_event
+from nautilus_trader.live.reconciliation import create_order_filled_event
+from nautilus_trader.live.reconciliation import create_order_rejected_event
+from nautilus_trader.live.reconciliation import create_order_triggered_event
+from nautilus_trader.live.reconciliation import create_order_updated_event
 from nautilus_trader.model.book import py_should_handle_own_book_order
-from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
@@ -54,25 +66,16 @@ from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.enums import trailing_offset_type_to_str
 from nautilus_trader.model.enums import trigger_type_to_str
-from nautilus_trader.model.events import OrderAccepted
-from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderEvent
-from nautilus_trader.model.events import OrderExpired
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
-from nautilus_trader.model.events import OrderRejected
-from nautilus_trader.model.events import OrderTriggered
-from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.objects import Money
-from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.orders import OrderUnpacker
@@ -126,7 +129,10 @@ class LiveExecutionEngine(ExecutionEngine):
         self._loop: asyncio.AbstractEventLoop = loop
         self._cmd_queue: asyncio.Queue = Queue(maxsize=config.qsize)
         self._evt_queue: asyncio.Queue = Queue(maxsize=config.qsize)
-        self._inflight_check_retries: Counter[ClientOrderId] = Counter()
+        self._recon_check_retries: Counter[ClientOrderId] = Counter()
+        self._ts_last_query: dict[ClientOrderId, int] = {}
+        self._order_local_activity_ns: dict[ClientOrderId, int] = {}
+        self._filtered_external_orders_count: int = 0
 
         self._cmd_enqueuer: ThrottledEnqueuer[Command] = ThrottledEnqueuer(
             qname="cmd_queue",
@@ -146,9 +152,8 @@ class LiveExecutionEngine(ExecutionEngine):
         # Async tasks
         self._cmd_queue_task: asyncio.Task | None = None
         self._evt_queue_task: asyncio.Task | None = None
-        self._inflight_check_task: asyncio.Task | None = None
+        self._reconciliation_task: asyncio.Task | None = None
         self._own_books_audit_task: asyncio.Task | None = None
-        self._open_check_task: asyncio.Task | None = None
         self._purge_closed_orders_task: asyncio.Task | None = None
         self._purge_closed_positions_task: asyncio.Task | None = None
         self._purge_account_events_task: asyncio.Task | None = None
@@ -170,6 +175,10 @@ class LiveExecutionEngine(ExecutionEngine):
         self.own_books_audit_interval_secs: float | None = config.own_books_audit_interval_secs
         self.open_check_interval_secs: float | None = config.open_check_interval_secs
         self.open_check_open_only: bool = config.open_check_open_only
+        self.open_check_lookback_mins: int = config.open_check_lookback_mins
+        self.open_check_threshold_ms: int = config.open_check_threshold_ms
+        self.open_check_missing_retries: int = config.open_check_missing_retries
+        self.reconciliation_startup_delay_secs: float = config.reconciliation_startup_delay_secs
         self.purge_closed_orders_interval_mins = config.purge_closed_orders_interval_mins
         self.purge_closed_orders_buffer_mins = config.purge_closed_orders_buffer_mins
         self.purge_closed_positions_interval_mins = config.purge_closed_positions_interval_mins
@@ -191,6 +200,10 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.info(f"{config.own_books_audit_interval_secs=}", LogColor.BLUE)
         self._log.info(f"{config.open_check_interval_secs=}", LogColor.BLUE)
         self._log.info(f"{config.open_check_open_only=}", LogColor.BLUE)
+        self._log.info(f"{config.open_check_lookback_mins=}", LogColor.BLUE)
+        self._log.info(f"{config.open_check_threshold_ms=}", LogColor.BLUE)
+        self._log.info(f"{config.open_check_missing_retries=}", LogColor.BLUE)
+        self._log.info(f"{config.reconciliation_startup_delay_secs=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_orders_interval_mins=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_orders_buffer_mins=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_positions_interval_mins=}", LogColor.BLUE)
@@ -201,6 +214,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.info(f"{config.graceful_shutdown_on_exception=}", LogColor.BLUE)
 
         self._inflight_check_threshold_ns: int = millis_to_nanos(self.inflight_check_threshold_ms)
+        self._open_check_threshold_ns: int = millis_to_nanos(self.open_check_threshold_ms)
         self._shutdown_initiated: bool = False
 
         # Register endpoints
@@ -278,17 +292,6 @@ class LiveExecutionEngine(ExecutionEngine):
         """
         return self._evt_queue_task
 
-    def get_inflight_check_task(self) -> asyncio.Task | None:
-        """
-        Return the internal in-flight check task for the engine.
-
-        Returns
-        -------
-        asyncio.Task or ``None``
-
-        """
-        return self._inflight_check_task
-
     def get_own_books_audit_task(self) -> asyncio.Task | None:
         """
         Return the own books audit task for the engine.
@@ -300,16 +303,16 @@ class LiveExecutionEngine(ExecutionEngine):
         """
         return self._own_books_audit_task
 
-    def get_open_check_task(self) -> asyncio.Task | None:
+    def get_reconciliation_task(self) -> asyncio.Task | None:
         """
-        Return the open check task for the engine.
+        Return the continuous reconciliation task for the engine.
 
         Returns
         -------
         asyncio.Task or ``None``
 
         """
-        return self._open_check_task
+        return self._reconciliation_task
 
     def cmd_qsize(self) -> int:
         """
@@ -382,6 +385,7 @@ class LiveExecutionEngine(ExecutionEngine):
             The event to process.
 
         """
+        self._record_local_activity(event)
         self._evt_enqueuer.enqueue(event)
 
     # -- INTERNAL -------------------------------------------------------------------------------------
@@ -411,6 +415,39 @@ class LiveExecutionEngine(ExecutionEngine):
         self._loop.call_soon_threadsafe(self._evt_queue.put_nowait, self._sentinel)
         self._log.debug("Sentinel messages placed on queues")
 
+    def _record_local_activity(self, event: OrderEvent | None) -> None:
+        if event is None:
+            return
+        client_order_id = event.client_order_id
+        if client_order_id is None:
+            return
+        ts_event = event.ts_event
+        if ts_event == 0:
+            ts_event = self._clock.timestamp_ns()
+        self._order_local_activity_ns[client_order_id] = ts_event
+
+    def _clear_recon_tracking(
+        self,
+        client_order_id: ClientOrderId,
+        *,
+        drop_last_query: bool = True,
+    ) -> None:
+        self._recon_check_retries.pop(client_order_id, None)
+        if drop_last_query:
+            self._ts_last_query.pop(client_order_id, None)
+
+    def _handle_event_with_tracking(self, event: OrderEvent) -> None:
+        self._record_local_activity(event)
+        self._handle_event(event)
+
+        if event.client_order_id is None:
+            return
+
+        order = self._cache.order(event.client_order_id)
+        if order and order.is_closed:
+            self._clear_recon_tracking(order.client_order_id)
+            self._order_local_activity_ns.pop(order.client_order_id, None)
+
     def _on_start(self) -> None:
         if not self._loop.is_running():
             self._log.warning("Started when loop is not running")
@@ -420,24 +457,21 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.debug(f"Scheduled task '{self._cmd_queue_task.get_name()}'")
         self._log.debug(f"Scheduled task '{self._evt_queue_task.get_name()}'")
 
-        if not self._inflight_check_task:
-            if self.inflight_check_interval_ms > 0:
-                self._inflight_check_task = self._loop.create_task(
-                    self._inflight_check_loop(),
-                    name="inflight_check",
-                )
-                self._log.debug(f"Scheduled task '{self._inflight_check_task.get_name()}'")
+        # Start reconciliation task if any check is configured
+        if (
+            self.inflight_check_interval_ms > 0 or self.open_check_interval_secs
+        ) and not self._reconciliation_task:
+            self._reconciliation_task = self._loop.create_task(
+                self._continuous_reconciliation_loop(),
+                name="continuous_reconciliation",
+            )
+            self._log.debug(f"Scheduled task '{self._reconciliation_task.get_name()}'")
+            self._log.info("Started reconciliation task", LogColor.BLUE)
 
         if self.own_books_audit_interval_secs and not self._own_books_audit_task:
             self._own_books_audit_task = self._loop.create_task(
                 self._own_books_audit_loop(self.own_books_audit_interval_secs),
                 name="own_books_audit",
-            )
-
-        if self.open_check_interval_secs and not self._open_check_task:
-            self._open_check_task = self._loop.create_task(
-                self._open_check_loop(self.open_check_interval_secs),
-                name="open_check",
             )
 
         if self.purge_closed_orders_interval_mins and not self._purge_closed_orders_task:
@@ -459,25 +493,26 @@ class LiveExecutionEngine(ExecutionEngine):
             )
 
     def _on_stop(self) -> None:
-        if self._inflight_check_task:
-            self._log.debug(f"Canceling task '{self._inflight_check_task.get_name()}'")
-            self._inflight_check_task.cancel()
-            self._inflight_check_task = None
+        if self._reconciliation_task:
+            self._log.debug(f"Canceling task '{self._reconciliation_task.get_name()}'")
+            self._reconciliation_task.cancel()
+            self._reconciliation_task = None
 
         if self._own_books_audit_task:
             self._log.debug(f"Canceling task '{self._own_books_audit_task.get_name()}'")
             self._own_books_audit_task.cancel()
             self._own_books_audit_task = None
 
-        if self._open_check_task:
-            self._log.debug(f"Canceling task '{self._open_check_task.get_name()}'")
-            self._open_check_task.cancel()
-            self._open_check_task = None
-
         if self._purge_closed_orders_task:
             self._log.debug(f"Canceling task '{self._purge_closed_orders_task.get_name()}'")
             self._purge_closed_orders_task.cancel()
             self._purge_closed_orders_task = None
+
+        if self._filtered_external_orders_count > 0:
+            self._log.info(
+                f"Filtered {self._filtered_external_orders_count:,} unclaimed EXTERNAL orders during run",
+                LogColor.BLUE,
+            )
 
         if self._purge_closed_positions_task:
             self._log.debug(f"Canceling task '{self._purge_closed_positions_task.get_name()}'")
@@ -531,7 +566,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     if event is self._sentinel:
                         break
 
-                    self._handle_event(event)
+                    self._handle_event_with_tracking(event)
                 except asyncio.CancelledError:
                     self._log.warning("Canceled task 'run_evt_queue'")
                     break
@@ -545,89 +580,154 @@ class LiveExecutionEngine(ExecutionEngine):
             else:
                 self._log.debug(stopped_msg)
 
-    async def _inflight_check_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self.inflight_check_interval_ms / 1000)
+    def _resolve_inflight_order(self, order: Order) -> None:
+        if not order.is_inflight:
+            self._log.debug(
+                f"Skipping inflight resolution for {order.client_order_id!r} - current status {order.status_string()}",
+            )
+            self._clear_recon_tracking(order.client_order_id)
+            self._order_local_activity_ns.pop(order.client_order_id, None)
+            return
 
-                try:
-                    await self._check_inflight_orders()
-                except Exception as e:
-                    self._log.exception("Failed to check in-flight orders", e)
-        except asyncio.CancelledError:
-            self._log.debug("Canceled task 'inflight_check_loop'")
+        ts_now = self._clock.timestamp_ns()
 
-    async def _check_inflight_orders(self) -> None:
-        self._log.debug("Checking in-flight orders status")
-        inflight_orders: list[Order] = self._cache.orders_inflight()
-        inflight_len = len(inflight_orders)
+        if order.status == OrderStatus.SUBMITTED:
+            rejected = create_order_rejected_event(
+                order=order,
+                ts_now=ts_now,
+                reason="UNKNOWN",
+            )
+            self._log.debug(f"Generated {rejected}")
+            self._handle_event_with_tracking(rejected)
+        elif order.status in (OrderStatus.PENDING_UPDATE, OrderStatus.PENDING_CANCEL):
+            canceled = create_order_canceled_event(
+                order=order,
+                ts_now=ts_now,
+            )
+            self._log.debug(f"Generated {canceled}")
+            self._handle_event_with_tracking(canceled)
+        else:
+            raise RuntimeError(f"Invalid status for in-flight order, was '{order.status_string()}'")
+
+        self._clear_recon_tracking(order.client_order_id)
+        self._order_local_activity_ns.pop(order.client_order_id, None)
+
+    async def _resolve_order_not_found_at_venue(self, order: Order) -> None:
+        """
+        Resolve an order that exists in cache but is not found at the venue.
+
+        This handles the case where our cache shows an order as open but the venue has
+        no record of it, which typically means the order was never successfully placed
+        or was rejected.
+
+        Before marking as rejected, performs a targeted query to check if the order
+        exists but was missed due to API timing/processing delays.
+
+        """
+        ts_now = self._clock.timestamp_ns()
+
         self._log.debug(
-            f"Found {inflight_len} order{'' if inflight_len == 1 else 's'} in-flight",
+            f"Performing targeted query for {order.client_order_id!r} before marking as REJECTED",
+            LogColor.BLUE,
         )
 
-        for order in inflight_orders:
-            retries = self._inflight_check_retries[order.client_order_id]
-
-            if retries >= self.inflight_check_max_retries:
-                self._inflight_check_retries.pop(order.client_order_id, None)
-                self._resolve_inflight_order(order)
-                continue
-
-            ts_now = self._clock.timestamp_ns()
-            ts_init_last = order.last_event.ts_event
-            self._log.debug(
-                f"Checking in-flight order: {ts_now=}, {ts_init_last=}, {order=}...",
+        client_id = self._cache.client_id(order.client_order_id)
+        if client_id is None:
+            self._log.warning(
+                f"No client_id found for {order.client_order_id!r}, skipping targeted query",
             )
+            # Skip targeted query but proceed with resolution
+        else:
+            client = self._clients.get(client_id)
 
-            if ts_now > order.last_event.ts_event + self._inflight_check_threshold_ns:
-                self._log.debug(f"Querying {order} with exchange...")
-                query = QueryOrder(
-                    trader_id=order.trader_id,
-                    strategy_id=order.strategy_id,
+            try:
+                query_ts = self._clock.timestamp_ns()
+                command = GenerateOrderStatusReport(
                     instrument_id=order.instrument_id,
                     client_order_id=order.client_order_id,
                     venue_order_id=order.venue_order_id,
                     command_id=UUID4(),
-                    ts_init=self._clock.timestamp_ns(),
+                    ts_init=query_ts,
                 )
-                self._execute_command(query)
-                self._inflight_check_retries[order.client_order_id] += 1
 
-    def _resolve_inflight_order(self, order: Order) -> None:
-        ts_now = self._clock.timestamp_ns()
+                self._ts_last_query[order.client_order_id] = query_ts
+                report = await client.generate_order_status_report(command)
+                if report is not None:
+                    self._log.info(
+                        f"Found {order.client_order_id!r} via targeted query: {report.order_status}",
+                        LogColor.BLUE,
+                    )
+                    self._reconcile_order_report(report, trades=[])
+                    return  # Order found and reconciled, no need to mark as rejected
+            except Exception as e:
+                self._log.warning(f"Error during targeted query for {order.client_order_id!r}: {e}")
 
-        if order.status == OrderStatus.SUBMITTED:
-            rejected = OrderRejected(
-                trader_id=order.trader_id,
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                account_id=order.account_id,
-                reason="UNKNOWN",
-                event_id=UUID4(),
-                ts_event=ts_now,
-                ts_init=ts_now,
-                reconciliation=True,
+        if not order.is_open:
+            self._log.debug(
+                f"Skipping reconciliation for {order.client_order_id!r} - already {order.status_string()}",
             )
-            self._log.debug(f"Generated {rejected}")
-            self._handle_event(rejected)
-        elif order.status in (OrderStatus.PENDING_UPDATE, OrderStatus.PENDING_CANCEL):
-            canceled = OrderCanceled(
-                trader_id=order.trader_id,
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                venue_order_id=order.venue_order_id,
-                account_id=order.account_id,
-                event_id=UUID4(),
-                ts_event=ts_now,
-                ts_init=ts_now,
-                reconciliation=True,
+            self._clear_recon_tracking(order.client_order_id)
+            self._order_local_activity_ns.pop(order.client_order_id, None)
+            return
+
+        if order.status == OrderStatus.ACCEPTED:
+            self._log.warning(
+                f"Reconciling {order.client_order_id!r}: ACCEPTED order not found at venue, marking as REJECTED",
+                LogColor.YELLOW,
             )
-            self._log.debug(f"Generated {canceled}")
-            self._handle_event(canceled)
-        else:
-            raise RuntimeError(f"Invalid status for in-flight order, was '{order.status_string()}'")
+            rejected = create_order_rejected_event(
+                order=order,
+                ts_now=ts_now,
+                reason="ORDER_NOT_FOUND_AT_VENUE",
+            )
+            self._handle_event_with_tracking(rejected)
+            self._clear_recon_tracking(order.client_order_id)
+            self._order_local_activity_ns.pop(order.client_order_id, None)
+            return
+
+        if order.status == OrderStatus.PARTIALLY_FILLED:
+            self._log.warning(
+                f"Reconciling {order.client_order_id!r}: PARTIALLY_FILLED "
+                f"order not found at venue, marking as CANCELED (preserving {order.filled_qty} filled quantity)",
+                LogColor.YELLOW,
+            )
+            canceled = create_order_canceled_event(
+                order=order,
+                ts_now=ts_now,
+            )
+            self._handle_event_with_tracking(canceled)
+            self._clear_recon_tracking(order.client_order_id)
+            self._order_local_activity_ns.pop(order.client_order_id, None)
+            return
+
+        if order.is_inflight:
+            self._log.debug(
+                f"Deferring resolution for {order.client_order_id!r} - still inflight state {order.status_string()}",
+            )
+            self._clear_recon_tracking(order.client_order_id, drop_last_query=False)
+            self._ts_last_query[order.client_order_id] = ts_now
+            return
+
+        if order.is_closed:
+            if order.status == OrderStatus.FILLED:
+                self._log.debug(
+                    f"{order.client_order_id!r} is FILLED and not found at venue (expected behavior)",
+                )
+            else:
+                self._log.warning(
+                    f"Order {order.client_order_id!r} is already closed as {order.status_string()}, "
+                    "skipping missing-order resolution",
+                )
+            self._clear_recon_tracking(order.client_order_id)
+            self._order_local_activity_ns.pop(order.client_order_id, None)
+            return
+
+        self._log.warning(
+            f"Unexpected order status {order.status_string()} "
+            f"for order not found at venue: {order.client_order_id!r}",
+        )
+        self._clear_recon_tracking(order.client_order_id)
+        self._order_local_activity_ns.pop(order.client_order_id, None)
 
     async def _own_books_audit_loop(self, interval_secs: float) -> None:
         try:
@@ -635,46 +735,165 @@ class LiveExecutionEngine(ExecutionEngine):
                 await asyncio.sleep(interval_secs)
                 self._cache.audit_own_order_books()
         except asyncio.CancelledError:
-            self._log.debug("Canceled task 'own_books_audit_loop'")
+            self._log.debug("Canceled task 'own_books_audit'")
         except Exception as e:
             self._log.exception("Error auditing own books", e)
 
-    async def _open_check_loop(self, interval_secs: float) -> None:
+    async def _continuous_reconciliation_loop(self) -> None:
         try:
-            while True:
-                await asyncio.sleep(interval_secs)
-                await self._check_open_orders()
-        except asyncio.CancelledError:
-            self._log.debug("Canceled task 'open_check_loop'")
+            # Track last execution times (in nanoseconds)
+            ts_last_inflight_check = 0
+            ts_last_consistency_check = 0
 
-    async def _check_open_orders(self) -> None:
+            # Convert intervals to nanoseconds (handle None values)
+            inflight_check_interval_ns = (
+                millis_to_nanos(self.inflight_check_interval_ms)
+                if self.inflight_check_interval_ms > 0
+                else 0
+            )
+            consistency_check_interval_ns = (
+                secs_to_nanos(self.open_check_interval_secs) if self.open_check_interval_secs else 0
+            )
+
+            # Determine minimum sleep interval (in seconds)
+            intervals_secs: list[float] = []
+
+            if self.inflight_check_interval_ms > 0:
+                intervals_secs.append(self.inflight_check_interval_ms / 1000)
+            if self.open_check_interval_secs:
+                intervals_secs.append(self.open_check_interval_secs)
+
+            min_interval_secs = min(intervals_secs) if intervals_secs else 1.0
+
+            self._log.info(
+                f"Starting continuous reconciliation with intervals: "
+                f"inflight={self.inflight_check_interval_ms}ms, "
+                f"consistency={self.open_check_interval_secs}s",
+                LogColor.BLUE,
+            )
+
+            await asyncio.sleep(self.reconciliation_startup_delay_secs)
+
+            while True:
+                ts_now = self._clock.timestamp_ns()
+
+                # Higher-frequency in-flight check (if configured)
+                if (
+                    inflight_check_interval_ns > 0
+                    and ts_now - ts_last_inflight_check >= inflight_check_interval_ns
+                ):
+                    try:
+                        await self._check_inflight_orders()
+                        ts_last_inflight_check = ts_now
+                    except Exception as e:
+                        self._log.exception("Failed in check_inflight_orders", e)
+
+                # Lower-frequency consistency check (if configured)
+                if (
+                    consistency_check_interval_ns > 0
+                    and ts_now - ts_last_consistency_check >= consistency_check_interval_ns
+                ):
+                    try:
+                        await self._check_orders_consistency()
+                        ts_last_consistency_check = ts_now
+                    except Exception as e:
+                        self._log.exception("Failed in check_orders_consistency", e)
+
+                await asyncio.sleep(min_interval_secs)
+        except asyncio.CancelledError:
+            self._log.debug("Canceled task 'continuous_reconciliation'")
+
+    async def _check_inflight_orders(self) -> None:
+        self._log.debug("Checking in-flight orders status")
+
+        delayed_orders: list[Order] = []
+        inflight_orders: list[Order] = self._cache.orders_inflight()
+
+        ts_now = self._clock.timestamp_ns()
+
+        for order in inflight_orders:
+            if ts_now > order.last_event.ts_event + self._inflight_check_threshold_ns:
+                delayed_orders.append(order)
+
+        if delayed_orders:
+            self._log.debug(
+                f"Detected {len(delayed_orders)} delayed in-flight "
+                f"order{'' if len(delayed_orders) == 1 else 's'}",
+            )
+
+        # Query and potentially resolve each inconsistent order
+        for order in delayed_orders:
+            if not order.is_inflight:
+                self._clear_recon_tracking(order.client_order_id, drop_last_query=False)
+                continue
+
+            last_query_ts = self._ts_last_query.get(order.client_order_id)
+            if last_query_ts and ts_now - last_query_ts < self._inflight_check_threshold_ns:
+                self._log.debug(
+                    f"Skipping re-query for {order.client_order_id!r} - awaiting prior response",
+                )
+                continue
+
+            retries = self._recon_check_retries[order.client_order_id]
+            if retries >= self.inflight_check_max_retries:
+                backlog = self.evt_qsize()
+                if backlog > 0:
+                    self._log.debug(
+                        f"Deferring inflight resolution for {order.client_order_id!r} - event queue backlog {backlog}",
+                    )
+                    continue
+
+                self._resolve_inflight_order(order)
+            else:
+                self._log.debug(f"Querying {order} with venue...")
+                query_ts = self._clock.timestamp_ns()
+                query = QueryOrder(
+                    trader_id=order.trader_id,
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    command_id=UUID4(),
+                    ts_init=query_ts,
+                )
+                self._execute_command(query)
+                self._ts_last_query[order.client_order_id] = query_ts
+                self._recon_check_retries[order.client_order_id] = retries + 1
+
+    async def _check_orders_consistency(self) -> None:  # noqa: C901 (too complex)
         try:
-            self._log.debug("Checking open orders status")
+            self._log.debug("Checking order consistency between cached-state and venues")
 
             open_order_ids: set[ClientOrderId] = self._cache.client_order_ids_open()
             open_orders: list[Order] = self._cache.orders_open()
+
+            if self.reconciliation_instrument_ids:
+                open_orders = [
+                    o for o in open_orders if o.instrument_id in self.reconciliation_instrument_ids
+                ]
+                open_order_ids = {o.client_order_id for o in open_orders}
+
             open_len = len(open_orders)
-            self._log.debug(f"Found {open_len} order{'' if open_len == 1 else 's'} open")
+            self._log.debug(f"Found {open_len} order{'' if open_len == 1 else 's'} open in cache")
 
-            check_open_only = self.open_check_open_only
+            if not self._clients:
+                return  # No clients to query
 
-            # In full-history mode, if there are no cached open orders, skip the venue check
-            # In open-only mode, the venue is always queried regardless of cache state
-            if not open_orders and not check_open_only:
-                return  # Nothing further to check
+            # For continuous reconciliation limit lookback to configured window
+            order_status_start = self._clock.utc_now() - pd.Timedelta(
+                minutes=self.open_check_lookback_mins,
+            )
 
-            if check_open_only:
-                clients = self._clients.values()
-            else:
-                clients = self.get_clients_for_orders(open_orders)
+            # Always use all registered clients for consistency checks
+            clients = self._clients.values()
 
             tasks = [
                 c.generate_order_status_reports(
                     GenerateOrderStatusReports(
                         instrument_id=None,
-                        start=None,
+                        start=order_status_start,
                         end=None,
-                        open_only=check_open_only,
+                        open_only=self.open_check_open_only,
                         command_id=UUID4(),
                         ts_init=self._clock.timestamp_ns(),
                         log_receipt_level=LogLevel.DEBUG,
@@ -696,16 +915,117 @@ class LiveExecutionEngine(ExecutionEngine):
                 reports = cast(list[OrderStatusReport], reports_or_exception)
                 all_order_reports.extend(reports)
 
-            # For each report, compare the reported open status with our cache
-            # If there's a discrepancy, reconcile the order report
+            # Build set of client order IDs reported by venue
+            venue_reported_ids: set[ClientOrderId] = {
+                report.client_order_id
+                for report in all_order_reports
+                if report.client_order_id is not None
+            }
+
+            # Reconcile each report against cache state
             for report in all_order_reports:
                 is_in_open_ids = report.client_order_id in open_order_ids
 
+                # Clear any retry counts for successfully queried orders
+                if report.client_order_id:
+                    self._clear_recon_tracking(report.client_order_id)
+                elif report.venue_order_id:
+                    # Try to map venue-only ID to client order ID and clear that retry counter
+                    mapped_client_id = self._cache.client_order_id(report.venue_order_id)
+                    if mapped_client_id:
+                        self._clear_recon_tracking(mapped_client_id)
+
+                # Check if we should reconcile this order
+                should_reconcile = False
+                reconcile_reason = ""
+
                 if report.is_open != is_in_open_ids:
+                    should_reconcile = True
+                    reconcile_reason = f"venue_open={report.is_open}, cache_open={is_in_open_ids}"
+                elif report.filled_qty and report.filled_qty > 0 and report.client_order_id:
+                    order = self._cache.order(report.client_order_id)
+                    if order and order.filled_qty != report.filled_qty:
+                        should_reconcile = True
+                        reconcile_reason = f"filled_qty mismatch: venue={report.filled_qty}, cache={order.filled_qty}"
+
+                if should_reconcile:
+                    # Apply include filter before reconciling
+                    if not self._consider_for_reconciliation(report.instrument_id):
+                        self._log.debug(
+                            f"Skipping reconciliation for {report.client_order_id!r}: "
+                            f"instrument {report.instrument_id} not in include list",
+                        )
+                        continue
+
+                    self._log.debug(
+                        f"Reconciling {report.client_order_id!r}: {reconcile_reason}",
+                        LogColor.BLUE,
+                    )
                     self._reconcile_order_report(report, trades=[])
+
+            # When open_check_open_only=True, we can't determine if orders are truly missing
+            # or just filled/canceled (since venue only returns open orders)
+            # Skip the missing order resolution to avoid false positives
+            if self.open_check_open_only:
+                missing_orders = open_order_ids - venue_reported_ids
+                if missing_orders:
+                    self._log.debug(
+                        f"{len(missing_orders)} cached open order(s) not in venue's current response - "
+                        f"likely recently filled/canceled (venue may include recent closed orders with open query):",
+                    )
+                    for order_id in missing_orders:
+                        self._log.debug(f"- {order_id}")
+
+                return  # Can't reliably resolve missing orders in open_only mode
+
+            # Check for orders that are open in cache but not reported by venue
+            # In full history mode, these are genuinely missing orders
+            missing_at_venue: set[ClientOrderId] = open_order_ids - venue_reported_ids
+            ts_now = self._clock.timestamp_ns()
+
+            for client_order_id in missing_at_venue:
+                order = self._cache.order(client_order_id)
+                if order is None:
+                    self._log.error(f"{client_order_id!r} missing at venue and not found in cache")
+                    continue
+
+                # Check if order is too recent to reconcile (avoid race conditions)
+                ts_last = order.ts_last
+                if (ts_now - ts_last) < self._open_check_threshold_ns:
+                    # TODO: Debug log for initial development only
+                    self._log.debug(
+                        f"Skipping reconciliation for {client_order_id!r} - order too recent "
+                        f"(age={(ts_now - ts_last) / 1_000_000}ms < threshold={self.open_check_threshold_ms}ms)",
+                    )
+                    continue
+
+                local_activity = self._order_local_activity_ns.get(client_order_id)
+                if local_activity and (ts_now - local_activity) < self._open_check_threshold_ns:
+                    self._log.debug(
+                        f"Skipping reconciliation for {client_order_id!r}; "
+                        f"pending local activity ({(ts_now - local_activity) / 1_000_000}ms < threshold={self.open_check_threshold_ms}ms)",
+                    )
+                    continue
+
+                retries = self._recon_check_retries.get(client_order_id, 0)
+                if retries >= self.open_check_missing_retries:
+                    self._log.warning(
+                        f"Order {client_order_id!r} not found at venue after {retries} retries, performing targeted query",
+                        LogColor.YELLOW,
+                    )
+                    self._clear_recon_tracking(client_order_id, drop_last_query=False)
+                    await self._resolve_order_not_found_at_venue(order)
+                else:
+                    self._recon_check_retries[client_order_id] = retries + 1
+                    self._log.debug(
+                        f"Order {client_order_id!r} not found at venue, retry {retries + 1}/{self.open_check_missing_retries}",
+                    )
         except Exception as e:
-            # Catch all exception for error visibility in task
-            self._log.exception("Error in check_open_orders", e)
+            self._log.exception("Error in check_order_consistency", e)
+
+    async def _check_open_orders(self) -> None:
+        # Legacy method maintained for compatibility
+        await self._check_orders_consistency()
 
     async def _purge_closed_orders_loop(self, interval_mins: int) -> None:
         interval_secs = interval_mins * 60
@@ -722,7 +1042,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     purge_from_database=self.purge_from_database,
                 )
         except asyncio.CancelledError:
-            self._log.debug("Canceled task 'purge_closed_orders_loop'")
+            self._log.debug("Canceled task 'purge_closed_orders'")
         except Exception as e:
             self._log.exception("Error purging closed orders", e)
 
@@ -741,7 +1061,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     purge_from_database=self.purge_from_database,
                 )
         except asyncio.CancelledError:
-            self._log.debug("Canceled task 'purge_closed_positions_loop'")
+            self._log.debug("Canceled task 'purge_closed_positions'")
         except Exception as e:
             self._log.exception("Error purging closed positions", e)
 
@@ -760,23 +1080,23 @@ class LiveExecutionEngine(ExecutionEngine):
                     purge_from_database=self.purge_from_database,
                 )
         except asyncio.CancelledError:
-            self._log.debug("Canceled task 'purge_account_events_loop'")
+            self._log.debug("Canceled task 'purge_account_events'")
         except Exception as e:
             self._log.exception("Error purging account events", e)
 
     # -- RECONCILIATION -------------------------------------------------------------------------------
-
-    def _log_reconciliation_result(self, value: ClientId | InstrumentId, result: bool) -> None:
-        if result:
-            self._log.info(f"Reconciliation for {value} succeeded", LogColor.GREEN)
-        else:
-            self._log.warning(f"Reconciliation for {value} failed")
 
     def _consider_for_reconciliation(self, instrument_id: InstrumentId) -> bool:
         if self.reconciliation_instrument_ids:
             return instrument_id in self.reconciliation_instrument_ids
 
         return True
+
+    def _log_reconciliation_result(self, value: ClientId | InstrumentId, result: bool) -> None:
+        if result:
+            self._log.info(f"Reconciliation for {value} succeeded", LogColor.GREEN)
+        else:
+            self._log.warning(f"Reconciliation for {value} failed")
 
     def _log_skipping_reconciliation_on_instrument_id(self, report: ExecutionReport) -> None:
         self._log.debug(
@@ -962,7 +1282,7 @@ class LiveExecutionEngine(ExecutionEngine):
             self._log_skipping_reconciliation_on_instrument_id(report)
             return True  # Filtered
 
-        self._log.info(f"Reconciling {report}", color=LogColor.BLUE)
+        self._log.debug(f"Reconciling {report}", color=LogColor.BLUE)
 
         if isinstance(report, OrderStatusReport):
             result = self._reconcile_order_report(report, [])  # No trades to reconcile
@@ -1094,12 +1414,20 @@ class LiveExecutionEngine(ExecutionEngine):
             report.client_order_id = client_order_id
 
         # Reset retry count
-        self._inflight_check_retries.pop(client_order_id, None)
+        self._clear_recon_tracking(client_order_id)
 
         self._log.debug(f"Reconciling order for {client_order_id!r}", LogColor.MAGENTA)
         order: Order = self._cache.order(client_order_id)
 
         if order is None:
+            instrument = self._cache.instrument(report.instrument_id)
+            if instrument is None:
+                self._log.debug(
+                    f"Cannot reconcile order for {client_order_id!r}: "
+                    f"instrument {report.instrument_id} not found",
+                )
+                return True  # Filtered instrument not loaded
+
             order = self._generate_order(report, is_external)
 
             if order is None:
@@ -1112,14 +1440,15 @@ class LiveExecutionEngine(ExecutionEngine):
             if self.manage_own_order_books and py_should_handle_own_book_order(order):
                 self._add_own_book_order(order)
 
-        instrument: Instrument | None = self._cache.instrument(order.instrument_id)
-
-        if instrument is None:
-            self._log.error(
-                f"Cannot reconcile order for {order.client_order_id!r}: "
-                f"instrument {order.instrument_id} not found",
-            )
-            return False  # Failed
+        else:
+            # Order already exists, check instrument
+            instrument = self._cache.instrument(order.instrument_id)
+            if instrument is None:
+                self._log.debug(
+                    f"Cannot reconcile order for {order.client_order_id!r}: "
+                    f"instrument {order.instrument_id} not found",
+                )
+                return True  # Filtered instrument not loaded
 
         if report.order_status == OrderStatus.REJECTED:
             if order.status != OrderStatus.REJECTED:
@@ -1180,7 +1509,6 @@ class LiveExecutionEngine(ExecutionEngine):
         if report.avg_px is None:
             self._log.warning("report.avg_px was `None` when a value was expected")
 
-        # Check reported filled qty against order filled qty
         if report.filled_qty < order.filled_qty:
             self._log.error(
                 f"report.filled_qty {report.filled_qty} < order.filled_qty {order.filled_qty}, "
@@ -1189,11 +1517,28 @@ class LiveExecutionEngine(ExecutionEngine):
             return False  # Failed
 
         if report.filled_qty > order.filled_qty:
+            # Check if order is already closed to avoid duplicate inferred fills
+            if order.is_closed:
+                self._log.warning(  # TODO: Reduce level to debug after initial development phase
+                    f"{order.client_order_id!r} already {order.status_string()} but "
+                    f"reported difference in filled_qty: "
+                    f"report={report.filled_qty}, cached={order.filled_qty}, "
+                    f"skipping inferred fill generation for closed order",
+                )
+                return True  # Consider it reconciled to avoid infinite loops
+
             # This is due to missing fill report(s), there may now be some
             # information loss if multiple fills occurred to reach the reported
             # state, or if commissions differed from the default.
-            fill: OrderFilled = self._generate_inferred_fill(order, report, instrument)
-            self._handle_event(fill)
+            try:
+                fill: OrderFilled = self._generate_inferred_fill(order, report, instrument)
+                self._handle_event_with_tracking(fill)
+            except ValueError as e:
+                self._log.error(
+                    f"Cannot generate inferred fill for {order.client_order_id}: {e}. "
+                    f"Reconciliation for this order failed.",
+                )
+                return False  # Failed
 
             if (
                 report.avg_px is not None
@@ -1232,13 +1577,12 @@ class LiveExecutionEngine(ExecutionEngine):
             return False  # Failed
 
         instrument: Instrument | None = self._cache.instrument(order.instrument_id)
-
         if instrument is None:
-            self._log.error(
+            self._log.debug(
                 f"Cannot reconcile order for {order.client_order_id!r}: "
                 f"instrument {order.instrument_id} not found",
             )
-            return False  # Failed
+            return True  # Filtered instrument not loaded
 
         return self._reconcile_fill_report(order, report, instrument)
 
@@ -1300,10 +1644,27 @@ class LiveExecutionEngine(ExecutionEngine):
 
             return True  # Fill already applied, continue with existing data
 
+        # Check if fill would cause overfill
+        potential_filled_qty = order.filled_qty + report.last_qty
+        if potential_filled_qty > order.quantity:
+            self._log.warning(
+                f"Rejecting fill that would cause overfill for {order.client_order_id!r}: "
+                f"order.quantity={order.quantity}, order.filled_qty={order.filled_qty}, "
+                f"fill.last_qty={report.last_qty}, would result in filled_qty={potential_filled_qty}",
+            )
+            return False  # Reject fill to prevent overfill
+
         try:
             self._generate_order_filled(order, report, instrument)
         except InvalidStateTrigger as e:
             self._log.error(str(e))
+            return False
+        except ValueError as e:
+            # Handle the negative leaves_qty error
+            self._log.exception(
+                f"ValueError when applying fill to {order.client_order_id!r}: {e}",
+                e,
+            )
             return False
 
         # Check correct ordering of fills
@@ -1380,16 +1741,18 @@ class LiveExecutionEngine(ExecutionEngine):
 
         return True  # Reconciled
 
-    def _reconcile_position_report_netting(self, report: PositionStatusReport) -> bool:
+    def _reconcile_position_report_netting(  # noqa: C901 (too complex)
+        self,
+        report: PositionStatusReport,
+    ) -> bool:
         self._log.info(f"Reconciling NET position for {report.instrument_id}", LogColor.BLUE)
 
         instrument = self._cache.instrument(report.instrument_id)
-
         if instrument is None:
-            self._log.error(
+            self._log.debug(
                 f"Cannot reconcile position for {report.instrument_id}: instrument not found",
             )
-            return False  # Failed
+            return True  # Filtered instrument not loaded
 
         positions_open: list[Position] = self._cache.positions_open(
             venue=None,  # Faster query filtering
@@ -1410,7 +1773,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     f"Discrepancy for {report.instrument_id} position "
                     "when `generate_missing_orders` disabled, skipping further reconciliation",
                 )
-                return False
+                return True
 
             diff = abs(position_signed_decimal_qty - report.signed_decimal_qty)
             diff_quantity = Quantity(diff, instrument.size_precision)
@@ -1428,22 +1791,104 @@ class LiveExecutionEngine(ExecutionEngine):
                 else OrderSide.SELL
             )
 
-            now = self._clock.timestamp_ns()
-            diff_report = OrderStatusReport(
-                instrument_id=report.instrument_id,
-                account_id=report.account_id,
-                venue_order_id=VenueOrderId(str(uuid.uuid4())),
-                order_side=order_side,
-                order_type=OrderType.MARKET,
-                time_in_force=TimeInForce.DAY,
-                order_status=OrderStatus.FILLED,
-                quantity=diff_quantity,
-                filled_qty=diff_quantity,
-                report_id=UUID4(),
-                ts_accepted=now,
-                ts_last=now,
-                ts_init=now,
+            # Calculate the price for the reconciliation order
+            # Get current position average price if available
+            current_avg_px = None
+
+            if positions_open:
+                # Calculate weighted average price of current positions
+                total_value = Decimal(0)
+                total_qty = Decimal(0)
+
+                for pos in positions_open:
+                    qty = abs(pos.signed_decimal_qty())
+
+                    if pos.avg_px_open and qty > 0:
+                        total_value += Decimal(str(pos.avg_px_open)) * qty
+                        total_qty += qty
+
+                if total_qty > 0:
+                    current_avg_px = total_value / total_qty
+
+            # Calculate reconciliation price
+            reconciliation_price = calculate_reconciliation_price(
+                current_position_qty=position_signed_decimal_qty,
+                current_position_avg_px=current_avg_px,
+                target_position_qty=report.signed_decimal_qty,
+                target_position_avg_px=report.avg_px_open,
+                instrument=instrument,
             )
+
+            # If we couldn't calculate a price, use a reasonable fallback
+            if reconciliation_price is None:
+                # If avg_px_open is None, we cannot compute an exact reconciliation price
+                # and will fall back to a market price.
+                self._log.warning(
+                    f"Cannot calculate exact reconciliation price for {report.instrument_id}: "
+                    f"position report lacks average price information, using last quote fallback",
+                )
+
+                quote = self._cache.quote_tick(report.instrument_id)
+
+                if quote:
+                    if order_side == OrderSide.BUY:
+                        reconciliation_price = quote.ask_price
+                    else:  # OrderSide.SELL
+                        reconciliation_price = quote.bid_price
+                else:
+                    # If no market data, use current average price of positions as fallback
+                    if current_avg_px is not None:
+                        reconciliation_price = instrument.make_price(current_avg_px)
+
+            now = self._clock.timestamp_ns()
+
+            if reconciliation_price:
+                # Generate a LIMIT order with the calculated reconciliation price
+                avg_px = reconciliation_price.as_decimal()
+
+                diff_report = OrderStatusReport(
+                    instrument_id=report.instrument_id,
+                    account_id=report.account_id,
+                    venue_order_id=VenueOrderId(str(uuid.uuid4())),
+                    order_side=order_side,
+                    order_type=OrderType.LIMIT,
+                    time_in_force=TimeInForce.GTC,
+                    order_status=OrderStatus.FILLED,
+                    price=reconciliation_price,
+                    quantity=diff_quantity,
+                    filled_qty=diff_quantity,
+                    avg_px=avg_px,
+                    report_id=UUID4(),
+                    ts_accepted=now,
+                    ts_last=now,
+                    ts_init=now,
+                )
+            else:
+                # No price information, fall back to generated MARKET order
+                avg_px = None
+                self._log.warning(
+                    f"Could not determine reconciliation price for {report.instrument_id}, "
+                    f"generating MARKET order for position reconciliation "
+                    f"(current: {position_signed_decimal_qty}, target: {report.signed_decimal_qty})",
+                )
+
+                diff_report = OrderStatusReport(
+                    instrument_id=report.instrument_id,
+                    account_id=report.account_id,
+                    venue_order_id=VenueOrderId(str(uuid.uuid4())),
+                    order_side=order_side,
+                    order_type=OrderType.MARKET,
+                    time_in_force=TimeInForce.IOC,
+                    order_status=OrderStatus.FILLED,
+                    quantity=diff_quantity,
+                    filled_qty=diff_quantity,
+                    avg_px=avg_px,
+                    report_id=UUID4(),
+                    ts_accepted=now,
+                    ts_last=now,
+                    ts_init=now,
+                )
+
             self._reconcile_order_report(diff_report, trades=[], is_external=False)
 
         return True  # Reconciled
@@ -1457,58 +1902,20 @@ class LiveExecutionEngine(ExecutionEngine):
         report: OrderStatusReport,
         instrument: Instrument,
     ) -> OrderFilled:
-        # Infer liquidity side
-        liquidity_side: LiquiditySide = LiquiditySide.NO_LIQUIDITY_SIDE
-
-        if order.order_type in (
-            OrderType.MARKET,
-            OrderType.STOP_MARKET,
-            OrderType.TRAILING_STOP_MARKET,
-        ):
-            liquidity_side = LiquiditySide.TAKER
-        elif report.post_only:
-            liquidity_side = LiquiditySide.MAKER
-
-        # Calculate last qty
-        last_qty: Quantity = instrument.make_qty(report.filled_qty - order.filled_qty)
-
-        # Calculate last px
-        if order.avg_px is None:
-            last_px: Price = instrument.make_price(report.avg_px or 0.0)
-        else:
-            report_cost: float = float(report.avg_px or 0.0) * float(report.filled_qty)
-            filled_cost = order.avg_px * float(order.filled_qty)
-            last_px = instrument.make_price((report_cost - filled_cost) / float(last_qty))
-
-        notional_value: Money = instrument.notional_value(last_qty, last_px)
-        commission: Money = Money(notional_value * instrument.taker_fee, instrument.quote_currency)
-
-        filled = OrderFilled(
-            trader_id=order.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=order.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            position_id=report.venue_position_id or PositionId(f"{instrument.id}-EXTERNAL"),
-            trade_id=TradeId(UUID4().value),
-            order_side=order.side,
-            order_type=order.order_type,
-            last_qty=last_qty,
-            last_px=last_px,
-            currency=instrument.quote_currency,
-            commission=commission,
-            liquidity_side=liquidity_side,
-            event_id=UUID4(),
-            ts_event=report.ts_last,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+        filled = create_inferred_order_filled_event(
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
+            instrument=instrument,
         )
-        self._log.warning(f"Generated inferred {filled}")
-
+        self._log.info(f"Generated inferred {filled}", LogColor.BLUE)
         return filled
 
-    def _generate_order(self, report: OrderStatusReport, is_external: bool = True) -> Order | None:
+    def _generate_order(  # noqa: C901 (too complex)
+        self,
+        report: OrderStatusReport,
+        is_external: bool = True,
+    ) -> Order | None:
         self._log.debug(f"Generating order {report.client_order_id!r}", color=LogColor.MAGENTA)
 
         options: dict[str, Any] = {}
@@ -1554,12 +1961,12 @@ class LiveExecutionEngine(ExecutionEngine):
         else:
             tags = None
 
-        # Check if filtering
-        if self.filter_unclaimed_external_orders and strategy_id.value == "EXTERNAL":
-            # Experimental: will call this out with a warning log for now
-            self._log.warning(
-                f"Skipping order status report reconciliation for unclaimed EXTERNAL order: {report}",
-            )
+        if self.filter_unclaimed_external_orders and strategy_id.is_external():
+            self._filtered_external_orders_count += 1
+
+            if self._filtered_external_orders_count == 1:
+                self._log.warning("Filtering unclaimed EXTERNAL orders", LogColor.BLUE)
+
             return None  # No further reconciliation
 
         initialized = OrderInitialized(
@@ -1579,8 +1986,8 @@ class LiveExecutionEngine(ExecutionEngine):
             trigger_instrument_id=None,
             contingency_type=report.contingency_type,
             order_list_id=report.order_list_id,
-            linked_order_ids=None,
-            parent_order_id=None,
+            linked_order_ids=report.linked_order_ids,
+            parent_order_id=report.parent_order_id,
             exec_algorithm_id=None,
             exec_algorithm_params=None,
             exec_spawn_id=None,
@@ -1596,103 +2003,70 @@ class LiveExecutionEngine(ExecutionEngine):
         return order
 
     def _generate_order_rejected(self, order: Order, report: OrderStatusReport) -> None:
-        rejected = OrderRejected(
-            trader_id=order.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=order.instrument_id,
-            client_order_id=order.client_order_id,
-            account_id=report.account_id,
-            reason=report.cancel_reason or "UNKNOWN",
-            event_id=UUID4(),
-            ts_event=report.ts_last,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+        rejected = create_order_rejected_event(
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
         )
         self._log.debug(f"Generated {rejected}")
-        self._handle_event(rejected)
+        self._handle_event_with_tracking(rejected)
 
     def _generate_order_accepted(self, order: Order, report: OrderStatusReport) -> None:
-        accepted = OrderAccepted(
+        # Clear any retry counts when order transitions to ACCEPTED
+        self._clear_recon_tracking(order.client_order_id)
+
+        # Also try to clear by venue order ID mapping
+        if report.venue_order_id:
+            mapped_client_id = self._cache.client_order_id(report.venue_order_id)
+            if mapped_client_id:
+                self._clear_recon_tracking(mapped_client_id)
+
+        accepted = create_order_accepted_event(
             trader_id=self.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=report.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            event_id=UUID4(),
-            ts_event=report.ts_accepted,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
         )
         self._log.debug(f"Generated {accepted}")
-        self._handle_event(accepted)
+        self._handle_event_with_tracking(accepted)
 
     def _generate_order_triggered(self, order: Order, report: OrderStatusReport) -> None:
-        triggered = OrderTriggered(
+        triggered = create_order_triggered_event(
             trader_id=self.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=report.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            event_id=UUID4(),
-            ts_event=report.ts_triggered,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
         )
         self._log.debug(f"Generated {triggered}")
-        self._handle_event(triggered)
+        self._handle_event_with_tracking(triggered)
 
     def _generate_order_updated(self, order: Order, report: OrderStatusReport) -> None:
-        updated = OrderUpdated(
+        updated = create_order_updated_event(
             trader_id=self.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=report.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            quantity=report.quantity,
-            price=report.price,
-            trigger_price=report.trigger_price,
-            event_id=UUID4(),
-            ts_event=report.ts_last,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
         )
         self._log.debug(f"Generated {updated}")
-        self._handle_event(updated)
+        self._handle_event_with_tracking(updated)
 
     def _generate_order_canceled(self, order: Order, report: OrderStatusReport) -> None:
-        canceled = OrderCanceled(
-            trader_id=order.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=report.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            event_id=UUID4(),
-            ts_event=report.ts_last,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+        canceled = create_order_canceled_event(
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
         )
         self._log.debug(f"Generated {canceled}")
-        self._handle_event(canceled)
+        self._handle_event_with_tracking(canceled)
 
     def _generate_order_expired(self, order: Order, report: OrderStatusReport) -> None:
-        expired = OrderExpired(
-            trader_id=order.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=report.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            event_id=UUID4(),
-            ts_event=report.ts_last,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+        expired = create_order_expired_event(
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
         )
         self._log.debug(f"Generated {expired}")
-        self._handle_event(expired)
+        self._handle_event_with_tracking(expired)
 
     def _generate_order_filled(
         self,
@@ -1700,29 +2074,14 @@ class LiveExecutionEngine(ExecutionEngine):
         report: FillReport,
         instrument: Instrument,
     ) -> None:
-        filled = OrderFilled(
-            trader_id=order.trader_id,
-            strategy_id=order.strategy_id,
-            instrument_id=report.instrument_id,
-            client_order_id=order.client_order_id,
-            venue_order_id=report.venue_order_id,
-            account_id=report.account_id,
-            trade_id=report.trade_id,
-            position_id=report.venue_position_id,
-            order_side=order.side,
-            order_type=order.order_type,
-            last_qty=report.last_qty,
-            last_px=report.last_px,
-            currency=instrument.quote_currency,
-            commission=report.commission,
-            liquidity_side=report.liquidity_side,
-            event_id=UUID4(),
-            ts_event=report.ts_event,
-            ts_init=self._clock.timestamp_ns(),
-            reconciliation=True,
+        filled = create_order_filled_event(
+            order=order,
+            ts_now=self._clock.timestamp_ns(),
+            report=report,
+            instrument=instrument,
         )
         self._log.debug(f"Generated {filled}")
-        self._handle_event(filled)
+        self._handle_event_with_tracking(filled)
 
     def _should_update(self, order: Order, report: OrderStatusReport) -> bool:
         if report.quantity != order.quantity:

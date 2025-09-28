@@ -50,6 +50,7 @@ from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import FundingRateUpdate
+from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.data import capsule_to_data
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import book_type_to_str
@@ -150,27 +151,19 @@ class OKXDataClient(LiveMarketDataClient):
 
         instruments = self.instrument_provider.instruments_pyo3()
 
-        # Connect public WebSocket client (non-blocking)
-        future = asyncio.ensure_future(
-            self._ws_client.connect(
-                instruments=instruments,
-                callback=self._handle_msg,
-            ),
+        await self._ws_client.connect(
+            instruments=instruments,
+            callback=self._handle_msg,
         )
-        self._ws_client_futures.add(future)
 
         # Wait for connection to be established
         await self._ws_client.wait_until_active(timeout_secs=10.0)
         self._log.info(f"Connected to public websocket {self._ws_client.url}", LogColor.BLUE)
 
-        # Connect business WebSocket client
-        business_future = asyncio.ensure_future(
-            self._ws_business_client.connect(
-                instruments=instruments,
-                callback=self._handle_msg,
-            ),
+        await self._ws_business_client.connect(
+            instruments=instruments,
+            callback=self._handle_msg,
         )
-        self._ws_business_client_futures.add(business_future)
 
         # Wait for connection to be established
         await self._ws_client.wait_until_active(timeout_secs=10.0)
@@ -180,11 +173,12 @@ class OKXDataClient(LiveMarketDataClient):
         )
         self._log.info("OKX API key authenticated", LogColor.GREEN)
 
-        # Subscribe to instruments for updates
         for instrument_type in self._instrument_provider.instrument_types:
             await self._ws_client.subscribe_instruments(instrument_type)
 
     async def _disconnect(self) -> None:
+        self._http_client.cancel_all_requests()
+
         # Delay to allow websocket to send any unsubscribe messages
         await asyncio.sleep(1.0)
 
@@ -253,7 +247,7 @@ class OKXDataClient(LiveMarketDataClient):
             return
 
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
-        vip_level = self._config.vip_level or 0
+        vip_level = self._config.vip_level.value if self._config.vip_level else 0
 
         if command.depth == 50:
             if vip_level >= 4:
@@ -420,14 +414,23 @@ class OKXDataClient(LiveMarketDataClient):
             return
 
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(request.instrument_id.value)
-        trades = await self._http_client.request_trades(
+
+        pyo3_trades = await self._http_client.request_trades(
             instrument_id=pyo3_instrument_id,
             start=ensure_pydatetime_utc(request.start),
             end=ensure_pydatetime_utc(request.end),
             limit=request.limit,
         )
+        trades = TradeTick.from_pyo3_list(pyo3_trades)
 
-        self._handle_trade_ticks(trades, request.id, request.params)
+        self._handle_trade_ticks(
+            request.instrument_id,
+            trades,
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )
 
     async def _request_bars(self, request: RequestBars) -> None:
         self._log.debug(

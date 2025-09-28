@@ -60,6 +60,7 @@ from nautilus_trader.test_kit.functions import ensure_all_tasks_completed
 from nautilus_trader.test_kit.mocks.exec_clients import MockLiveExecutionClient
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
@@ -1381,6 +1382,177 @@ class TestReconciliationEdgeCases:
         assert order.filled_qty == Quantity.from_int(100)  # No inferred fill
 
     @pytest.mark.asyncio()
+    async def test_reconcile_order_report_with_missing_instrument_defers(
+        self,
+        live_exec_engine,
+    ):
+        """
+        Test that order reconciliation is deferred when instrument is not in cache.
+
+        This prevents creating invalid orders without instrument information and allows
+        reconciliation to succeed later when the instrument is loaded.
+
+        """
+        # Arrange
+        # Instrument NOT added to cache
+        report = OrderStatusReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=AUDUSD_SIM.id,  # Instrument not in cache
+            client_order_id=ClientOrderId("O-123456"),
+            venue_order_id=VenueOrderId("1"),
+            order_side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            order_status=OrderStatus.ACCEPTED,
+            price=Price.from_str("1.00000"),
+            quantity=Quantity.from_int(10_000),
+            filled_qty=Quantity.from_int(0),
+            report_id=UUID4(),
+            ts_accepted=0,
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Act
+        result = live_exec_engine._reconcile_order_report(report, trades=[])
+
+        # Assert
+        assert result is True  # Deferred, not failed
+        assert len(self.cache.orders()) == 0  # No order created
+
+    @pytest.mark.asyncio()
+    async def test_reconcile_fill_report_preventing_overfill(
+        self,
+        live_exec_engine,
+    ):
+        """
+        Test that fill reports that would cause overfill are rejected.
+
+        This prevents order corruption from excessive fills.
+
+        """
+        # Arrange
+        instrument = AUDUSD_SIM
+        self.cache.add_instrument(instrument)
+
+        # Create an order with quantity 100
+        order = TestExecStubs.limit_order(
+            instrument=instrument,
+            quantity=Quantity.from_int(100),
+        )
+        order.apply(TestEventStubs.order_accepted(order))
+
+        # Partially fill with 80
+        fill1 = TestEventStubs.order_filled(
+            order,
+            instrument=instrument,
+            last_qty=Quantity.from_int(80),
+        )
+        order.apply(fill1)
+        self.cache.add_order(order)
+
+        # Create a fill report that would cause overfill (80 + 30 > 100)
+        overfill_report = FillReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=instrument.id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            trade_id=TradeId("2"),
+            order_side=OrderSide.BUY,
+            last_qty=Quantity.from_int(30),  # This would make total 110 > 100
+            last_px=Price.from_str("1.00001"),
+            commission=Money(0, USD),
+            liquidity_side=LiquiditySide.TAKER,
+            report_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Act
+        result = live_exec_engine._reconcile_fill_report(order, overfill_report, instrument)
+
+        # Assert
+        assert result is False
+        assert order.filled_qty == Quantity.from_int(80)  # Fill not applied
+
+    @pytest.mark.asyncio()
+    async def test_reconcile_existing_order_with_missing_instrument_defers(
+        self,
+        live_exec_engine,
+    ):
+        """
+        Test that reconciling an existing order is deferred when instrument is missing.
+
+        This tests the second instrument check for already cached orders.
+
+        """
+        # Arrange
+        # Create an order with an instrument NOT in cache
+        instrument = AUDUSD_SIM  # Not added to cache
+
+        # Create an order manually (bypassing normal flow)
+        order = TestExecStubs.limit_order(instrument=instrument)
+        order.apply(TestEventStubs.order_submitted(order))
+        order.apply(TestEventStubs.order_accepted(order))
+
+        # Add order to cache without adding instrument
+        self.cache.add_order(order, position_id=None)
+
+        # Create a report for the existing order
+        report = OrderStatusReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=instrument.id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            order_status=OrderStatus.CANCELED,
+            price=Price.from_str("1.00000"),
+            quantity=Quantity.from_int(10_000),
+            filled_qty=Quantity.from_int(0),
+            report_id=UUID4(),
+            ts_accepted=0,
+            ts_triggered=0,
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Act
+        result = live_exec_engine._reconcile_order_report(report, trades=[])
+
+        # Assert
+        assert result is True  # Deferred, not failed
+        assert order.status == OrderStatus.ACCEPTED  # Status unchanged
+
+    @pytest.mark.asyncio()
+    async def test_reconcile_position_report_with_missing_instrument_defers(
+        self,
+        live_exec_engine,
+    ):
+        """
+        Test that position reconciliation is deferred when instrument is missing.
+        """
+        # Arrange
+        # Instrument NOT added to cache
+        report = PositionStatusReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=AUDUSD_SIM.id,  # Instrument not in cache
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_int(100),
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Act
+        result = live_exec_engine._reconcile_position_report(report)
+
+        # Assert
+        assert result is True  # Deferred, not failed
+        assert len(self.cache.positions()) == 0  # No position created
+
+    @pytest.mark.asyncio()
     async def test_internal_diff_order_not_filtered_when_filter_unclaimed_external_orders_enabled(
         self,
         live_exec_engine,
@@ -1500,6 +1672,160 @@ class TestReconciliationEdgeCases:
         assert result is True
         orders_after = self.cache.orders()
         assert len(orders_after) == orders_before  # No new orders added due to filtering
+
+    @pytest.mark.asyncio()
+    async def test_position_reconciliation_fallback_to_market_order_when_no_price_available(
+        self,
+        live_exec_engine,
+    ):
+        """
+        Test that position reconciliation falls back to MARKET order when no price
+        information is available (no positions, no market data).
+
+        This tests the last resort fallback when:
+        1. Reconciliation price calculation returns None (no target avg price)
+        2. No quote tick is available in cache (no market data)
+        3. No current position average price (starting from flat)
+
+        The reconciliation returns True in this case because we've done our best
+        to reconcile the position, even though price information is unavailable.
+
+        """
+        # Arrange
+        instrument = AUDUSD_SIM
+        self.cache.add_instrument(instrument)
+
+        # Ensure no quote tick is available
+        assert self.cache.quote_tick(instrument.id) is None
+
+        # External report shows 100 units long (starting from flat position)
+        external_report = PositionStatusReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=instrument.id,
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_int(100),
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Track reconciliation calls to verify MARKET order is generated
+        reconcile_calls = []
+        original_reconcile = live_exec_engine._reconcile_order_report
+
+        def spy_reconcile(order_report, trades, is_external=True):
+            reconcile_calls.append((order_report, trades, is_external))
+            return original_reconcile(order_report, trades, is_external)
+
+        live_exec_engine._reconcile_order_report = spy_reconcile
+
+        # Act
+        result = live_exec_engine._reconcile_position_report(external_report)
+
+        # Assert
+        # Reconciliation returns True because we've done our best to reconcile
+        assert result is True
+        assert len(reconcile_calls) == 1
+
+        # Verify the generated order report is a MARKET order (fallback)
+        order_report, trades, is_external = reconcile_calls[0]
+        assert order_report.order_type == OrderType.MARKET
+        assert order_report.time_in_force == TimeInForce.IOC
+        assert order_report.price is None  # MARKET orders don't have a price
+        assert order_report.order_side == OrderSide.BUY
+        assert order_report.quantity == Quantity.from_int(100)
+        assert order_report.filled_qty == Quantity.from_int(100)
+        assert order_report.order_status == OrderStatus.FILLED
+        assert is_external is False  # Internal reconciliation order
+
+        # Verify the order was added to cache with INTERNAL-DIFF strategy
+        orders = self.cache.orders()
+        internal_diff_orders = [o for o in orders if o.strategy_id.value == "INTERNAL-DIFF"]
+        assert len(internal_diff_orders) == 1
+
+        generated_order = internal_diff_orders[0]
+        assert generated_order.order_type == OrderType.MARKET
+        assert generated_order.side == OrderSide.BUY
+        assert generated_order.quantity == Quantity.from_int(100)
+        # Order might be ACCEPTED or FILLED depending on how reconciliation processes events
+        assert generated_order.status in (OrderStatus.ACCEPTED, OrderStatus.FILLED)
+
+    @pytest.mark.asyncio()
+    async def test_position_reconciliation_uses_limit_order_when_price_available(
+        self,
+        live_exec_engine,
+    ):
+        """
+        Test that position reconciliation uses LIMIT order when price information is
+        available (via quote tick).
+
+        This verifies that LIMIT orders are preferred when we can determine a price.
+
+        """
+        # Arrange
+        instrument = AUDUSD_SIM
+        self.cache.add_instrument(instrument)
+
+        # Add a quote tick to provide market data
+        quote_tick = TestDataStubs.quote_tick(
+            instrument=instrument,
+            bid_price=Price.from_str("0.9999"),
+            ask_price=Price.from_str("1.0001"),
+        )
+        self.cache.add_quote_tick(quote_tick)
+
+        # External report shows 100 units long (starting from flat position)
+        external_report = PositionStatusReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=instrument.id,
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_int(100),
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Track reconciliation calls
+        reconcile_calls = []
+        original_reconcile = live_exec_engine._reconcile_order_report
+
+        def spy_reconcile(order_report, trades, is_external=True):
+            reconcile_calls.append((order_report, trades, is_external))
+            return original_reconcile(order_report, trades, is_external)
+
+        live_exec_engine._reconcile_order_report = spy_reconcile
+
+        # Act
+        result = live_exec_engine._reconcile_position_report(external_report)
+
+        # Assert
+        assert result is True
+        assert len(reconcile_calls) == 1
+
+        # Verify the generated order report is a LIMIT order with calculated price
+        order_report, trades, is_external = reconcile_calls[0]
+        assert order_report.order_type == OrderType.LIMIT
+        assert order_report.time_in_force == TimeInForce.GTC
+        assert order_report.price is not None  # LIMIT orders have a price
+        assert order_report.price == Price.from_str("1.0001")  # Ask price for BUY order
+        assert order_report.avg_px == Decimal("1.0001")
+        assert order_report.order_side == OrderSide.BUY
+        assert order_report.quantity == Quantity.from_int(100)
+        assert order_report.filled_qty == Quantity.from_int(100)
+        assert order_report.order_status == OrderStatus.FILLED
+        assert is_external is False  # Internal reconciliation order
+
+        # Verify the order was added to cache
+        orders = self.cache.orders()
+        internal_diff_orders = [o for o in orders if o.strategy_id.value == "INTERNAL-DIFF"]
+        assert len(internal_diff_orders) == 1
+
+        generated_order = internal_diff_orders[0]
+        assert generated_order.order_type == OrderType.LIMIT
+        assert generated_order.side == OrderSide.BUY
+        assert generated_order.quantity == Quantity.from_int(100)
+        assert generated_order.price == Price.from_str("1.0001")  # Ask price for BUY order
+        assert generated_order.status == OrderStatus.FILLED
 
 
 class TestReconciliationFiltering:

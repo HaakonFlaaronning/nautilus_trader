@@ -24,10 +24,10 @@ from nautilus_trader.adapters.binance import BinanceLiveDataClientFactory
 from nautilus_trader.adapters.binance import BinanceLiveExecClientFactory
 from nautilus_trader.config import CacheConfig
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.config import LiveDataEngineConfig
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.live.config import LiveDataEngineConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
@@ -55,9 +55,19 @@ config_node = TradingNodeConfig(
     ),
     exec_engine=LiveExecEngineConfig(
         reconciliation=True,
+        open_check_interval_secs=5.0,
+        open_check_open_only=False,
         # snapshot_orders=True,
         # snapshot_positions=True,
         # snapshot_positions_interval_secs=5.0,
+        purge_closed_orders_interval_mins=1,  # Example of purging closed orders for HFT
+        purge_closed_orders_buffer_mins=0,  # Purged orders closed for at least an hour
+        purge_closed_positions_interval_mins=1,  # Example of purging closed positions for HFT
+        purge_closed_positions_buffer_mins=0,  # Purge positions closed for at least an hour
+        purge_account_events_interval_mins=1,  # Example of purging account events for HFT
+        purge_account_events_lookback_mins=0,  # Purge account events occurring more than an hour ago
+        purge_from_database=True,  # Set True with caution
+        graceful_shutdown_on_exception=True,
     ),
     cache=CacheConfig(
         # database=DatabaseConfig(),
@@ -113,14 +123,19 @@ config_node = TradingNodeConfig(
 # Instantiate the node with a configuration
 node = TradingNode(config=config_node)
 
+order_qty = Decimal("0.020")
+
 # Configure your strategy
 strat_config = ExecTesterConfig(
     instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE"),
     external_order_claims=[InstrumentId.from_str("ETHUSDT-PERP.BINANCE")],
-    order_qty=Decimal("0.020"),
+    order_qty=order_qty,
+    # open_position_on_start_qty=order_qty,
+    # tob_offset_ticks=0,
     # use_batch_cancel_on_stop=True,
     # use_individual_cancels_on_stop=True,
     use_post_only=True,
+    # close_positions_on_stop=False,
     log_data=False,
     log_rejected_due_post_only_as_warning=False,
     test_reject_post_only=False,

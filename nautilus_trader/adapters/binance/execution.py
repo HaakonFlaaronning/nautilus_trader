@@ -201,7 +201,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         self._http_user = user
 
         # Listen keys
-        self._ping_listen_keys_interval: int = 60 * 5  # Once every 5 mins (hard-coded)
+        self._ping_listen_keys_interval: int = 60 * 5  # Once every 5 mins (hardcoded)
         self._ping_listen_keys_task: asyncio.Task | None = None
         self._listen_key: str | None = None
         self._ping_consecutive_failures: int = 0
@@ -936,14 +936,6 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             position_id=command.position_id,
             exec_spawn_id=None,
         )
-
-        for order in command.order_list.orders:
-            self.generate_order_submitted(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                ts_event=self._clock.timestamp_ns(),
-            )
 
         for order in command.order_list.orders:
             if order.linked_order_ids:  # TODO: Implement

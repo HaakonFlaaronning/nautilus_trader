@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Data structures modelling OKX WebSocket request and response payloads.
+
 use derive_builder::Builder;
 use nautilus_model::{
     data::{Data, FundingRateUpdate, OrderBookDeltas},
@@ -27,8 +29,8 @@ use super::enums::{OKXWsChannel, OKXWsOperation};
 use crate::{
     common::{
         enums::{
-            OKXBookAction, OKXCandleConfirm, OKXExecType, OKXInstrumentType, OKXOrderStatus,
-            OKXOrderType, OKXPositionSide, OKXSide, OKXTradeMode,
+            OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXExecType, OKXInstrumentType,
+            OKXOrderStatus, OKXOrderType, OKXPositionSide, OKXSide, OKXTradeMode, OKXTriggerType,
         },
         parse::{deserialize_empty_string_as_none, deserialize_string_to_u64},
     },
@@ -48,6 +50,7 @@ pub enum NautilusWsMessage {
     ExecutionReports(Vec<ExecutionReport>),
     Error(OKXWebSocketError),
     Raw(serde_json::Value), // Unhandled channels
+    Reconnected,
 }
 
 /// Represents an OKX WebSocket error.
@@ -80,8 +83,29 @@ pub struct OKXWsRequest<T> {
     pub id: Option<String>,
     /// Operation type (order, cancel-order, amend-order).
     pub op: OKXWsOperation,
+    /// Request effective deadline. Unix timestamp format in milliseconds.
+    /// This is when the request itself expires, not related to order expiration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp_time: Option<String>,
     /// Arguments payload for the operation.
     pub args: Vec<T>,
+}
+
+/// OKX WebSocket authentication message.
+#[derive(Debug, Serialize)]
+pub struct OKXAuthentication {
+    pub op: &'static str,
+    pub args: Vec<OKXAuthenticationArg>,
+}
+
+/// OKX WebSocket authentication arguments.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXAuthenticationArg {
+    pub api_key: String,
+    pub passphrase: String,
+    pub timestamp: String,
+    pub sign: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,16 +126,16 @@ pub struct OKXSubscriptionArg {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum OKXWebSocketEvent {
-    Subscription {
-        event: OKXSubscriptionEvent,
-        arg: OKXWebSocketArg,
-        #[serde(rename = "connId")]
-        conn_id: String,
-    },
     Login {
         event: String,
         code: String,
         msg: String,
+        #[serde(rename = "connId")]
+        conn_id: String,
+    },
+    Subscription {
+        event: OKXSubscriptionEvent,
+        arg: OKXWebSocketArg,
         #[serde(rename = "connId")]
         conn_id: String,
     },
@@ -143,6 +167,10 @@ pub enum OKXWebSocketEvent {
         code: String,
         msg: String,
     },
+    #[serde(skip)]
+    Ping,
+    #[serde(skip)]
+    Reconnected,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -416,18 +444,18 @@ pub struct OKXEstimatedPriceMsg {
 #[serde(rename_all = "camelCase")]
 pub struct OKXStatusMsg {
     /// System maintenance status.
-    pub title: String,
+    pub title: Ustr,
     /// Status type: planned or scheduled.
     #[serde(rename = "type")]
-    pub status_type: String,
+    pub status_type: Ustr,
     /// System maintenance state: canceled, completed, pending, ongoing.
-    pub state: String,
+    pub state: Ustr,
     /// Expected completion timestamp.
     pub end_time: Option<String>,
     /// Planned start timestamp.
     pub begin_time: Option<String>,
     /// Service involved.
-    pub service_type: Option<String>,
+    pub service_type: Option<Ustr>,
     /// Reason for status change.
     pub reason: Option<String>,
     /// Timestamp of the data generation, Unix timestamp format in milliseconds.
@@ -436,18 +464,12 @@ pub struct OKXStatusMsg {
 }
 
 /// Order update message from WebSocket orders channel.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OKXOrderMsg {
     /// Accumulated filled size.
     #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
     pub acc_fill_sz: Option<String>,
-    /// Algorithm client order ID.
-    #[serde(default)]
-    pub algo_cl_ord_id: Option<String>,
-    /// Algorithm ID.
-    #[serde(default)]
-    pub algo_id: Option<String>,
     /// Average price.
     pub avg_px: String,
     /// Creation time, Unix timestamp in milliseconds.
@@ -460,16 +482,19 @@ pub struct OKXOrderMsg {
     #[serde(default)]
     pub cancel_source_reason: Option<String>,
     /// Category.
-    pub category: String,
+    pub category: Ustr,
     /// Currency.
-    pub ccy: String,
+    pub ccy: Ustr,
     /// Client order ID.
     pub cl_ord_id: String,
+    /// Parent algo client order ID if present.
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub algo_cl_ord_id: Option<String>,
     /// Fee.
     #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
     pub fee: Option<String>,
     /// Fee currency.
-    pub fee_ccy: String,
+    pub fee_ccy: Ustr,
     /// Fill price.
     pub fill_px: String,
     /// Fill size.
@@ -490,8 +515,9 @@ pub struct OKXOrderMsg {
     /// Profit and loss.
     pub pnl: String,
     /// Position side.
-    pub pos_side: String,
-    /// Price.
+    pub pos_side: OKXPositionSide,
+    /// Price (algo orders use ordPx instead).
+    #[serde(default)]
     pub px: String,
     /// Reduce only flag.
     pub reduce_only: String,
@@ -504,12 +530,70 @@ pub struct OKXOrderMsg {
     /// Size.
     pub sz: String,
     /// Trade mode.
-    pub td_mode: String,
+    pub td_mode: OKXTradeMode,
     /// Trade ID.
     pub trade_id: String,
     /// Last update time, Unix timestamp in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub u_time: u64,
+}
+
+/// Represents an algo order message from WebSocket updates.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXAlgoOrderMsg {
+    /// Algorithm ID.
+    pub algo_id: String,
+    /// Algorithm client order ID.
+    #[serde(default)]
+    pub algo_cl_ord_id: String,
+    /// Client order ID (empty for algo orders until triggered).
+    pub cl_ord_id: String,
+    /// Order ID (empty until algo order is triggered).
+    pub ord_id: String,
+    /// Instrument ID.
+    pub inst_id: Ustr,
+    /// Instrument type.
+    pub inst_type: OKXInstrumentType,
+    /// Order type (always "trigger" for conditional orders).
+    pub ord_type: OKXOrderType,
+    /// Order state.
+    pub state: OKXOrderStatus,
+    /// Side.
+    pub side: OKXSide,
+    /// Position side.
+    pub pos_side: OKXPositionSide,
+    /// Size.
+    pub sz: String,
+    /// Trigger price.
+    pub trigger_px: String,
+    /// Trigger price type (last, mark, index).
+    pub trigger_px_type: OKXTriggerType,
+    /// Order price (-1 for market orders).
+    pub ord_px: String,
+    /// Trade mode.
+    pub td_mode: OKXTradeMode,
+    /// Leverage.
+    pub lever: String,
+    /// Reduce only flag.
+    pub reduce_only: String,
+    /// Actual filled price.
+    pub actual_px: String,
+    /// Actual filled size.
+    pub actual_sz: String,
+    /// Notional USD value.
+    pub notional_usd: String,
+    /// Creation time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub c_time: u64,
+    /// Update time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub u_time: u64,
+    /// Trigger time (empty until triggered).
+    pub trigger_time: String,
+    /// Tag.
+    #[serde(default)]
+    pub tag: String,
 }
 
 /// Parameters for WebSocket place order operation.
@@ -522,13 +606,13 @@ pub struct WsPostOrderParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_type: Option<OKXInstrumentType>,
     /// Instrument ID, e.g. "BTC-USDT".
-    pub inst_id: String,
+    pub inst_id: Ustr,
     /// Trading mode: cash, isolated, cross.
     pub td_mode: OKXTradeMode,
     /// Margin currency (only for isolated margin).
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ccy: Option<String>,
+    pub ccy: Option<Ustr>,
     /// Unique client order ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
@@ -558,11 +642,6 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    /// Order expiry time in milliseconds (for GTD orders).
-    #[builder(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "expTime")]
-    pub exp_time: Option<String>,
 }
 
 /// Parameters for WebSocket cancel order operation (instType not included).
@@ -572,19 +651,25 @@ pub struct WsPostOrderParams {
 #[serde(rename_all = "camelCase")]
 pub struct WsCancelOrderParams {
     /// Instrument ID, e.g. "BTC-USDT".
-    pub inst_id: String,
+    pub inst_id: Ustr,
     /// Exchange-assigned order ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ord_id: Option<String>,
     /// User-assigned client order ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
-    /// Position side: long, short, net (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pos_side: Option<OKXPositionSide>,
-    /// Margin currency (only for margin trades).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ccy: Option<String>,
+}
+
+/// Parameters for WebSocket mass cancel operation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct WsMassCancelParams {
+    /// Instrument type.
+    pub inst_type: OKXInstrumentType,
+    /// Instrument family, e.g. "BTC-USD", "BTC-USDT".
+    pub inst_family: Ustr,
 }
 
 /// Parameters for WebSocket amend order operation (instType not included).
@@ -594,7 +679,7 @@ pub struct WsCancelOrderParams {
 #[serde(rename_all = "camelCase")]
 pub struct WsAmendOrderParams {
     /// Instrument ID, e.g. "BTC-USDT".
-    pub inst_id: String,
+    pub inst_id: Ustr,
     /// Exchange-assigned order ID (optional if using clOrdId).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ord_id: Option<String>,
@@ -606,21 +691,75 @@ pub struct WsAmendOrderParams {
     pub new_cl_ord_id: Option<String>,
     /// New order price (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub px: Option<String>,
+    pub new_px: Option<String>,
     /// New order size (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sz: Option<String>,
+    pub new_sz: Option<String>,
+}
+
+/// Parameters for WebSocket algo order placement.
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct WsPostAlgoOrderParams {
+    /// Instrument ID, e.g. "BTC-USDT".
+    pub inst_id: Ustr,
+    /// Trading mode: cash, isolated, cross.
+    pub td_mode: OKXTradeMode,
+    /// Order side: buy or sell.
+    pub side: OKXSide,
+    /// Order type: trigger (for stop orders).
+    pub ord_type: OKXAlgoOrderType,
+    /// Order size.
+    pub sz: String,
+    /// Client order ID (optional).
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
     /// Position side: long, short, net (optional).
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pos_side: Option<OKXPositionSide>,
-    /// Margin currency (only for margin trades).
+    /// Trigger price for stop/conditional orders.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ccy: Option<String>,
+    pub trigger_px: Option<String>,
+    /// Trigger price type: last, index, mark.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_px_type: Option<OKXTriggerType>,
+    /// Order price (for limit orders after trigger).
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_px: Option<String>,
+    /// Reduce-only flag.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduce_only: Option<bool>,
+    /// Order tag for categorization.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+}
+
+/// Parameters for WebSocket cancel algo order operation.
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct WsCancelAlgoOrderParams {
+    /// Instrument ID, e.g. "BTC-USDT".
+    pub inst_id: Ustr,
+    /// Algo order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algo_id: Option<String>,
+    /// Client algo order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algo_cl_ord_id: Option<String>,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Tests
 ////////////////////////////////////////////////////////////////////////////////
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::time::get_atomic_clock_realtime;
@@ -635,14 +774,8 @@ mod tests {
         let result: Result<OKXWebSocketArg, _> = serde_json::from_str(json_str);
         match result {
             Ok(arg) => {
-                assert_eq!(
-                    arg.channel,
-                    crate::websocket::enums::OKXWsChannel::Instruments
-                );
-                assert_eq!(
-                    arg.inst_type,
-                    Some(crate::common::enums::OKXInstrumentType::Spot)
-                );
+                assert_eq!(arg.channel, OKXWsChannel::Instruments);
+                assert_eq!(arg.inst_type, Some(OKXInstrumentType::Spot));
                 assert_eq!(arg.inst_id, None);
             }
             Err(e) => {
@@ -667,10 +800,7 @@ mod tests {
         match result {
             Ok(msg) => {
                 assert_eq!(msg.event, "subscribe");
-                assert_eq!(
-                    msg.arg.channel,
-                    crate::websocket::enums::OKXWsChannel::Instruments
-                );
+                assert_eq!(msg.arg.channel, OKXWsChannel::Instruments);
                 assert_eq!(msg.conn_id, "380cfa6a");
             }
             Err(e) => {
@@ -696,7 +826,7 @@ mod tests {
                     assert_eq!(arg.channel, OKXWsChannel::Instruments);
                     assert_eq!(conn_id, "380cfa6a");
                 } else {
-                    panic!("Expected Subscribe variant, got: {msg:?}");
+                    panic!("Expected Subscribe variant, was: {msg:?}");
                 }
             }
             Err(e) => {
@@ -722,7 +852,7 @@ mod tests {
                     assert_eq!(arg.channel, OKXWsChannel::Candle1Minute);
                     assert_eq!(conn_id, "358602f5");
                 } else {
-                    panic!("Expected Subscribe variant, got: {msg:?}");
+                    panic!("Expected Subscribe variant, was: {msg:?}");
                 }
             }
             Err(e) => {
@@ -733,9 +863,6 @@ mod tests {
 
     #[rstest]
     fn test_channel_serialization_for_logging() {
-        // Test that we can serialize channel enums to their string representations for logging
-        use crate::websocket::enums::OKXWsChannel;
-
         let channel = OKXWsChannel::Candle1Minute;
         let serialized = serde_json::to_string(&channel).unwrap();
         let cleaned = serialized.trim_matches('"').to_string();
@@ -770,7 +897,7 @@ mod tests {
                 assert_eq!(msg, "");
                 assert!(data.is_empty());
             }
-            Ok(other) => panic!("Expected OrderResponse, got: {other:?}"),
+            Ok(other) => panic!("Expected OrderResponse, was: {other:?}"),
             Err(e) => panic!("Failed to deserialize: {e}"),
         }
 
@@ -790,7 +917,7 @@ mod tests {
                 assert_eq!(msg, "Order not found");
                 assert!(data.is_empty());
             }
-            Ok(other) => panic!("Expected OrderResponse, got: {other:?}"),
+            Ok(other) => panic!("Expected OrderResponse, was: {other:?}"),
             Err(e) => panic!("Failed to deserialize: {e}"),
         }
 
@@ -810,7 +937,7 @@ mod tests {
                 assert_eq!(msg, "Invalid price");
                 assert!(data.is_empty());
             }
-            Ok(other) => panic!("Expected OrderResponse, got: {other:?}"),
+            Ok(other) => panic!("Expected OrderResponse, was: {other:?}"),
             Err(e) => panic!("Failed to deserialize: {e}"),
         }
     }
@@ -945,7 +1072,7 @@ mod tests {
                 assert_eq!(msg, "Login successful");
                 assert_eq!(conn_id, "a4d3ae55");
             }
-            _ => panic!("Expected Login variant"),
+            _ => panic!("Expected Login variant, was: {:?}", parsed),
         }
     }
 
@@ -979,6 +1106,7 @@ mod tests {
                 "ordType": "market",
                 "sz": "0.1"
             })],
+            exp_time: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -1238,6 +1366,7 @@ mod tests {
                 "ordType": "market",
                 "sz": "0.1"
             })],
+            exp_time: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();

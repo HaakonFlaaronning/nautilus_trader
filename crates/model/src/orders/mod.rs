@@ -73,7 +73,7 @@ use crate::{
     types::{Currency, Money, Price, Quantity},
 };
 
-#[allow(dead_code)] // TODO: Will be used
+#[allow(dead_code, reason = "TODO: Will be used")]
 const STOP_ORDER_TYPES: &[OrderType] = &[
     OrderType::StopMarket,
     OrderType::StopLimit,
@@ -81,7 +81,7 @@ const STOP_ORDER_TYPES: &[OrderType] = &[
     OrderType::LimitIfTouched,
 ];
 
-#[allow(dead_code)] // TODO: Will be used
+#[allow(dead_code, reason = "TODO: Will be used")]
 const LIMIT_ORDER_TYPES: &[OrderType] = &[
     OrderType::Limit,
     OrderType::StopLimit,
@@ -89,7 +89,7 @@ const LIMIT_ORDER_TYPES: &[OrderType] = &[
     OrderType::MarketIfTouched,
 ];
 
-#[allow(dead_code)] // TODO: Will be used
+#[allow(dead_code, reason = "TODO: Will be used")]
 const LOCAL_ACTIVE_ORDER_STATUS: &[OrderStatus] = &[
     OrderStatus::Initialized,
     OrderStatus::Emulated,
@@ -713,7 +713,7 @@ impl OrderCore {
         self.last_trade_id = Some(event.trade_id);
         self.liquidity_side = Some(event.liquidity_side);
         self.filled_qty += event.last_qty;
-        self.leaves_qty -= event.last_qty;
+        self.leaves_qty = self.leaves_qty.saturating_sub(event.last_qty);
         self.ts_last = event.ts_event;
         if self.ts_accepted.is_none() {
             // Set ts_accepted to time of first fill if not previously set

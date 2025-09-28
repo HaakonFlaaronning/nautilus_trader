@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! API credential utilities for signing BitMEX requests.
+
 use std::fmt::Debug;
 
 use aws_lc_rs::hmac;
@@ -32,7 +34,7 @@ pub struct Credential {
 
 impl Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credential")
+        f.debug_struct(stringify!(Credential))
             .field("api_key", &self.api_key)
             .field("api_secret", &"<redacted>")
             .finish()
@@ -52,6 +54,7 @@ impl Credential {
     }
 
     /// Signs a request message according to the BitMEX authentication scheme.
+    #[must_use]
     pub fn sign(&self, verb: &str, endpoint: &str, expires: i64, data: &str) -> String {
         let sign_message = format!("{verb}{endpoint}{expires}{data}");
         let key = hmac::Key::new(hmac::HMAC_SHA256, &self.api_secret[..]);
@@ -64,12 +67,13 @@ impl Credential {
 // Tests
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Tests use examples from https://www.bitmex.com/app/apiKeysUsage.
+/// Tests use examples from <https://www.bitmex.com/app/apiKeysUsage>.
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::common::testing::load_test_json;
 
     const API_KEY: &str = "LAqUlngMIQkIUjXMUreyu3qn";
     const API_SECRET: &str = "chNOOS4KvNXR_Xq4k4c9qsfoKWvnDecLATCRlcBwyKDYnWgO";
@@ -107,9 +111,9 @@ mod tests {
     fn test_post_with_data() {
         let credential = Credential::new(API_KEY.to_string(), API_SECRET.to_string());
 
-        let data = r#"{"symbol":"XBTM15","price":219.0,"clOrdID":"mm_bitmex_1a/oemUeQ4CAJZgP3fjHsA","orderQty":98}"#;
+        let data = load_test_json("credential_post_order.json");
 
-        let signature = credential.sign("POST", "/api/v1/order", 1518064238, data);
+        let signature = credential.sign("POST", "/api/v1/order", 1518064238, data.trim_end());
 
         assert_eq!(
             signature,
@@ -120,7 +124,7 @@ mod tests {
     #[rstest]
     fn test_debug_redacts_secret() {
         let credential = Credential::new(API_KEY.to_string(), API_SECRET.to_string());
-        let dbg_out = format!("{:?}", credential);
+        let dbg_out = format!("{credential:?}");
         assert!(dbg_out.contains("api_secret: \"<redacted>\""));
         assert!(!dbg_out.contains("chNOO"));
         let secret_bytes_dbg = format!("{:?}", API_SECRET.as_bytes());
