@@ -81,10 +81,6 @@ cdef class DemoStrategyCy(Strategy):
         # Process each bar based on its type
         if bar.bar_type == self.bar_type_1min:  # if 1-minute bar is handled
             self.count_1min_bars += 1
-        elif bar.bar_type == self.bar_type_5min:  # if 5-minute bar is handled
-            self.count_5min_bars += 1
-        else:
-            raise Exception(f"Bar type not expected: {bar.bar_type}")
 
     cpdef void on_stop(self):
         # Save the exact time when strategy ends
