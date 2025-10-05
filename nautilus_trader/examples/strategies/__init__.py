@@ -12,3 +12,12 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+
+from nautilus_trader.examples.strategies.demo_strategy_cy import DemoStrategyCy
+from nautilus_trader.examples.strategies.demo_strategy_cy import DemoStrategyCyConfig
+
+
+__all__ = [
+    "DemoStrategyCy",
+    "DemoStrategyCyConfig",
+]
