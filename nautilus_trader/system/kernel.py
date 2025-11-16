@@ -18,8 +18,8 @@ import concurrent.futures
 import platform
 import signal
 import socket
-
-# import time
+import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -66,6 +66,7 @@ from nautilus_trader.config import StrategyFactory
 from nautilus_trader.config import StreamingConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
+from nautilus_trader.core.datetime import nanos_to_millis
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.algorithm import ExecAlgorithm
@@ -88,10 +89,13 @@ from nautilus_trader.trading.trader import Trader
 
 try:
     import uvloop
-
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:  # pragma: no cover
     uvloop = None
+
+# Only set uvloop policy if not running in test environment,
+# pytest-asyncio manages the event loop policy for tests via event_loop_policy fixture.
+if uvloop is not None and "pytest" not in sys.modules:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 class NautilusKernel:
@@ -125,7 +129,7 @@ class NautilusKernel:
 
     """
 
-    def __init__(  # noqa (too complex)
+    def __init__(  # noqa: C901 (too complex)
         self,
         name: str,
         config: NautilusKernelConfig,
@@ -168,7 +172,7 @@ class NautilusKernel:
         self._ts_created: int = self._clock.timestamp_ns()
         self._ts_started: int | None = None
         self._ts_shutdown: int | None = None
-        # ts_build = time.time_ns()
+        ts_build = time.time_ns()
 
         register_component_clock(self._instance_id, self._clock)
 
@@ -222,6 +226,8 @@ class NautilusKernel:
                         component=name,
                     )
                 else:
+                    set_logging_pyo3(False)
+
                     # Initialize logging for sync Rust and Python
                     self._log_guard = init_logging(
                         trader_id=self._trader_id,
@@ -506,6 +512,7 @@ class NautilusKernel:
                     path=catalog_config.path,
                     fs_protocol=catalog_config.fs_protocol,
                     fs_storage_options=catalog_config.fs_storage_options,
+                    fs_rust_storage_options=catalog_config.fs_rust_storage_options,
                 )
                 used_catalog_name = catalog_config.name
 
@@ -538,8 +545,9 @@ class NautilusKernel:
         self._is_running = False
         self._is_stopping = False
 
-        # build_time_ms = nanos_to_millis(time.time_ns() - ts_build)
-        # self._log.info(f"Initialized in {build_time_ms}ms")
+        build_time_ns = time.time_ns() - ts_build
+        build_time_ms = nanos_to_millis(build_time_ns) if build_time_ns > 0 else 0
+        self._log.info(f"Initialized in {build_time_ms}ms")
 
     def __del__(self) -> None:
         if hasattr(self, "_writer") and self._writer and not self._writer.is_closed:
@@ -1100,6 +1108,11 @@ class NautilusKernel:
         idempotent). Once called, it cannot be reversed, and no other methods should be
         called on this instance.
 
+        Notes
+        -----
+        The log guard is intentionally not disposed to support running multiple engines
+        sequentially without re-initializing logging.
+
         """
         self._stop_engines()
 
@@ -1155,11 +1168,7 @@ class NautilusKernel:
 
         # Get all tasks except the current one
         current_task = asyncio.current_task(self.loop)
-        pending_tasks = [
-            task
-            for task in asyncio.all_tasks(self.loop)
-            if task is not current_task and not task.done()
-        ]
+        pending_tasks = [task for task in asyncio.all_tasks(self.loop) if task is not current_task and not task.done()]
 
         if not pending_tasks:
             self._log.info("No pending tasks to cancel")
@@ -1208,11 +1217,7 @@ class NautilusKernel:
             cleanup_task = self.loop.create_task(_cancel_and_wait_for_tasks())
             cleanup_task.add_done_callback(
                 lambda t: self._log.info(
-                    (
-                        "Task cleanup completed"
-                        if not t.exception()
-                        else f"Task cleanup failed: {t.exception()}"
-                    ),
+                    ("Task cleanup completed" if not t.exception() else f"Task cleanup failed: {t.exception()}"),
                 ),
             )
         else:

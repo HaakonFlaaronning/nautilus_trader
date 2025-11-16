@@ -6,12 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "Data persistence and storage for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "nautilus_persistence"
@@ -26,10 +29,7 @@ extension-module = [
   "python",
   "pyo3/extension-module",
 ]
-ffi = [
-  "nautilus-core/ffi",
-  "nautilus-model/ffi",
-]
+ffi = ["nautilus-core/ffi", "nautilus-model/ffi"]
 python = [
   "nautilus-core/ffi",
   "nautilus-core/python",

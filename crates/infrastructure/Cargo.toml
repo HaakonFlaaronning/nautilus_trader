@@ -6,19 +6,22 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "Infrastructure components for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 name = "nautilus_infrastructure"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["redis"]  # redis needed by `nautilus_trader` by default for now
+default = ["redis"] # redis needed by `nautilus_trader` by default for now
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
@@ -32,6 +35,7 @@ python = [
   "nautilus-model/python",
   "pyo3",
   "pyo3-async-runtimes",
+  "pyo3-stub-gen",
 ]
 redis = ["dep:redis"]
 postgres = ["dep:sqlx"]
@@ -68,6 +72,7 @@ ustr = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 

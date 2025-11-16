@@ -157,8 +157,8 @@ pub enum OKXWsChannel {
     // Private Channels
     #[serde(rename = "account")]
     Account,
-    // #[display(fmt = "positions")]
-    // Positions,
+    #[serde(rename = "positions")]
+    Positions,
     // #[display(fmt = "balance_and_position")]
     // BalanceAndPosition,
     #[serde(rename = "orders")]
@@ -177,7 +177,7 @@ pub enum OKXWsChannel {
     // Rfqs,
     // #[serde(rename = "quotes")]
     // Quotes,
-    // #[display(fmt = "struc-block")]
+    // #[display(fmt = "structure-block-trades")]
     // StructuredBlock,
     // #[display(fmt = "spreads")]
     // Spreads,

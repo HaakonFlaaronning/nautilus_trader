@@ -1,4 +1,5 @@
 # Backtesting
+
 Backtesting with NautilusTrader is a methodical simulation process that replicates trading
 activities using a specific system implementation. This system is composed of various components
 including the built-in engines, `Cache`, [MessageBus](message_bus.md), `Portfolio`, [Actors](actors.md), [Strategies](strategies.md), [Execution Algorithms](execution.md),
@@ -38,6 +39,109 @@ An instantiated `BacktestEngine` can accept the following:
 
 This approach offers detailed control over the backtesting process, allowing you to manually configure each component.
 
+### Loading large datasets efficiently
+
+When working with large amounts of data across multiple instruments, the way you load data
+can significantly impact performance.
+
+#### The performance consideration
+
+By default, `BacktestEngine.add_data()` sorts the entire data stream (existing data + newly
+added data) on each call when `sort=True` (the default). This means:
+
+- First call with 1M bars: sorts 1M bars.
+- Second call with 1M bars: sorts 2M bars.
+- Third call with 1M bars: sorts 3M bars.
+- And so on...
+
+This repeated sorting of increasingly large datasets can become a bottleneck when loading
+data for multiple instruments.
+
+#### Optimization strategies
+
+**Strategy 1: Defer sorting until the end (recommended for multiple instruments)**
+
+```python
+from nautilus_trader.backtest.engine import BacktestEngine
+
+engine = BacktestEngine()
+
+# Setup venue and instruments
+engine.add_venue(...)
+engine.add_instrument(instrument1)
+engine.add_instrument(instrument2)
+engine.add_instrument(instrument3)
+
+# Load all data WITHOUT sorting on each call
+engine.add_data(instrument1_bars, sort=False)
+engine.add_data(instrument2_bars, sort=False)
+engine.add_data(instrument3_bars, sort=False)
+
+# Sort once at the end - much more efficient!
+engine.sort_data()
+
+# Now run your backtest
+engine.add_strategy(strategy)
+engine.run()
+```
+
+**Strategy 2: Collect and add in a single batch**
+
+```python
+# Collect all data first
+all_bars = []
+all_bars.extend(instrument1_bars)
+all_bars.extend(instrument2_bars)
+all_bars.extend(instrument3_bars)
+
+# Add once with sorting
+engine.add_data(all_bars, sort=True)
+```
+
+**Strategy 3: Use streaming API for very large datasets**
+
+For datasets that don't fit in memory, use the streaming API:
+
+```python
+def data_generator():
+    # Yield chunks of pre-sorted data
+    yield load_chunk_1()
+    yield load_chunk_2()
+    yield load_chunk_3()
+
+engine.add_data_iterator(
+    data_name="my_data_stream",
+    generator=data_generator(),
+)
+```
+
+:::tip Performance impact
+For a backtest with 10 instruments, each with 1M bars:
+
+- Sorting on each call: ~10 sorts of increasing size (1M, 2M, 3M, ... 10M bars).
+- Sorting once at the end: 1 sort of 10M bars.
+
+The deferred sorting approach can be **orders of magnitude faster** for large datasets.
+:::
+
+### Data loading contract
+
+The `BacktestEngine` enforces important invariants to ensure data integrity:
+
+**Requirements:**
+
+- All data must be sorted and synced to the internal iterator before calling `run()`.
+- When using `sort=False`, you **must** call `sort_data()` or add more data with `sort=True` before running.
+- The engine validates this requirement and raises `RuntimeError` if violated.
+
+**Safety guarantees:**
+
+- Data lists are always copied internally to prevent external mutations from affecting engine state.
+- You can safely clear or modify data lists after passing them to `add_data()`.
+- Adding data with `sort=True` makes it immediately available for backtesting.
+
+This design ensures data integrity while enabling performance optimizations for large datasets.
+
 ## High-level API
 
 The high-level API centers around a `BacktestNode`, which orchestrates the management of multiple `BacktestEngine` instances,
@@ -52,6 +156,97 @@ Each `BacktestRunConfig` object consists of the following:
 - A list of `ImportableExecAlgorithmConfig` objects.
 - An optional `ImportableControllerConfig` object.
 - An optional `BacktestEngineConfig` object, with a default configuration if not specified.
+
+## Repeated runs
+
+When conducting multiple backtest runs, it's important to understand how components reset to avoid unexpected behavior.
+
+### BacktestEngine.reset()
+
+The `.reset()` method returns all stateful fields to their **initial value**, except for data and instruments which persist.
+
+**What gets reset:**
+
+- All trading state (orders, positions, account balances)
+- Strategy state
+- Engine counters and timestamps
+
+**What persists:**
+
+- Data added via `.add_data()` (use `.clear_data()` to drop it)
+- Instruments (required to match the persisted data)
+- Venue configurations
+
+**Instrument handling:**
+
+For `BacktestEngine`, instruments persist across resets by default (because data persists and instruments must match data).
+This is configured via `CacheConfig.drop_instruments_on_reset=False` in the default `BacktestEngineConfig`.
+
+### Approaches for multiple backtest runs
+
+There are two main approaches for running multiple backtests:
+
+#### 1. Use BacktestNode (recommended for production)
+
+The high-level API is designed for multiple backtest runs with different configurations:
+
+```python
+from nautilus_trader.backtest.node import BacktestNode
+from nautilus_trader.config import BacktestRunConfig
+
+# Define multiple run configurations
+configs = [
+    BacktestRunConfig(...),  # Run 1
+    BacktestRunConfig(...),  # Run 2
+    BacktestRunConfig(...),  # Run 3
+]
+
+# Execute all runs
+node = BacktestNode(configs=configs)
+results = node.run()
+```
+
+Each run gets a fresh engine with clean state - no reset() needed.
+
+#### 2. Use BacktestEngine.reset()
+
+For fine-grained control with the low-level API:
+
+```python
+from nautilus_trader.backtest.engine import BacktestEngine
+
+engine = BacktestEngine()
+
+# Setup once
+engine.add_venue(...)
+engine.add_instrument(ETHUSDT)
+engine.add_data(data)
+
+# Run 1
+engine.add_strategy(strategy1)
+engine.run()
+
+# Reset and run 2 - instruments and data persist
+engine.reset()
+engine.add_strategy(strategy2)
+engine.run()
+
+# Reset and run 3
+engine.reset()
+engine.add_strategy(strategy3)
+engine.run()
+```
+
+:::note
+Instruments and data persist across resets by default for `BacktestEngine`, making parameter optimizations straightforward.
+:::
+
+:::tip Best practices
+
+- **For production backtesting:** Use `BacktestNode` with configuration objects.
+- **For parameter optimizations:** Use `BacktestEngine.reset()` to run multiple strategies against the same data.
+- **For quick experiments:** Either approach works - choose based on individual use case.
+:::
 
 ## Data
 
@@ -145,18 +340,33 @@ granular data such as quotes, trades, or bars (although the simulation will only
 
 :::warning
 When using bars for execution simulation (enabled by default with `bar_execution=True` in venue configurations),
-Nautilus strictly expects the timestamp (`ts_init`) of each bar to represent its **closing time**.
+Nautilus strictly expects the initialization timestamp (`ts_init`) of each bar to represent its **closing time**.
 This ensures accurate chronological processing, prevents look-ahead bias, and aligns market updates (Open → High → Low → Close) with the moment the bar is complete.
+
+The event timestamp (`ts_event`) can represent either the open or close time of the bar:
+
+- If `ts_event` is at the **close**, ensure `ts_init_delta=0` when processing bars (default).
+- If `ts_event` is at the **open**, set `ts_init_delta` equal to the bar's duration to shift `ts_init` to the close.
+
 :::
 
 #### Bar timestamp convention
 
-If your data source provides bars timestamped at the **opening time** (common in some providers), you must adjust them to the closing time before loading into Nautilus.
-Failure to do so can lead to incorrect order fills, event sequencing errors, or unrealistic backtest results.
+If your data source provides bars timestamped at the **opening time** (common in some providers), you need to ensure `ts_init` is set to the closing time for correct execution simulation. There are two approaches:
+
+**Approach 1: Adjust data timestamps (recommended)**
 
 - Use adapter-specific configurations like `bars_timestamp_on_close=True` (e.g., for Bybit or Databento adapters) to handle this automatically during data ingestion.
-- For custom data, manually shift timestamps by the bar duration (e.g., add 1 minute for `1-MINUTE` bars).
-- Always verify your data's timestamp convention with a small sample to avoid simulation inaccuracies.
+- For custom data, manually shift the timestamps by the bar duration before loading (e.g., add 1 minute for `1-MINUTE` bars).
+- This approach is clearest because the data itself reflects the close time.
+
+**Approach 2: Use `ts_init_delta` parameter**
+
+- When calling `BarDataWrangler.process()`, set `ts_init_delta` to the bar's duration in nanoseconds.
+- The wrangler will compute `ts_init = ts_event + ts_init_delta`, shifting execution timing to the close.
+- Use this when you cannot or prefer not to modify source data timestamps.
+
+Always verify your data's timestamp convention with a small sample to avoid simulation inaccuracies. Incorrect timestamp handling can lead to look-ahead bias and unrealistic backtest results.
 
 #### Processing bar data
 
@@ -164,9 +374,20 @@ Even when you provide bar data, Nautilus maintains an internal order book for ea
 
 1. **Time processing**:
    - Nautilus has a specific way of handling the timing of bar data *for execution* that's crucial for accurate simulation.
-   - Bar timestamps (`ts_event`) are expected to represent the close time of the bar. This approach is most logical because it represents the moment when the bar is fully formed and its aggregation is complete.
-   - The initialization time (`ts_init`) can be controlled using the `ts_init_delta` parameter in `BarDataWrangler`, which should typically be set to the bar's step size (timeframe) in nanoseconds.
-   - The platform ensures all events happen in the correct sequence based on these timestamps, preventing any possibility of look-ahead bias in your backtests.
+   - The initialization timestamp (`ts_init`) is used for execution timing and must represent the close time of the bar. This approach is most logical because it represents the moment when the bar is fully formed and its aggregation is complete.
+   - The event timestamp (`ts_event`) represents when the data event occurred and may differ from `ts_init` depending on your data source:
+     - If your bars are timestamped at the **close** (the recommended default), use `ts_init_delta=0` in `BarDataWrangler` so that `ts_init = ts_event`.
+     - If your bars are timestamped at the **open**, set `ts_init_delta` to the bar's duration in nanoseconds (e.g., 60_000_000_000 for 1-minute bars) to shift `ts_init` to the close time.
+   - The platform ensures all events happen in the correct sequence based on `ts_init`, preventing any possibility of look-ahead bias in your backtests.
+
+:::note Exceptions for bar execution
+Bars will **not** be processed for execution (and will not update the order book) in the following cases:
+
+- **Internally aggregated bars**: Bars with `AggregationSource.INTERNAL` are skipped to avoid processing bars that are derived from already-processed tick data.
+- **Non-L1 book types**: When the venue's `book_type` is configured as `L2_MBP` or `L3_MBO`, bar data is ignored for execution processing, as bars are derived from top-of-book prices only.
+
+In these cases, bars will still be received by strategies for analytics and decision-making, but they won't trigger order matching or update the simulated order book.
+:::
 
 2. **Price processing**:
    - The platform converts each bar's OHLC prices into a sequence of market updates.
@@ -446,7 +667,7 @@ The engine locks only the stake required by the venue; leverage and margin are n
 
 ## Margin models
 
-Nautilus Trader provides flexible margin calculation models to accommodate different venue types and trading scenarios.
+NautilusTrader provides flexible margin calculation models to accommodate different venue types and trading scenarios.
 
 ### Overview
 

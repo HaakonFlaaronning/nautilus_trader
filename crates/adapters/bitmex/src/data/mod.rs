@@ -24,7 +24,7 @@ use std::{
 };
 
 use ahash::AHashMap;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use nautilus_common::{
@@ -92,7 +92,7 @@ impl BitmexDataClient {
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be constructed.
-    pub fn new(client_id: ClientId, config: BitmexDataClientConfig) -> Result<Self> {
+    pub fn new(client_id: ClientId, config: BitmexDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
 
@@ -105,6 +105,10 @@ impl BitmexDataClient {
             config.max_retries,
             config.retry_delay_initial_ms,
             config.retry_delay_max_ms,
+            config.recv_window_ms,
+            config.max_requests_per_second,
+            config.max_requests_per_minute,
+            config.http_proxy_url.clone(),
         )
         .context("failed to construct BitMEX HTTP client")?;
 
@@ -128,31 +132,31 @@ impl BitmexDataClient {
         *BITMEX_VENUE
     }
 
-    fn ws_client(&self) -> Result<&BitmexWebSocketClient> {
+    fn ws_client(&self) -> anyhow::Result<&BitmexWebSocketClient> {
         self.ws_client
             .as_ref()
             .context("websocket client not initialized; call connect first")
     }
 
-    fn ws_client_mut(&mut self) -> Result<&mut BitmexWebSocketClient> {
+    fn ws_client_mut(&mut self) -> anyhow::Result<&mut BitmexWebSocketClient> {
         self.ws_client
             .as_mut()
             .context("websocket client not initialized; call connect first")
     }
 
     fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
-        if let Err(err) = sender.send(DataEvent::Data(data)) {
-            tracing::error!("Failed to emit data event: {err}");
+        if let Err(e) = sender.send(DataEvent::Data(data)) {
+            tracing::error!("Failed to emit data event: {e}");
         }
     }
 
     fn spawn_ws<F>(&self, fut: F, context: &'static str)
     where
-        F: Future<Output = Result<()>> + Send + 'static,
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         tokio::spawn(async move {
-            if let Err(err) = fut.await {
-                tracing::error!("{context}: {err:?}");
+            if let Err(e) = fut.await {
+                tracing::error!("{context}: {e:?}");
             }
         });
     }
@@ -160,7 +164,7 @@ impl BitmexDataClient {
     fn spawn_stream_task(
         &mut self,
         stream: impl futures_util::Stream<Item = NautilusWsMessage> + Send + 'static,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         let data_sender = self.data_sender.clone();
         let instruments = Arc::clone(&self.instruments);
         let cancellation = self.cancellation_token.clone();
@@ -202,6 +206,15 @@ impl BitmexDataClient {
                     Self::send_data(sender, data);
                 }
             }
+            NautilusWsMessage::Instruments(insts) => {
+                let mut guard = instruments.write().expect("instrument cache lock poisoned");
+                for instrument in insts {
+                    let instrument_id = instrument.id();
+                    guard.insert(instrument_id, instrument);
+                }
+                // TODO: Send instruments to data engine
+                let _ = sender;
+            }
             NautilusWsMessage::FundingRateUpdates(updates) => {
                 for update in updates {
                     tracing::debug!(
@@ -221,14 +234,13 @@ impl BitmexDataClient {
             NautilusWsMessage::Reconnected => {
                 tracing::info!("BitMEX websocket reconnected");
             }
+            NautilusWsMessage::Authenticated => {
+                tracing::debug!("BitMEX websocket authenticated");
+            }
         }
-
-        // Instrument updates arrive via the REST bootstrap. Keep the argument alive so Clippy
-        // doesn't flag the unused parameter warning when we expand handling later.
-        let _ = instruments;
     }
 
-    async fn bootstrap_instruments(&mut self) -> Result<Vec<InstrumentAny>> {
+    async fn bootstrap_instruments(&mut self) -> anyhow::Result<Vec<InstrumentAny>> {
         let http = self.http_client.clone();
         let mut instruments = http
             .request_instruments(self.config.active_only)
@@ -249,7 +261,7 @@ impl BitmexDataClient {
         }
 
         for instrument in &instruments {
-            self.http_client.add_instrument(instrument.clone());
+            self.http_client.cache_instrument(instrument.clone());
         }
 
         Ok(instruments)
@@ -263,7 +275,7 @@ impl BitmexDataClient {
         !self.is_connected()
     }
 
-    fn maybe_spawn_instrument_refresh(&mut self) -> Result<()> {
+    fn maybe_spawn_instrument_refresh(&mut self) -> anyhow::Result<()> {
         let Some(minutes) = self.config.update_instruments_interval_mins else {
             return Ok(());
         };
@@ -285,7 +297,7 @@ impl BitmexDataClient {
         let http_client = self.http_client.clone();
 
         let handle = tokio::spawn(async move {
-            let mut http_client = http_client;
+            let http_client = http_client;
             loop {
                 let sleep = tokio::time::sleep(interval);
                 tokio::pin!(sleep);
@@ -310,13 +322,13 @@ impl BitmexDataClient {
                                 }
 
                                 for instrument in instruments {
-                                    http_client.add_instrument(instrument);
+                                    http_client.cache_instrument(instrument);
                                 }
 
                                 tracing::debug!(client_id=%client_id, "BitMEX instruments refreshed");
                             }
-                            Err(err) => {
-                                tracing::warn!(client_id=%client_id, error=?err, "Failed to refresh BitMEX instruments");
+                            Err(e) => {
+                                tracing::warn!(client_id=%client_id, error=?e, "Failed to refresh BitMEX instruments");
                             }
                         }
                     }
@@ -347,12 +359,18 @@ impl DataClient for BitmexDataClient {
         Some(self.venue())
     }
 
-    fn start(&mut self) -> Result<()> {
-        tracing::info!("Starting BitMEX data client {id}", id = self.client_id);
+    fn start(&mut self) -> anyhow::Result<()> {
+        tracing::info!(
+            client_id = %self.client_id,
+            use_testnet = self.config.use_testnet,
+            http_proxy_url = ?self.config.http_proxy_url,
+            ws_proxy_url = ?self.config.ws_proxy_url,
+            "Starting BitMEX data client"
+        );
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) -> anyhow::Result<()> {
         tracing::info!("Stopping BitMEX data client {id}", id = self.client_id);
         self.cancellation_token.cancel();
         self.is_connected.store(false, Ordering::Relaxed);
@@ -360,7 +378,7 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn reset(&mut self) -> Result<()> {
+    fn reset(&mut self) -> anyhow::Result<()> {
         tracing::debug!("Resetting BitMEX data client {id}", id = self.client_id);
         self.is_connected.store(false, Ordering::Relaxed);
         self.cancellation_token = CancellationToken::new();
@@ -373,11 +391,11 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn dispose(&mut self) -> Result<()> {
+    fn dispose(&mut self) -> anyhow::Result<()> {
         self.stop()
     }
 
-    async fn connect(&mut self) -> Result<()> {
+    async fn connect(&mut self) -> anyhow::Result<()> {
         if self.is_connected() {
             return Ok(());
         }
@@ -396,7 +414,7 @@ impl DataClient for BitmexDataClient {
 
         let instruments = self.bootstrap_instruments().await?;
         if let Some(ws) = self.ws_client.as_mut() {
-            ws.initialize_instruments_cache(instruments);
+            ws.cache_instruments(instruments);
         }
 
         let ws = self.ws_client_mut()?;
@@ -416,7 +434,7 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    async fn disconnect(&mut self) -> Result<()> {
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
         if self.is_disconnected() {
             return Ok(());
         }
@@ -424,14 +442,14 @@ impl DataClient for BitmexDataClient {
         self.cancellation_token.cancel();
 
         if let Some(ws) = self.ws_client.as_mut()
-            && let Err(err) = ws.close().await
+            && let Err(e) = ws.close().await
         {
-            tracing::warn!("Error while closing BitMEX websocket: {err:?}");
+            tracing::warn!("Error while closing BitMEX websocket: {e:?}");
         }
 
         for handle in self.tasks.drain(..) {
-            if let Err(err) = handle.await {
-                tracing::error!("Error joining websocket task: {err:?}");
+            if let Err(e) = handle.await {
+                tracing::error!("Error joining websocket task: {e:?}");
             }
         }
 
@@ -455,13 +473,13 @@ impl DataClient for BitmexDataClient {
         self.is_disconnected()
     }
 
-    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> Result<()> {
+    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
         if cmd.book_type != BookType::L2_MBP {
-            bail!("BitMEX only supports L2_MBP order book deltas");
+            anyhow::bail!("BitMEX only supports L2_MBP order book deltas");
         }
 
         let instrument_id = cmd.instrument_id;
-        let depth = cmd.depth.map(|d| d.get()).unwrap_or(0);
+        let depth = cmd.depth.map_or(0, |d| d.get());
         let channel = if depth > 0 && depth <= 25 {
             BitmexBookChannel::OrderBookL2_25
         } else {
@@ -470,17 +488,18 @@ impl DataClient for BitmexDataClient {
 
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
+
         self.spawn_ws(
             async move {
                 match channel {
                     BitmexBookChannel::OrderBookL2 => ws
                         .subscribe_book(instrument_id)
                         .await
-                        .map_err(|err| anyhow!(err))?,
+                        .map_err(|err| anyhow::anyhow!(err))?,
                     BitmexBookChannel::OrderBookL2_25 => ws
                         .subscribe_book_25(instrument_id)
                         .await
-                        .map_err(|err| anyhow!(err))?,
+                        .map_err(|err| anyhow::anyhow!(err))?,
                     BitmexBookChannel::OrderBook10 => unreachable!(),
                 }
                 book_channels
@@ -495,15 +514,16 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn subscribe_book_depth10(&mut self, cmd: &SubscribeBookDepth10) -> Result<()> {
+    fn subscribe_book_depth10(&mut self, cmd: &SubscribeBookDepth10) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
+
         self.spawn_ws(
             async move {
                 ws.subscribe_book_depth10(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))?;
+                    .map_err(|err| anyhow::anyhow!(err))?;
                 book_channels
                     .write()
                     .expect("book channel cache lock poisoned")
@@ -515,12 +535,12 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn subscribe_book_snapshots(&mut self, cmd: &SubscribeBookSnapshots) -> Result<()> {
+    fn subscribe_book_snapshots(&mut self, cmd: &SubscribeBookSnapshots) -> anyhow::Result<()> {
         if cmd.book_type != BookType::L2_MBP {
-            bail!("BitMEX only supports L2_MBP order book snapshots");
+            anyhow::bail!("BitMEX only supports L2_MBP order book snapshots");
         }
 
-        let depth = cmd.depth.map(|d| d.get()).unwrap_or(10);
+        let depth = cmd.depth.map_or(10, |d| d.get());
         if depth != 10 {
             tracing::warn!("BitMEX orderBook10 provides 10 levels; requested depth={depth}");
         }
@@ -528,11 +548,12 @@ impl DataClient for BitmexDataClient {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
+
         self.spawn_ws(
             async move {
                 ws.subscribe_book_depth10(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))?;
+                    .map_err(|err| anyhow::anyhow!(err))?;
                 book_channels
                     .write()
                     .expect("book channel cache lock poisoned")
@@ -544,94 +565,101 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> Result<()> {
+    fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.subscribe_quotes(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX quote subscription",
         );
         Ok(())
     }
 
-    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> Result<()> {
+    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.subscribe_trades(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX trade subscription",
         );
         Ok(())
     }
 
-    fn subscribe_mark_prices(&mut self, cmd: &SubscribeMarkPrices) -> Result<()> {
+    fn subscribe_mark_prices(&mut self, cmd: &SubscribeMarkPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.subscribe_mark_prices(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX mark price subscription",
         );
         Ok(())
     }
 
-    fn subscribe_index_prices(&mut self, cmd: &SubscribeIndexPrices) -> Result<()> {
+    fn subscribe_index_prices(&mut self, cmd: &SubscribeIndexPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.subscribe_index_prices(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX index price subscription",
         );
         Ok(())
     }
 
-    fn subscribe_funding_rates(&mut self, cmd: &SubscribeFundingRates) -> Result<()> {
+    fn subscribe_funding_rates(&mut self, cmd: &SubscribeFundingRates) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.subscribe_funding_rates(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX funding rate subscription",
         );
         Ok(())
     }
 
-    fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> Result<()> {
+    fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
         let bar_type = cmd.bar_type;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.subscribe_bars(bar_type)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX bar subscription",
         );
         Ok(())
     }
 
-    fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> Result<()> {
+    fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
+
         self.spawn_ws(
             async move {
                 let channel = book_channels
@@ -643,15 +671,15 @@ impl DataClient for BitmexDataClient {
                     Some(BitmexBookChannel::OrderBookL2) => ws
                         .unsubscribe_book(instrument_id)
                         .await
-                        .map_err(|err| anyhow!(err))?,
+                        .map_err(|err| anyhow::anyhow!(err))?,
                     Some(BitmexBookChannel::OrderBookL2_25) => ws
                         .unsubscribe_book_25(instrument_id)
                         .await
-                        .map_err(|err| anyhow!(err))?,
+                        .map_err(|err| anyhow::anyhow!(err))?,
                     Some(BitmexBookChannel::OrderBook10) | None => ws
                         .unsubscribe_book(instrument_id)
                         .await
-                        .map_err(|err| anyhow!(err))?,
+                        .map_err(|err| anyhow::anyhow!(err))?,
                 }
                 Ok(())
             },
@@ -660,10 +688,11 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> Result<()> {
+    fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
+
         self.spawn_ws(
             async move {
                 book_channels
@@ -672,17 +701,18 @@ impl DataClient for BitmexDataClient {
                     .remove(&instrument_id);
                 ws.unsubscribe_book_depth10(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX book depth10 unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_book_snapshots(&mut self, cmd: &UnsubscribeBookSnapshots) -> Result<()> {
+    fn unsubscribe_book_snapshots(&mut self, cmd: &UnsubscribeBookSnapshots) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
+
         self.spawn_ws(
             async move {
                 book_channels
@@ -691,98 +721,104 @@ impl DataClient for BitmexDataClient {
                     .remove(&instrument_id);
                 ws.unsubscribe_book_depth10(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX book snapshot unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> Result<()> {
+    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.unsubscribe_quotes(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX quote unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> Result<()> {
+    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.unsubscribe_trades(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX trade unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> Result<()> {
+    fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
         let ws = self.ws_client()?.clone();
         let instrument_id = cmd.instrument_id;
+
         self.spawn_ws(
             async move {
                 ws.unsubscribe_mark_prices(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX mark price unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> Result<()> {
+    fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
         let ws = self.ws_client()?.clone();
         let instrument_id = cmd.instrument_id;
+
         self.spawn_ws(
             async move {
                 ws.unsubscribe_index_prices(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX index price unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> Result<()> {
+    fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
         let ws = self.ws_client()?.clone();
         let instrument_id = cmd.instrument_id;
+
         self.spawn_ws(
             async move {
                 ws.unsubscribe_funding_rates(instrument_id)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX funding rate unsubscribe",
         );
         Ok(())
     }
 
-    fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> Result<()> {
+    fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
         let bar_type = cmd.bar_type;
         let ws = self.ws_client()?.clone();
+
         self.spawn_ws(
             async move {
                 ws.unsubscribe_bars(bar_type)
                     .await
-                    .map_err(|err| anyhow!(err))
+                    .map_err(|err| anyhow::anyhow!(err))
             },
             "BitMEX bar unsubscribe",
         );
         Ok(())
     }
 
-    fn request_instruments(&self, request: &RequestInstruments) -> Result<()> {
+    fn request_instruments(&self, request: &RequestInstruments) -> anyhow::Result<()> {
         let venue = request.venue.unwrap_or_else(|| self.venue());
         if let Some(req_venue) = request.venue
             && req_venue != self.venue()
@@ -802,7 +838,7 @@ impl DataClient for BitmexDataClient {
         let active_only = self.config.active_only;
 
         tokio::spawn(async move {
-            let mut http_client = http;
+            let http_client = http;
             match http_client
                 .request_instruments(active_only)
                 .await
@@ -816,7 +852,7 @@ impl DataClient for BitmexDataClient {
                         guard.clear();
                         for instrument in &instruments {
                             guard.insert(instrument.id(), instrument.clone());
-                            http_client.add_instrument(instrument.clone());
+                            http_client.cache_instrument(instrument.clone());
                         }
                     }
 
@@ -830,18 +866,18 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
-                    if let Err(err) = sender.send(DataEvent::Response(response)) {
-                        tracing::error!("Failed to send instruments response: {err}");
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        tracing::error!("Failed to send instruments response: {e}");
                     }
                 }
-                Err(err) => tracing::error!("Instrument request failed: {err:?}"),
+                Err(e) => tracing::error!("Instrument request failed: {e:?}"),
             }
         });
 
         Ok(())
     }
 
-    fn request_instrument(&self, request: &RequestInstrument) -> Result<()> {
+    fn request_instrument(&self, request: &RequestInstrument) -> anyhow::Result<()> {
         if let Some(instrument) = self
             .instruments
             .read()
@@ -859,13 +895,13 @@ impl DataClient for BitmexDataClient {
                 self.clock.get_time_ns(),
                 request.params.clone(),
             )));
-            if let Err(err) = self.data_sender.send(DataEvent::Response(response)) {
-                tracing::error!("Failed to send instrument response: {err}");
+            if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
+                tracing::error!("Failed to send instrument response: {e}");
             }
             return Ok(());
         }
 
-        let mut http_client = self.http_client.clone();
+        let http_client = self.http_client.clone();
         let instruments_cache = Arc::clone(&self.instruments);
         let sender = self.data_sender.clone();
         let instrument_id = request.instrument_id;
@@ -883,7 +919,7 @@ impl DataClient for BitmexDataClient {
                 .context("failed to request instrument from BitMEX")
             {
                 Ok(Some(instrument)) => {
-                    http_client.add_instrument(instrument.clone());
+                    http_client.cache_instrument(instrument.clone());
                     {
                         let mut guard = instruments_cache
                             .write()
@@ -901,19 +937,19 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     )));
-                    if let Err(err) = sender.send(DataEvent::Response(response)) {
-                        tracing::error!("Failed to send instrument response: {err}");
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        tracing::error!("Failed to send instrument response: {e}");
                     }
                 }
                 Ok(None) => tracing::warn!("BitMEX instrument {instrument_id} not found"),
-                Err(err) => tracing::error!("Instrument request failed: {err:?}"),
+                Err(e) => tracing::error!("Instrument request failed: {e:?}"),
             }
         });
 
         Ok(())
     }
 
-    fn request_trades(&self, request: &RequestTrades) -> Result<()> {
+    fn request_trades(&self, request: &RequestTrades) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instrument_id = request.instrument_id;
@@ -944,18 +980,18 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
-                    if let Err(err) = sender.send(DataEvent::Response(response)) {
-                        tracing::error!("Failed to send trades response: {err}");
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        tracing::error!("Failed to send trades response: {e}");
                     }
                 }
-                Err(err) => tracing::error!("Trade request failed: {err:?}"),
+                Err(e) => tracing::error!("Trade request failed: {e:?}"),
             }
         });
 
         Ok(())
     }
 
-    fn request_bars(&self, request: &RequestBars) -> Result<()> {
+    fn request_bars(&self, request: &RequestBars) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let bar_type = request.bar_type;
@@ -986,11 +1022,11 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
-                    if let Err(err) = sender.send(DataEvent::Response(response)) {
-                        tracing::error!("Failed to send bars response: {err}");
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        tracing::error!("Failed to send bars response: {e}");
                     }
                 }
-                Err(err) => tracing::error!("Bar request failed: {err:?}"),
+                Err(e) => tracing::error!("Bar request failed: {e:?}"),
             }
         });
 

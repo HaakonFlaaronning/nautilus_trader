@@ -13,18 +13,20 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::fmt::Display;
+
 use nautilus_model::{enums::OrderSide, position::Position};
 
-use crate::statistic::PortfolioStatistic;
+use crate::{Returns, statistic::PortfolioStatistic};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis")
 )]
 pub struct LongRatio {
-    precision: usize,
+    pub precision: usize,
 }
 
 impl LongRatio {
@@ -37,11 +39,17 @@ impl LongRatio {
     }
 }
 
+impl Display for LongRatio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Long Ratio")
+    }
+}
+
 impl PortfolioStatistic for LongRatio {
     type Item = f64;
 
     fn name(&self) -> String {
-        stringify!(LongRatio).to_string()
+        self.to_string()
     }
 
     fn calculate_from_positions(&self, positions: &[Position]) -> Option<Self::Item> {
@@ -59,7 +67,18 @@ impl PortfolioStatistic for LongRatio {
         let scale = 10f64.powi(self.precision as i32);
         Some((value * scale).round() / scale)
     }
+    fn calculate_from_returns(&self, _returns: &Returns) -> Option<Self::Item> {
+        None
+    }
+
+    fn calculate_from_realized_pnls(&self, _realized_pnls: &[f64]) -> Option<Self::Item> {
+        None
+    }
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Tests
+////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
@@ -67,7 +86,7 @@ mod tests {
 
     use nautilus_core::{UnixNanos, approx_eq};
     use nautilus_model::{
-        enums::OrderSide,
+        enums::{InstrumentClass, OrderSide},
         identifiers::{
             AccountId, ClientOrderId, PositionId,
             stubs::{instrument_id_aud_usd_sim, strategy_id_ema_cross, trader_id},
@@ -113,6 +132,9 @@ mod tests {
             buy_qty: Quantity::default(),
             sell_qty: Quantity::default(),
             commissions: HashMap::new(),
+            adjustments: Vec::new(),
+            instrument_class: InstrumentClass::Spot,
+            is_currency_pair: true,
         }
     }
 
@@ -217,6 +239,6 @@ mod tests {
     #[rstest]
     fn test_name() {
         let long_ratio = LongRatio::new(None);
-        assert_eq!(long_ratio.name(), "LongRatio");
+        assert_eq!(long_ratio.name(), "Long Ratio");
     }
 }

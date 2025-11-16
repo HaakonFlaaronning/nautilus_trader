@@ -44,6 +44,7 @@ use nautilus_model::{
 };
 use rstest::*;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use crate::{
     client::ExecutionClient,
@@ -399,8 +400,9 @@ fn test_submit_order_with_duplicate_client_order_id_handles_gracefully(
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -487,8 +489,9 @@ fn test_submit_order_for_random_venue_logs(mut execution_engine: ExecutionEngine
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("RANDOM_VENUE"), // No client registered with this ID
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -679,7 +682,7 @@ fn test_submit_bracket_order_list_with_all_duplicate_client_order_id_logs_does_n
         client_order_id: ClientOrderId::from("OL-19700101-000000-001-001-1"),
         venue_order_id: VenueOrderId::from("VOID"),
         order_list,
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         position_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -798,6 +801,7 @@ fn test_submit_order_successfully_processes_and_caches_order(
         trader_id,
         strategy_id,
         position_id: None,
+        params: None,
         order: order.clone(),
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -805,7 +809,7 @@ fn test_submit_order_successfully_processes_and_caches_order(
         instrument_id: instrument.id,
         client_order_id: order.client_order_id(),
         venue_order_id: VenueOrderId::from("VOID"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
     };
 
     // Act - Submit order directly to execution engine
@@ -902,8 +906,9 @@ fn test_submit_order_with_cleared_cache_logs_error(mut execution_engine: Executi
         client_order_id: order.client_order_id(),
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         position_id: None,
+        params: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -1004,8 +1009,9 @@ fn test_when_applying_event_to_order_with_invalid_state_trigger_logs(
         client_order_id: order.client_order_id(),
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         position_id: None,
+        params: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -1170,8 +1176,9 @@ fn test_cancel_order_for_already_closed_order_logs_and_does_nothing(
         client_order_id: order.client_order_id(),
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         position_id: None,
+        params: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -4479,6 +4486,7 @@ fn test_handle_updated_order_event(mut execution_engine: ExecutionEngine) {
         Some(account_id),
         order.price(),
         None, // trigger_price
+        None, // protection_price
     ));
     execution_engine.process(&order_updated_event);
 
@@ -4545,8 +4553,9 @@ fn test_submit_order_with_quote_quantity_and_no_prices_denies(
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -4674,7 +4683,7 @@ fn test_submit_bracket_order_with_quote_quantity_and_no_prices_denies(
         client_order_id: ClientOrderId::from("O-20240101-000000-001-001-1"),
         venue_order_id: VenueOrderId::from("VOID"),
         order_list: bracket,
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         position_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -4865,8 +4874,9 @@ fn test_submit_order_with_quote_quantity_and_quote_tick_converts_to_base_quantit
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5014,8 +5024,9 @@ fn test_submit_order_with_quote_quantity_and_trade_ticks_converts_to_base_quanti
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5239,7 +5250,7 @@ fn test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
         client_order_id: ClientOrderId::from("O-20240101-000000-001-001-1"), // Use entry order's client order ID
         venue_order_id: VenueOrderId::from("VOID"),
         order_list,
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         position_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
@@ -5248,57 +5259,47 @@ fn test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
     // Act - Submit the order list
     execution_engine.execute(&TradingCommand::SubmitOrderList(submit_order_list));
 
-    // Check the orders immediately after submission to see if conversion happened
+    // Check the orders immediately after submission to confirm quote quantities were converted
     let cache = execution_engine.cache.borrow();
+
+    let last_price = cache
+        .trade(&instrument.id)
+        .map(|trade| trade.price)
+        .or_else(|| {
+            cache.quote(&instrument.id).map(|quote| match order_side {
+                nautilus_model::enums::OrderSide::Buy => quote.ask_price,
+                nautilus_model::enums::OrderSide::Sell => quote.bid_price,
+                nautilus_model::enums::OrderSide::NoOrderSide => quote.ask_price,
+            })
+        })
+        .expect("Expected trade or quote price for conversion");
+
+    let instrument_any = cache
+        .instrument(&instrument.id)
+        .expect("Instrument should exist in cache");
+    let expected_base_quantity =
+        instrument_any.calculate_base_quantity(Quantity::from(100_000), last_price);
 
     // Check entry order
     let cached_entry_order = cache
         .order(&entry_order.client_order_id())
         .expect("Entry order should exist in cache");
+    assert!(!cached_entry_order.is_quote_quantity());
+    assert_eq!(cached_entry_order.quantity(), expected_base_quantity);
 
     // Check stop loss order
     let cached_stop_loss_order = cache
         .order(&stop_loss_order.client_order_id())
         .expect("Stop loss order should exist in cache");
+    assert!(!cached_stop_loss_order.is_quote_quantity());
+    assert_eq!(cached_stop_loss_order.quantity(), expected_base_quantity);
 
     // Check take profit order
     let cached_take_profit_order = cache
         .order(&take_profit_order.client_order_id())
         .expect("Take profit order should exist in cache");
-
-    // Note: The execution engine should convert quote quantity to base quantity during submission
-    // However, the current implementation may not be updating the cached orders properly.
-    // This test documents the current behavior and may need to be updated when the conversion logic is fixed.
-
-    // For now, we'll check that the orders exist and have the expected properties
-    assert!(
-        cached_entry_order.is_quote_quantity(),
-        "Entry order should still have quote quantity flag after submission (conversion may not be working)"
-    );
-    assert!(
-        cached_stop_loss_order.is_quote_quantity(),
-        "Stop loss order should still have quote quantity flag after submission (conversion may not be working)"
-    );
-    assert!(
-        cached_take_profit_order.is_quote_quantity(),
-        "Take profit order should still have quote quantity flag after submission (conversion may not be working)"
-    );
-
-    assert_eq!(
-        cached_entry_order.quantity(),
-        Quantity::from(100_000),
-        "Entry order quantity should remain as quote quantity (conversion may not be working)"
-    );
-    assert_eq!(
-        cached_stop_loss_order.quantity(),
-        Quantity::from(100_000),
-        "Stop loss order quantity should remain as quote quantity (conversion may not be working)"
-    );
-    assert_eq!(
-        cached_take_profit_order.quantity(),
-        Quantity::from(100_000),
-        "Take profit order quantity should remain as quote quantity (conversion may not be working)"
-    );
+    assert!(!cached_take_profit_order.is_quote_quantity());
+    assert_eq!(cached_take_profit_order.quantity(), expected_base_quantity);
 
     // Process order events to simulate the full lifecycle for all orders
     drop(cache); // Release the borrow before processing events
@@ -5340,36 +5341,13 @@ fn test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
         .order(&take_profit_order.client_order_id())
         .expect("Take profit order should exist in cache");
 
-    // The final assertions reflect the current behavior where conversion may not be working
-    // These should be updated when the quote quantity conversion is properly implemented
-    assert_eq!(
-        final_entry_order.quantity(),
-        Quantity::from(100_000),
-        "Entry order quantity should remain as quote quantity (conversion not yet implemented)"
-    );
-    assert_eq!(
-        final_stop_loss_order.quantity(),
-        Quantity::from(100_000),
-        "Stop loss order quantity should remain as quote quantity (conversion not yet implemented)"
-    );
-    assert_eq!(
-        final_take_profit_order.quantity(),
-        Quantity::from(100_000),
-        "Take profit order quantity should remain as quote quantity (conversion not yet implemented)"
-    );
+    assert!(!final_entry_order.is_quote_quantity());
+    assert!(!final_stop_loss_order.is_quote_quantity());
+    assert!(!final_take_profit_order.is_quote_quantity());
 
-    assert!(
-        final_entry_order.is_quote_quantity(),
-        "Entry order should still have quote quantity flag (conversion not yet implemented)"
-    );
-    assert!(
-        final_stop_loss_order.is_quote_quantity(),
-        "Stop loss order should still have quote quantity flag (conversion not yet implemented)"
-    );
-    assert!(
-        final_take_profit_order.is_quote_quantity(),
-        "Take profit order should still have quote quantity flag (conversion not yet implemented)"
-    );
+    assert_eq!(final_entry_order.quantity(), expected_base_quantity);
+    assert_eq!(final_stop_loss_order.quantity(), expected_base_quantity);
+    assert_eq!(final_take_profit_order.quantity(), expected_base_quantity);
 }
 
 #[rstest]
@@ -5437,8 +5415,9 @@ fn test_submit_market_should_not_add_to_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5525,8 +5504,9 @@ fn test_submit_ioc_fok_should_not_add_to_own_book(#[case] time_in_force: TimeInF
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5610,8 +5590,9 @@ fn test_submit_order_adds_to_own_book_bid() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5644,7 +5625,7 @@ fn test_submit_order_adds_to_own_book_bid() {
     );
 
     // Check the specific price level
-    let price_key = Decimal::from_str("10.0").unwrap();
+    let price_key = dec!(10.0);
     assert!(
         bids.contains_key(&price_key),
         "Own order book should contain bid orders at price 10.0"
@@ -5665,7 +5646,7 @@ fn test_submit_order_adds_to_own_book_bid() {
     );
     assert_eq!(
         own_order.price.as_decimal(),
-        Decimal::from_str("10.0").unwrap(),
+        dec!(10.0),
         "Own order should have price 10.0"
     );
     assert_eq!(
@@ -5773,8 +5754,9 @@ fn test_submit_order_adds_to_own_book_ask() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5807,7 +5789,7 @@ fn test_submit_order_adds_to_own_book_ask() {
     );
 
     // Check the specific price level
-    let price_key = Decimal::from_str("11.0").unwrap();
+    let price_key = dec!(11.0);
     assert!(
         asks.contains_key(&price_key),
         "Own order book should contain ask orders at price 11.0"
@@ -5828,7 +5810,7 @@ fn test_submit_order_adds_to_own_book_ask() {
     );
     assert_eq!(
         own_order.price.as_decimal(),
-        Decimal::from_str("11.0").unwrap(),
+        dec!(11.0),
         "Own order should have price 11.0"
     );
     assert_eq!(
@@ -5952,8 +5934,9 @@ fn test_cancel_order_removes_from_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_bid.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -5966,8 +5949,9 @@ fn test_cancel_order_removes_from_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_ask.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6129,8 +6113,9 @@ fn test_own_book_status_filtering() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_bid.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6143,8 +6128,9 @@ fn test_own_book_status_filtering() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_ask.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6343,8 +6329,9 @@ fn test_filled_order_removes_from_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_bid.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6357,8 +6344,9 @@ fn test_filled_order_removes_from_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_ask.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6560,8 +6548,9 @@ fn test_order_updates_in_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_bid.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6574,8 +6563,9 @@ fn test_order_updates_in_own_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: order_ask.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6616,6 +6606,7 @@ fn test_order_updates_in_own_book() {
         Some(account_id),                  // account_id
         Some(new_bid_price),               // new price
         None,                              // trigger_price
+        None,                              // protection_price
     ));
 
     let order_updated_ask = OrderEventAny::Updated(OrderUpdated::new(
@@ -6632,6 +6623,7 @@ fn test_order_updates_in_own_book() {
         Some(account_id),                  // account_id
         Some(new_ask_price),               // new price
         None,                              // trigger_price
+        None,                              // protection_price
     ));
 
     execution_engine.process(&order_updated_bid);
@@ -6800,8 +6792,9 @@ fn test_position_flip_with_own_order_book() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: buy_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -6897,9 +6890,10 @@ fn test_position_flip_with_own_order_book() {
         client_order_id: sell_order.client_order_id(),
         venue_order_id: VenueOrderId::from("VOID"),
         order: sell_order.clone(),
-        position_id: Some(position_id), // Link to existing position
+        position_id: Some(position_id),
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7078,8 +7072,9 @@ fn test_own_book_with_crossed_orders() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: buy_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7092,8 +7087,9 @@ fn test_own_book_with_crossed_orders() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: sell_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7135,8 +7131,8 @@ fn test_own_book_with_crossed_orders() {
     assert_eq!(asks.len(), 1, "Expected 1 ask order in own book");
 
     // Verify by price
-    let bid_price = Decimal::from_str("1.05").unwrap();
-    let ask_price = Decimal::from_str("1.04").unwrap();
+    let bid_price = dec!(1.05);
+    let ask_price = dec!(1.04);
 
     assert!(
         bids.contains_key(&bid_price),
@@ -7248,8 +7244,9 @@ fn test_own_book_with_contingent_orders() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: entry_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7262,8 +7259,9 @@ fn test_own_book_with_contingent_orders() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: tp_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7276,8 +7274,9 @@ fn test_own_book_with_contingent_orders() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: sl_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7339,7 +7338,7 @@ fn test_own_book_with_contingent_orders() {
     // Entry order should be in the book as a bid
     let bids = own_book.bids_as_map(None, None, None);
     assert_eq!(bids.len(), 1, "Expected 1 bid order in own book");
-    let bid_price = Decimal::from_str("1.00").unwrap();
+    let bid_price = dec!(1.00);
     assert!(bids.contains_key(&bid_price), "Expected bid at price 1.00");
     assert_eq!(
         bids[&bid_price].len(),
@@ -7350,7 +7349,7 @@ fn test_own_book_with_contingent_orders() {
     // TP order should be in the book as an ask (submitted)
     let asks = own_book.asks_as_map(None, None, None);
     assert_eq!(asks.len(), 1, "Expected 1 ask order in own book");
-    let ask_price = Decimal::from_str("1.10").unwrap();
+    let ask_price = dec!(1.10);
     assert!(asks.contains_key(&ask_price), "Expected ask at price 1.10");
     assert_eq!(
         asks[&ask_price].len(),
@@ -7410,7 +7409,7 @@ fn test_own_book_with_contingent_orders() {
     // TP should still be in the book
     let asks = own_book.asks_as_map(None, None, None);
     assert_eq!(asks.len(), 1, "Expected 1 ask order in own book");
-    let tp_price = Decimal::from_str("1.10").unwrap();
+    let tp_price = dec!(1.10);
     assert!(
         asks.contains_key(&tp_price),
         "Expected TP order at price 1.10"
@@ -7517,8 +7516,9 @@ fn test_own_book_order_status_filtering_parameterized(
         venue_order_id: VenueOrderId::from("VOID"),
         order: order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7768,8 +7768,9 @@ fn test_own_book_combined_status_filtering() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: initialized_order,
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7784,8 +7785,9 @@ fn test_own_book_combined_status_filtering() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: submitted_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7802,8 +7804,9 @@ fn test_own_book_combined_status_filtering() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: accepted_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7823,8 +7826,9 @@ fn test_own_book_combined_status_filtering() {
         venue_order_id: VenueOrderId::from("VOID"),
         order: partially_filled_order.clone(),
         position_id: None,
+        params: None,
         client_id: ClientId::from("STUB"),
-        exec_algorith_id: None,
+        exec_algorithm_id: None,
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
@@ -7877,8 +7881,8 @@ fn test_own_book_combined_status_filtering() {
         "Expected 2 orders with INITIALIZED or SUBMITTED status"
     );
 
-    let price_100 = Decimal::from_str("1.00").unwrap();
-    let price_101 = Decimal::from_str("1.01").unwrap();
+    let price_100 = dec!(1.00);
+    let price_101 = dec!(1.01);
     assert!(
         early_orders.contains_key(&price_100),
         "Expected order at price 1.00 in early statuses"
@@ -7897,8 +7901,8 @@ fn test_own_book_combined_status_filtering() {
         "Expected 2 orders with ACCEPTED or PARTIALLY_FILLED status"
     );
 
-    let price_102 = Decimal::from_str("1.02").unwrap();
-    let price_103 = Decimal::from_str("1.03").unwrap();
+    let price_102 = dec!(1.02);
+    let price_103 = dec!(1.03);
     assert!(
         active_orders.contains_key(&price_102),
         "Expected order at price 1.02 in active statuses"
@@ -8005,8 +8009,9 @@ fn test_own_book_status_integrity_during_transitions() {
             venue_order_id: VenueOrderId::from("VOID"),
             order: order.clone(),
             position_id: None,
+            params: None,
             client_id: ClientId::from("STUB"),
-            exec_algorith_id: None,
+            exec_algorithm_id: None,
             command_id: UUID4::new(),
             ts_init: UnixNanos::default(),
         };
@@ -8096,7 +8101,7 @@ fn test_own_book_status_integrity_during_transitions() {
             "Expected 1 partially filled order"
         );
 
-        let price_101 = Decimal::from_str("1.01").unwrap();
+        let price_101 = dec!(1.01);
         assert!(
             partially_filled_orders.contains_key(&price_101),
             "Expected partially filled order at price 1.01"
@@ -8144,7 +8149,7 @@ fn test_own_book_status_integrity_during_transitions() {
             "Expected 1 accepted order after cancellation"
         );
 
-        let price_102 = Decimal::from_str("1.02").unwrap();
+        let price_102 = dec!(1.02);
         assert!(
             !accepted_after_cancel.contains_key(&price_102),
             "Canceled order should not be in accepted status"
@@ -8191,7 +8196,7 @@ fn test_own_book_status_integrity_during_transitions() {
             "Expected 2 partially filled orders"
         );
 
-        let price_100 = Decimal::from_str("1.00").unwrap();
+        let price_100 = dec!(1.00);
         assert!(
             partially_after_first.contains_key(&price_100),
             "Expected partially filled order at price 1.00"
@@ -8266,7 +8271,7 @@ fn test_own_book_status_integrity_during_transitions() {
 
         // Check if order exists in own book with any status (no filter)
         let all_orders = own_book.bids_as_map(None, None, None);
-        let price_101 = Decimal::from_str("1.01").unwrap();
+        let price_101 = dec!(1.01);
         assert!(
             all_orders.contains_key(&price_101),
             "Order at price 1.01 should exist in own book"

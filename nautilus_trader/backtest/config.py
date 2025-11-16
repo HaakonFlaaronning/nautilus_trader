@@ -21,6 +21,7 @@ from typing import Any
 import msgspec
 import pandas as pd
 
+from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.common import Environment
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.common.config import ImportableActorConfig
@@ -168,6 +169,9 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
         If borrowing is allowed for cash accounts (negative balances).
     frozen_account : bool, default False
         If the account for this exchange is frozen (balances will not change).
+    price_protection_points : int, default 0
+        Defines an exchange-calculated price boundary (in points) to prevent
+        marketable orders from executing at excessively aggressive prices.
 
     """
 
@@ -196,6 +200,7 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
     trade_execution: bool = False
     allow_cash_borrowing: bool = False
     frozen_account: bool = False
+    price_protection_points: int = 0
 
 
 class BacktestDataConfig(NautilusConfig, frozen=True):
@@ -212,6 +217,8 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
         The `fsspec` filesystem protocol for the catalog.
     catalog_fs_storage_options : dict, optional
         The `fsspec` storage options.
+    catalog_fs_rust_storage_options : dict, optional
+        The `fsspec` storage options for the Rust backend.
     instrument_id : InstrumentId | str, optional
         The instrument ID for the data configuration.
     start_time : str or int, optional
@@ -242,6 +249,7 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
     data_cls: str
     catalog_fs_protocol: str | None = None
     catalog_fs_storage_options: dict | None = None
+    catalog_fs_rust_storage_options: dict | None = None
     instrument_id: InstrumentId | None = None
     start_time: str | int | None = None
     end_time: str | int | None = None
@@ -399,9 +407,10 @@ class BacktestEngineConfig(NautilusKernelConfig, frozen=True):
 
     environment: Environment = Environment.BACKTEST
     trader_id: TraderId = "BACKTESTER-001"
-    data_engine: DataEngineConfig = DataEngineConfig()
-    risk_engine: RiskEngineConfig = RiskEngineConfig()
-    exec_engine: ExecEngineConfig = ExecEngineConfig()
+    cache: CacheConfig | None = CacheConfig(drop_instruments_on_reset=False)
+    data_engine: DataEngineConfig | None = DataEngineConfig()
+    risk_engine: RiskEngineConfig | None = RiskEngineConfig()
+    exec_engine: ExecEngineConfig | None = ExecEngineConfig()
     run_analysis: bool = True
 
     def __post_init__(self):

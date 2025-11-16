@@ -36,6 +36,10 @@ from nautilus_trader.test_kit.strategies.tester_exec import ExecTesterConfig
 # *** THIS IS A TEST STRATEGY WITH NO ALPHA ADVANTAGE WHATSOEVER. ***
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
+# Strategy config params
+symbol = "ETHUSDT"
+instrument_id = InstrumentId.from_str(f"{symbol}.{BINANCE}")
+order_qty = Decimal("0.01")
 
 # Configure the trading node
 config_node = TradingNodeConfig(
@@ -68,8 +72,6 @@ config_node = TradingNodeConfig(
             testnet=True,  # If client uses the testnet
             instrument_provider=InstrumentProviderConfig(load_all=True),
             max_retries=3,
-            retry_delay_initial_ms=1_000,
-            retry_delay_max_ms=10_000,
         ),
     },
     timeout_connection=30.0,
@@ -83,16 +85,18 @@ config_node = TradingNodeConfig(
 node = TradingNode(config=config_node)
 
 # Configure your strategy
-strat_config = ExecTesterConfig(
-    instrument_id=InstrumentId.from_str("ETHUSDT.BINANCE"),
-    external_order_claims=[InstrumentId.from_str("ETHUSDT.BINANCE")],
-    order_qty=Decimal("0.010"),
-    order_id_tag="001",
-    # use_batch_cancel_on_stop=True,
+config_strat = ExecTesterConfig(
+    instrument_id=instrument_id,
+    external_order_claims=[instrument_id],
+    order_qty=order_qty,
+    open_position_on_start_qty=order_qty,
+    use_post_only=True,
+    # tob_offset_ticks=0,
+    # log_data=False,
 )
 
 # Instantiate your strategy
-strategy = ExecTester(config=strat_config)
+strategy = ExecTester(config=config_strat)
 
 # Add your strategies and modules
 node.trader.add_strategy(strategy)

@@ -95,7 +95,7 @@ def account_state(account_id) -> AccountState:
     return AccountState(
         account_id=account_id,
         account_type=AccountType.MARGIN,
-        base_currency=xbt_currency,
+        base_currency=None,  # Multi-currency account
         reported=True,
         balances=[
             AccountBalance(
@@ -128,7 +128,10 @@ def mock_http_client():
     mock.api_secret = "test_api_secret"
 
     # Mock account number retrieval
-    mock.http_get_margin = AsyncMock(return_value="1234567")
+    mock.get_margin = AsyncMock(return_value="1234567")
+
+    # Mock server time retrieval
+    mock.get_server_time = AsyncMock(return_value=1234567890000)
 
     # Mock account state request
     mock_account_state = MagicMock()
@@ -136,9 +139,16 @@ def mock_http_client():
         return_value={
             "account_id": "BITMEX-1234567",
             "account_type": "MARGIN",
-            "base_currency": "XBt",
+            "base_currency": None,
             "reported": True,
-            "balances": [],
+            "balances": [
+                {
+                    "currency": "XBt",
+                    "total": "1000000.0",
+                    "locked": "0.0",
+                    "free": "1000000.0",
+                },
+            ],
             "margins": [],
             "info": {},
             "event_id": str(TestIdStubs.uuid()),
@@ -165,7 +175,7 @@ def mock_http_client():
     mock.request_position_status_reports = AsyncMock(return_value=[])
 
     # Mock instrument caching
-    mock.add_instrument = MagicMock()
+    mock.cache_instrument = MagicMock()
     mock.request_instruments = AsyncMock(return_value=[])
 
     return mock
@@ -228,6 +238,48 @@ def mock_ws_client():
 
 
 @pytest.fixture()
+def mock_submitter():
+    """
+    Create a mock BitMEX submit broadcaster.
+    """
+    mock = MagicMock(spec=nautilus_pyo3.SubmitBroadcaster)
+
+    # Mock lifecycle methods
+    mock.start = AsyncMock()
+    mock.stop = AsyncMock()
+
+    # Mock instrument caching
+    mock.cache_instrument = MagicMock()
+
+    # Mock submit operations
+    mock.broadcast_submit = AsyncMock()
+
+    return mock
+
+
+@pytest.fixture()
+def mock_canceller():
+    """
+    Create a mock BitMEX cancel broadcaster.
+    """
+    mock = MagicMock(spec=nautilus_pyo3.CancelBroadcaster)
+
+    # Mock lifecycle methods
+    mock.start = AsyncMock()
+    mock.stop = AsyncMock()
+
+    # Mock instrument caching
+    mock.cache_instrument = MagicMock()
+
+    # Mock cancel operations
+    mock.broadcast_cancel = AsyncMock()
+    mock.broadcast_cancel_all = AsyncMock()
+    mock.broadcast_batch_cancel = AsyncMock()
+
+    return mock
+
+
+@pytest.fixture()
 def mock_instrument_provider(instrument):
     """
     Create a mock BitMEX instrument provider.
@@ -249,6 +301,8 @@ def exec_client(
     event_loop,
     mock_http_client,
     mock_ws_client,
+    mock_submitter,
+    mock_canceller,
     msgbus,
     cache,
     live_clock,
@@ -262,6 +316,18 @@ def exec_client(
     monkeypatch.setattr(
         "nautilus_trader.adapters.bitmex.execution.nautilus_pyo3.BitmexWebSocketClient",
         lambda *args, **kwargs: mock_ws_client,
+    )
+
+    # Patch the SubmitBroadcaster creation
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bitmex.execution.nautilus_pyo3.SubmitBroadcaster",
+        lambda *args, **kwargs: mock_submitter,
+    )
+
+    # Patch the CancelBroadcaster creation
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bitmex.execution.nautilus_pyo3.CancelBroadcaster",
+        lambda *args, **kwargs: mock_canceller,
     )
 
     config = BitmexExecClientConfig(
@@ -284,6 +350,8 @@ def exec_client(
     # Store the mocked clients for test access
     client._mock_http_client = mock_http_client
     client._mock_ws_client = mock_ws_client
+    client._mock_submitter = mock_submitter
+    client._mock_canceller = mock_canceller
 
     return client
 

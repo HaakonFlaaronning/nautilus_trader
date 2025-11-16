@@ -35,10 +35,11 @@ types and how these map to their corresponding `PyObject` types.
 
 - [Environment Setup](environment_setup.md)
 - [Coding Standards](coding_standards.md)
-- [Cython](cython.md)
 - [Rust](rust.md)
-- [Docs](docs.md)
+- [Python](python.md)
 - [Testing](testing.md)
+- [Docs Style](docs.md)
+- [Release Notes](releases.md)
 - [Adapters](adapters.md)
 - [Benchmarking](benchmarking.md)
 - [Packaged Data](packaged_data.md)

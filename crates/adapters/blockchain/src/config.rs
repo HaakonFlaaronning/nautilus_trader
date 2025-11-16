@@ -75,6 +75,13 @@ pub struct BlockchainDataClientConfig {
     pub multicall_calls_per_rpc_request: u32,
     /// The WebSocket secure URL for the blockchain RPC endpoint.
     pub wss_rpc_url: Option<String>,
+    /// Optional HTTP proxy URL for RPC requests.
+    pub http_proxy_url: Option<String>,
+    /// Optional WebSocket proxy URL for RPC connections.
+    ///
+    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
+    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
+    pub ws_proxy_url: Option<String>,
     /// The block from which to sync historical data.
     pub from_block: Option<u64>,
     /// Filtering criteria that define which DEX pools to include in the data universe.
@@ -105,8 +112,10 @@ impl BlockchainDataClientConfig {
             use_hypersync_for_live_data,
             http_rpc_url,
             rpc_requests_per_second,
-            multicall_calls_per_rpc_request: multicall_calls_per_rpc_request.unwrap_or(100),
+            multicall_calls_per_rpc_request: multicall_calls_per_rpc_request.unwrap_or(200),
             wss_rpc_url,
+            http_proxy_url: None,
+            ws_proxy_url: None,
             from_block,
             pool_filters: pools_filters.unwrap_or_default(),
             postgres_cache_database_config,

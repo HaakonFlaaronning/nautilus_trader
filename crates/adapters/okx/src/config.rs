@@ -16,7 +16,7 @@
 //! Configuration structures for the OKX adapter.
 
 use crate::common::{
-    enums::{OKXContractType, OKXInstrumentType, OKXVipLevel},
+    enums::{OKXContractType, OKXInstrumentType, OKXMarginMode, OKXVipLevel},
     urls::{
         get_http_base_url, get_ws_base_url_business, get_ws_base_url_private,
         get_ws_base_url_public,
@@ -36,16 +36,32 @@ pub struct OKXDataClientConfig {
     pub instrument_types: Vec<OKXInstrumentType>,
     /// Contract type filter applied to loaded instruments.
     pub contract_types: Option<Vec<OKXContractType>>,
+    /// Instrument families to load (e.g., "BTC-USD", "ETH-USD").
+    /// Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
+    pub instrument_families: Option<Vec<String>>,
     /// Optional override for the HTTP base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the public WebSocket URL.
     pub base_url_ws_public: Option<String>,
     /// Optional override for the business WebSocket URL.
     pub base_url_ws_business: Option<String>,
+    /// Optional HTTP proxy URL.
+    pub http_proxy_url: Option<String>,
+    /// Optional WebSocket proxy URL.
+    ///
+    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
+    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
+    pub ws_proxy_url: Option<String>,
     /// When true the client will use OKX demo endpoints.
     pub is_demo: bool,
     /// Optional HTTP timeout in seconds.
     pub http_timeout_secs: Option<u64>,
+    /// Optional maximum retry attempts for requests.
+    pub max_retries: Option<u32>,
+    /// Optional initial retry delay in milliseconds.
+    pub retry_delay_initial_ms: Option<u64>,
+    /// Optional maximum retry delay in milliseconds.
+    pub retry_delay_max_ms: Option<u64>,
     /// Optional interval for refreshing instruments.
     pub update_instruments_interval_mins: Option<u64>,
     /// Optional VIP level that unlocks additional subscriptions.
@@ -60,11 +76,17 @@ impl Default for OKXDataClientConfig {
             api_passphrase: None,
             instrument_types: vec![OKXInstrumentType::Spot],
             contract_types: None,
+            instrument_families: None,
             base_url_http: None,
             base_url_ws_public: None,
             base_url_ws_business: None,
+            http_proxy_url: None,
+            ws_proxy_url: None,
             is_demo: false,
             http_timeout_secs: Some(60),
+            max_retries: Some(3),
+            retry_delay_initial_ms: Some(1_000),
+            retry_delay_max_ms: Some(10_000),
             update_instruments_interval_mins: Some(60),
             vip_level: None,
         }
@@ -126,12 +148,22 @@ pub struct OKXExecClientConfig {
     pub instrument_types: Vec<OKXInstrumentType>,
     /// Contract type filter applied to operations.
     pub contract_types: Option<Vec<OKXContractType>>,
+    /// Instrument families to load (e.g., "BTC-USD", "ETH-USD").
+    /// Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
+    pub instrument_families: Option<Vec<String>>,
     /// Optional override for the HTTP base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the private WebSocket URL.
     pub base_url_ws_private: Option<String>,
     /// Optional override for the business WebSocket URL.
     pub base_url_ws_business: Option<String>,
+    /// Optional HTTP proxy URL.
+    pub http_proxy_url: Option<String>,
+    /// Optional WebSocket proxy URL.
+    ///
+    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
+    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
+    pub ws_proxy_url: Option<String>,
     /// When true the client will use OKX demo endpoints.
     pub is_demo: bool,
     /// Optional HTTP timeout in seconds.
@@ -146,6 +178,10 @@ pub struct OKXExecClientConfig {
     pub retry_delay_initial_ms: Option<u64>,
     /// Optional maximum retry delay in milliseconds.
     pub retry_delay_max_ms: Option<u64>,
+    /// Optional margin mode (CROSS or ISOLATED) for margin/derivative accounts.
+    pub margin_mode: Option<OKXMarginMode>,
+    /// Enables margin/leverage for SPOT trading when true.
+    pub use_spot_margin: bool,
 }
 
 impl Default for OKXExecClientConfig {
@@ -156,9 +192,12 @@ impl Default for OKXExecClientConfig {
             api_passphrase: None,
             instrument_types: vec![OKXInstrumentType::Spot],
             contract_types: None,
+            instrument_families: None,
             base_url_http: None,
             base_url_ws_private: None,
             base_url_ws_business: None,
+            http_proxy_url: None,
+            ws_proxy_url: None,
             is_demo: false,
             http_timeout_secs: Some(60),
             use_fills_channel: false,
@@ -166,6 +205,8 @@ impl Default for OKXExecClientConfig {
             max_retries: Some(3),
             retry_delay_initial_ms: Some(1_000),
             retry_delay_max_ms: Some(10_000),
+            margin_mode: None,
+            use_spot_margin: false,
         }
     }
 }

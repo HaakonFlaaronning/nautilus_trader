@@ -33,7 +33,6 @@ from ibapi.order_condition import TimeCondition
 from ibapi.order_condition import VolumeCondition
 from ibapi.order_state import OrderState as IBOrderState
 
-# fmt: off
 from nautilus_trader.adapters.interactive_brokers.client import InteractiveBrokersClient
 from nautilus_trader.adapters.interactive_brokers.client.common import IBPosition
 from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
@@ -81,6 +80,7 @@ from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
 from nautilus_trader.model.enums import TriggerType
+from nautilus_trader.model.enums import order_side_to_str
 from nautilus_trader.model.enums import trailing_offset_type_to_str
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
@@ -103,9 +103,6 @@ from nautilus_trader.model.orders.trailing_stop_limit import TrailingStopLimitOr
 from nautilus_trader.model.orders.trailing_stop_market import TrailingStopMarketOrder
 
 
-# fmt: on
-
-
 # Monkey patch to fix IB API bug where PriceCondition.__str__ is a property instead of a method
 # This prevents TypeError: 'str' object is not callable when IB API tries to log orders
 def _price_condition_str(self):
@@ -119,7 +116,7 @@ def _price_condition_str(self):
 
 
 # Apply the monkey patch
-if hasattr(PriceCondition, "__str__") and not callable(getattr(PriceCondition, "__str__")):
+if hasattr(PriceCondition, "__str__") and not callable(PriceCondition.__str__):
     PriceCondition.__str__ = _price_condition_str
 
 
@@ -194,6 +191,8 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             clock=clock,
             config=config,
         )
+
+        self._filter_sec_types = instrument_provider.filter_sec_types
 
         # Track known positions to detect external changes (like option exercises)
         self._known_positions: dict[int, Decimal] = {}  # conId -> quantity
@@ -437,9 +436,14 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             instrument = await self.instrument_provider.get_instrument(position.contract)
 
             if instrument is None:
-                self._log.error(
-                    f"Cannot generate report: instrument not found for contract ID {position.contract.conId}",
-                )
+                if position.contract.secType in self._filter_sec_types:
+                    self._log.warning(
+                        f"Skipping reconciliation for filtered contract: {position.contract}",
+                    )
+                else:
+                    self._log.error(
+                        f"Cannot generate report: instrument not found for contract ID {position.contract.conId}",
+                    )
                 continue
 
             contract_details = self.instrument_provider.contract_details[instrument.id]
@@ -483,12 +487,6 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         self,
         command: GenerateFillReports,
     ) -> list[FillReport]:
-        """
-        Generate a list of `FillReport`s with optional query filters.
-
-        The returned list may be empty if no executions match the given parameters.
-
-        """
         self._log.debug("Requesting FillReports...")
         reports: list[FillReport] = []
 
@@ -659,29 +657,51 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             self.account_id.get_id(),
         )
 
+        # Handle case when specific instrument requested but no positions found
+        if command.instrument_id and not positions:
+            now = self._clock.timestamp_ns()
+            flat_report = PositionStatusReport(
+                account_id=self.account_id,
+                instrument_id=command.instrument_id,
+                position_side=PositionSide.FLAT,
+                quantity=Quantity.zero(),
+                report_id=UUID4(),
+                ts_last=now,
+                ts_init=now,
+            )
+            self._log.debug(f"Generated FLAT report for {command.instrument_id}")
+            return [flat_report]
+
         if not positions:
             return []
 
         for position in positions:
             self._log.debug(f"Trying PositionStatusReport for {position.contract.conId}")
 
+            instrument = await self.instrument_provider.get_instrument(position.contract)
+
+            if instrument is None:
+                if position.contract.secType in self._filter_sec_types:
+                    self._log.warning(
+                        f"Skipping reconciliation for filtered contract: {position.contract}",
+                    )
+                else:
+                    self._log.error(
+                        f"Cannot generate report: instrument not found for contract ID {position.contract.conId}",
+                    )
+                continue
+
+            if not self._cache.instrument(instrument.id):
+                self._msgbus.send(endpoint="DataEngine.process", msg=instrument)
+
+            # Determine position side
             if position.quantity > 0:
                 side = PositionSide.LONG
             elif position.quantity < 0:
                 side = PositionSide.SHORT
             else:
-                continue  # Skip, IB may continue to display closed positions
-
-            instrument = await self.instrument_provider.get_instrument(position.contract)
-
-            if instrument is None:
-                self._log.error(
-                    f"Cannot generate report: instrument not found for contract ID {position.contract.conId}",
-                )
-                continue
-
-            if not self._cache.instrument(instrument.id):
-                self._handle_data(instrument)
+                # Generate FLAT report for zero quantity positions
+                side = PositionSide.FLAT
 
             # Convert avg_cost to Price if available
             avg_px_open = None
@@ -824,6 +844,10 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
     def _transform_order_to_ib_order(self, order: Order) -> IBOrder:  # noqa: C901
         if order.is_post_only:
             raise ValueError("`post_only` not supported by Interactive Brokers")
+
+        is_inverse = self.instrument_provider.find(order.instrument_id).is_inverse
+        if order.is_quote_quantity and not is_inverse:
+            raise ValueError("UNSUPPORTED_QUOTE_QUANTITY")
 
         ib_order = IBOrder()
         time_in_force = order.time_in_force
@@ -1090,6 +1114,12 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             self._log.error(f"VenueOrderId not found for {command.client_order_id}")
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
+        if command.order_side != OrderSide.NO_ORDER_SIDE:
+            self._log.warning(
+                f"Interactive Brokers does not support order_side filtering for cancel all orders; "
+                f"ignoring order_side={order_side_to_str(command.order_side)} and canceling all orders",
+            )
+
         for order in self._cache.orders_open(
             instrument_id=command.instrument_id,
         ):
@@ -1118,15 +1148,11 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 continue
 
             if self._account_summary_tags - set(self._account_summary[currency].keys()) == set():
-                self._log.info(f"{self._account_summary}", LogColor.GREEN)
-                # free = self._account_summary[currency]["FullAvailableFunds"]
-                locked = self._account_summary[currency]["FullMaintMarginReq"]
+                self._log.debug(f"{self._account_summary}", LogColor.GREEN)
                 total = self._account_summary[currency]["NetLiquidation"]
+                free = self._account_summary[currency]["FullAvailableFunds"]
+                locked = total - free
 
-                if total - locked < locked:
-                    total = 400000  # TODO: Bug; Cannot recalculate balance when no current balance
-
-                free = total - locked
                 account_balance = AccountBalance(
                     total=Money(total, Currency.from_str(currency)),
                     free=Money(free, Currency.from_str(currency)),
@@ -1232,7 +1258,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             # TODO: Is there more better approach for this use case?
             # This tells the details about Pre and Post margin changes, user can request by setting whatIf flag
             # order will not be placed by IB and instead returns simulation.
-            # example={'status': 'PreSubmitted', 'initMarginBefore': '52.88', 'maintMarginBefore': '52.88', 'equityWithLoanBefore': '23337.31', 'initMarginChange': '2517.5099999999998', 'maintMarginChange': '2517.5099999999998', 'equityWithLoanChange': '-0.6200000000026193', 'initMarginAfter': '2570.39', 'maintMarginAfter': '2570.39', 'equityWithLoanAfter': '23336.69', 'commission': 2.12362, 'minCommission': 1.7976931348623157e+308, 'maxCommission': 1.7976931348623157e+308, 'commissionCurrency': 'USD', 'warningText': '', 'completedTime': '', 'completedStatus': ''}  # noqa
+            # example={'status': 'PreSubmitted', 'initMarginBefore': '52.88', 'maintMarginBefore': '52.88', 'equityWithLoanBefore': '23337.31', 'initMarginChange': '2517.5099999999998', 'maintMarginChange': '2517.5099999999998', 'equityWithLoanChange': '-0.6200000000026193', 'initMarginAfter': '2570.39', 'maintMarginAfter': '2570.39', 'equityWithLoanAfter': '23336.69', 'commission': 2.12362, 'minCommission': 1.7976931348623157e+308, 'maxCommission': 1.7976931348623157e+308, 'commissionCurrency': 'USD', 'warningText': '', 'completedTime': '', 'completedStatus': ''}
             self._handle_order_event(
                 status=OrderStatus.REJECTED,
                 order=nautilus_order,
@@ -1733,7 +1759,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
             # Ensure instrument is in cache
             if not self._cache.instrument(instrument.id):
-                self._handle_data(instrument)
+                self._msgbus.send(endpoint="DataEngine.process", msg=instrument)
 
             # Determine position side
             side = PositionSide.LONG if new_quantity > 0 else PositionSide.SHORT

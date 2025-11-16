@@ -1,9 +1,5 @@
 # Positions
 
-:::info
-We are currently working on this concept guide.
-:::
-
 This guide explains how positions work in NautilusTrader, including their lifecycle, aggregation
 from order fills, profit and loss calculations, and the important concept of position snapshotting
 for netting OMS configurations.
@@ -23,7 +19,12 @@ and hedging position management styles through its OMS (Order Management System)
 
 ### Creation
 
-The system opens a position on the first fill for an instrument. A position tracks:
+The system opens a position on the first fill:
+
+- **NETTING OMS**: Opens on first fill for an instrument (one position per instrument).
+- **HEDGING OMS**: Opens on first fill for a new `position_id` (multiple positions per instrument).
+
+A position tracks:
 
 - Opening order and fill details.
 - Entry side (`LONG` or `SHORT`).
@@ -52,7 +53,7 @@ A position closes when the net quantity becomes zero (`FLAT`). At closure:
 - The closing order ID is recorded.
 - Duration is calculated from open to close.
 - Final realized PnL is computed.
-- In `NETTING` OMS, the engine snapshots the closed position when it reopens to preserve the prior cycle's realized PnL (see [Position snapshotting](#position-snapshotting)).
+- In `NETTING` OMS, the engine preserves closed position state through snapshots to maintain historical PnL (see [Position snapshotting](#position-snapshotting)).
 
 ## Order fill aggregation
 
@@ -96,6 +97,45 @@ signed_qty = -50   # Now SHORT position
 # Final BUY 50 units at $52
 signed_qty = 0     # Position FLAT (closed)
 ```
+
+## Position adjustments
+
+Position adjustments track quantity or PnL changes that occur outside of normal order fills,
+ensuring the position quantity accurately reflects the true net asset position. The system
+generates `PositionAdjusted` events for these scenarios.
+
+### Base currency commissions
+
+When trading spot currency pairs (e.g., BTC/USDT) or FX spot, commissions paid in the base
+currency directly affect the net quantity received or delivered:
+
+- **Opening fills**: Commission is deducted from the traded quantity. A buy of 1.0 BTC with
+  -0.001 BTC commission results in a net long position of 0.999 BTC.
+- **Closing fills**: Commission is applied to `signed_qty` because it affects actual inventory.
+  Selling a 0.999 BTC LONG position with -0.000999 BTC commission leaves you SHORT 0.000999 BTC,
+  not FLAT, because you gave up 0.999999 BTC total.
+- **Flips**: Commission affects the final position size on both sides of the flip.
+
+:::note
+Base currency commissions only apply to spot currency pairs and FX spot instruments where the
+commission currency matches `instrument.base_currency`. For other instruments, commissions are
+tracked separately and do not affect position quantity.
+:::
+
+### Funding payments
+
+Funding adjustments track periodic payments for perpetual futures without affecting position
+quantity. These are logged with `quantity_change = None` and can include PnL impacts.
+
+### Adjustment tracking
+
+All adjustments are preserved in the position event history:
+
+- `position.adjustments` returns the list of all `PositionAdjusted` events.
+- Each adjustment includes type (`COMMISSION` or `FUNDING`), quantity change, and timestamps.
+- The adjustment history is cleared when positions close and reopen. When events are purged,
+  commission adjustments tied to the removed fills are regenerated while non-commission adjustments
+  (for example funding) are preserved.
 
 ## OMS types and position management
 
@@ -158,8 +198,8 @@ realized PnL from the previous position cycle would be lost.
 
 ### How it works
 
-When a `NETTING` position reopens after being closed, the engine takes a snapshot of the closed
-position state, preserving:
+When a `NETTING` position closes and then receives a new fill for the same instrument, the execution
+engine snapshots the closed position state before resetting it, preserving:
 
 - Final quantities and prices.
 - Realized PnL.
@@ -256,12 +296,17 @@ Positions track all trading costs:
 
 ```python
 commissions = position.commissions()
-# Returns list[Money] with all commission amounts
+# Returns list[Money] with aggregated commission totals per currency
 
-# Use notional_value to quantify exposure
 notional = position.notional_value(current_price)
 # Returns Money in quote currency (standard) or base currency (inverse)
 ```
+
+**Limitations:**
+
+- Panics if inverse instrument has no `base_currency` set.
+- Does not handle quanto contracts (returns quote currency instead of settlement currency).
+- For quanto instruments, use `instrument.calculate_notional_value()` instead.
 
 ## Position properties and state
 
@@ -278,9 +323,9 @@ notional = position.notional_value(current_price)
 ### Position state
 
 - `side`: Current position side (`LONG`, `SHORT`, or `FLAT`).
-- `entry`: Current entry side (BUY or SELL), reflecting the net direction; resets on reopen.
+- `entry`: Direction of the currently open position (`Buy` for `LONG`, `Sell` for `SHORT`). Updates when position flips direction.
 - `quantity`: Current absolute position size.
-- `signed_qty`: Signed position size (negative for `SHORT`).
+- `signed_qty`: Signed position size (positive for `LONG`, negative for `SHORT`).
 - `peak_qty`: Maximum quantity reached during position lifetime.
 - `is_open`: Whether position is currently open.
 - `is_closed`: Whether position is closed (`FLAT`).
@@ -349,6 +394,39 @@ This historical data enables:
 Use `position.events` to access the full history of fills for reconciliation.
 The `position.trade_ids` property helps match against broker statements.
 See the [Execution guide](execution.md) for reconciliation best practices.
+:::
+
+## Numerical precision
+
+Position calculations use 64-bit floating-point (`f64`) arithmetic for PnL and average price computations.
+While fixed-point types (`Price`, `Quantity`, `Money`) preserve exact precision at configured decimal places,
+internal calculations convert to `f64` for performance and overflow safety.
+
+### Design rationale
+
+The platform uses `f64` for position calculations to balance performance and accuracy:
+
+- Floating-point operations are significantly faster than arbitrary-precision arithmetic.
+- Raw integer multiplication can overflow even with 128-bit integers.
+- Each calculation starts from precise fixed-point values, avoiding cumulative error.
+- IEEE-754 double precision provides ~15 decimal digits of accuracy.
+
+### Validated precision characteristics
+
+Testing confirms `f64` arithmetic maintains accuracy for typical trading scenarios:
+
+- Standard amounts: No precision loss for amounts ≥ 0.01 in standard currencies.
+- High-precision instruments: 9-decimal crypto prices preserved within 1e-6 tolerance.
+- Sequential fills: 100 fills show no drift (commission accuracy to 1e-10).
+- Extreme prices: Handles range from 0.00001 to 99,999.99999 without overflow.
+- Round-trip trades: Opening and closing at same price produces exact PnL (commissions only).
+
+For implementation details, see `test_position_pnl_precision_*` tests in `crates/model/src/position.rs`.
+
+:::note
+For regulatory compliance or audit trails requiring exact decimal arithmetic, consider using `Decimal`
+types from external libraries. Very small amounts below `f64` epsilon (~1e-15) may round to zero,
+though this does not affect realistic trading scenarios with standard currency precisions.
 :::
 
 ## Integration with other components

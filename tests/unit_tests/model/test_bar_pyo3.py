@@ -85,12 +85,15 @@ class TestBarSpecification:
         assert str(bar_spec) == "1-MINUTE-BID"
         assert repr(bar_spec) == "BarSpecification(1-MINUTE-BID)"
 
-    @pytest.mark.skip(reason="WIP")
     @pytest.mark.parametrize(
         "aggregation",
         [
             BarAggregation.TICK,
+            BarAggregation.VOLUME,
+            BarAggregation.VALUE,
+            BarAggregation.WEEK,
             BarAggregation.MONTH,
+            BarAggregation.YEAR,
         ],
     )
     def test_timedelta_for_unsupported_aggregations_raises_value_error(self, aggregation):
@@ -404,6 +407,20 @@ class TestBarType:
 
         # Assert
         assert expected == bar_type
+
+    def test_bar_type_from_str_with_utf8_symbol(self):
+        # Arrange
+        non_ascii_instrument = "TËST-PÉRP.BINANCE"
+        non_ascii_bar_type = "TËST-PÉRP.BINANCE-1-MINUTE-LAST-EXTERNAL"
+
+        # Act
+        bar_type = BarType.from_str(non_ascii_bar_type)
+
+        # Assert
+        assert bar_type.instrument_id == InstrumentId.from_str(non_ascii_instrument)
+        assert bar_type.spec == BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST)
+        assert bar_type.aggregation_source == AggregationSource.EXTERNAL
+        assert str(bar_type) == non_ascii_bar_type
 
     def test_properties(self):
         # Arrange, Act

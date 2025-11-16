@@ -14,6 +14,8 @@
 # -------------------------------------------------------------------------------------------------
 
 from decimal import Decimal
+from enum import Enum
+from typing import Any
 
 import msgspec
 
@@ -44,6 +46,33 @@ from nautilus_trader.model.objects import QUANTITY_MIN
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+
+
+def _symbol_info_to_dict(symbol_info: BinanceSpotSymbolInfo) -> dict:
+    """
+    Convert symbol info to dict with all enums and nested structs converted to
+    primitives.
+
+    This ensures the info dict contains only JSON-serializable primitives.
+
+    """
+
+    def _convert_value(value: Any) -> Any:
+        # Recursively convert enums and structs to primitives
+        if isinstance(value, Enum):
+            return value.value
+        elif hasattr(value, "__struct_fields__"):
+            return _convert_dict(msgspec.structs.asdict(value))
+        elif isinstance(value, list):
+            return [_convert_value(item) for item in value]
+        elif isinstance(value, dict):
+            return _convert_dict(value)
+        return value
+
+    def _convert_dict(d: dict) -> dict:
+        return {key: _convert_value(val) for key, val in d.items()}
+
+    return _convert_dict(msgspec.structs.asdict(symbol_info))
 
 
 class BinanceSpotInstrumentProvider(InstrumentProvider):
@@ -105,8 +134,8 @@ class BinanceSpotInstrumentProvider(InstrumentProvider):
                 fees_dict: dict[str, BinanceSpotTradeFee] = {fee.symbol: fee for fee in response}
             else:
                 self._log.warning(
-                    "Currently not requesting actual trade fees for the SPOT testnet. "
-                    "All instruments will have zero fees.",
+                    "Currently not requesting actual trade fees for the SPOT testnet; "
+                    "all instruments will have zero fees",
                 )
                 fees_dict = {}
         except BinanceClientError as e:
@@ -146,13 +175,13 @@ class BinanceSpotInstrumentProvider(InstrumentProvider):
             else:
                 fees_dict = {}
                 self._log.warning(
-                    "Currently not requesting actual trade fees for the SPOT testnet. "
-                    "All instruments will have zero fees.",
+                    "Currently not requesting actual trade fees for the SPOT testnet; "
+                    "all instruments will have zero fees.",
                 )
         except BinanceClientError as e:
             self._log.error(
                 "Cannot load instruments: API key authentication failed "
-                f"(this is needed to request the applicable account fee tier). {e.message}",
+                f"(this is needed to request the applicable account fee tier): {e.message}",
             )
             return
 
@@ -178,7 +207,7 @@ class BinanceSpotInstrumentProvider(InstrumentProvider):
         PyCondition.equal(instrument_id.venue, self._venue, "instrument_id.venue", "BINANCE")
 
         filters_str = "..." if not filters else f" with filters {filters}..."
-        self._log.debug(f"Loading instrument {instrument_id}{filters_str}.")
+        self._log.debug(f"Loading instrument {instrument_id}{filters_str}")
 
         symbol = str(BinanceSymbol(instrument_id.symbol.value))
 
@@ -189,14 +218,14 @@ class BinanceSpotInstrumentProvider(InstrumentProvider):
                 fees_dict: dict[str, BinanceSpotTradeFee] = {fee.symbol: fee for fee in response}
             else:
                 self._log.warning(
-                    "Currently not requesting actual trade fees for the SPOT testnet. "
-                    "All instruments will have zero fees.",
+                    "Currently not requesting actual trade fees for the SPOT testnet; "
+                    "all instruments will have zero fees",
                 )
                 fees_dict = {}
         except BinanceClientError as e:
             self._log.error(
                 "Cannot load instruments: API key authentication failed "
-                f"(this is needed to request the applicable account fee tier). {e}",
+                f"(this is needed to request the applicable account fee tier): {e}",
             )
             return
 
@@ -308,7 +337,7 @@ class BinanceSpotInstrumentProvider(InstrumentProvider):
                 taker_fee=taker_fee,
                 ts_event=min(ts_event, ts_init),
                 ts_init=ts_init,
-                info=msgspec.structs.asdict(symbol_info),
+                info=_symbol_info_to_dict(symbol_info),
             )
             self.add_currency(currency=instrument.base_currency)
             self.add_currency(currency=instrument.quote_currency)

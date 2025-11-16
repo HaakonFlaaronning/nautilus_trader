@@ -55,12 +55,12 @@ pub type Statistic = Arc<dyn PortfolioStatistic<Item = f64> + Send + Sync>;
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis")
 )]
 pub struct PortfolioAnalyzer {
-    statistics: HashMap<String, Statistic>,
-    account_balances_starting: HashMap<Currency, Money>,
-    account_balances: HashMap<Currency, Money>,
-    positions: Vec<Position>,
-    realized_pnls: HashMap<Currency, Vec<(PositionId, f64)>>,
-    returns: Returns,
+    pub statistics: HashMap<String, Statistic>,
+    pub account_balances_starting: HashMap<Currency, Money>,
+    pub account_balances: HashMap<Currency, Money>,
+    pub positions: Vec<Position>,
+    pub realized_pnls: HashMap<Currency, Vec<(PositionId, f64)>>,
+    pub returns: Returns,
 }
 
 impl Default for PortfolioAnalyzer {
@@ -417,13 +417,17 @@ impl PortfolioAnalyzer {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Tests
+////////////////////////////////////////////////////////////////////////////////
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use nautilus_core::approx_eq;
     use nautilus_model::{
-        enums::{AccountType, LiquiditySide, OrderSide},
+        enums::{AccountType, InstrumentClass, LiquiditySide, OrderSide},
         events::{AccountState, OrderFilled},
         identifiers::{
             AccountId, ClientOrderId,
@@ -478,6 +482,7 @@ mod tests {
     ) -> Position {
         Position {
             events: Vec::new(),
+            adjustments: Vec::new(),
             trader_id: trader_id(),
             strategy_id: strategy_id_ema_cross(),
             instrument_id: instrument_id_aud_usd_sim(),
@@ -494,6 +499,8 @@ mod tests {
             size_precision: 2,
             multiplier: Quantity::default(),
             is_inverse: false,
+            is_currency_pair: true,
+            instrument_class: InstrumentClass::Spot,
             base_currency: None,
             quote_currency: Currency::USD(),
             settlement_currency: Currency::USD(),

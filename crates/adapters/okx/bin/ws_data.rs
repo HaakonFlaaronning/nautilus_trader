@@ -13,10 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-// Under development
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 use futures_util::StreamExt;
 use nautilus_model::identifiers::InstrumentId;
 use nautilus_okx::{
@@ -33,11 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let http_client = OKXHttpClient::from_env().unwrap();
     let instruments = http_client
-        .request_instruments(OKXInstrumentType::Swap)
+        .request_instruments(OKXInstrumentType::Swap, None)
         .await?;
 
     let mut ws_client = OKXWebSocketClient::from_env().unwrap();
-    ws_client.initialize_instruments_cache(instruments.clone());
+    ws_client.cache_instruments(instruments.clone());
     ws_client.connect().await?;
 
     let instrument_id = InstrumentId::from("BTC-USD-SWAP.OKX");

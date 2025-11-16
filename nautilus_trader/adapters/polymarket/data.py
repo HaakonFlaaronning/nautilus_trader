@@ -12,9 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
-
 import asyncio
-from collections.abc import Coroutine
 from typing import Any
 
 import msgspec
@@ -138,7 +136,10 @@ class PolymarketDataClient(LiveMarketDataClient):
 
         # Tasks
         self._update_instruments_task: asyncio.Task | None = None
-        self._delayed_ws_client_connection_task: asyncio.Task | None = None
+        self._delayed_ws_client_connection_tasks: set[asyncio.Task] = set()
+
+        # Synchronization
+        self._subscribe_lock = asyncio.Lock()
 
         # Hot caches
         self._last_quotes: dict[InstrumentId, QuoteTick] = {}
@@ -155,25 +156,30 @@ class PolymarketDataClient(LiveMarketDataClient):
             )
 
     async def _disconnect(self) -> None:
+        # Cancel background tasks
         if self._update_instruments_task:
-            self._log.debug("Canceling task 'update_instruments'")
             self._update_instruments_task.cancel()
             self._update_instruments_task = None
 
-        if self._delayed_ws_client_connection_task:
-            self._log.debug("Canceling task 'delayed_ws_client_connection'")
-            self._delayed_ws_client_connection_task.cancel()
-            self._delayed_ws_client_connection_task = None
+        # Cancel all pending connection tasks and wait for them to finish
+        for task in self._delayed_ws_client_connection_tasks:
+            task.cancel()
+        if self._delayed_ws_client_connection_tasks:
+            await asyncio.gather(*self._delayed_ws_client_connection_tasks, return_exceptions=True)
+            self._delayed_ws_client_connection_tasks.clear()
 
-        # Shutdown websockets
-        tasks: set[Coroutine[Any, Any, None]] = set()
+        # Disconnect all clients (hold lock during shutdown - no performance concern)
+        async with self._subscribe_lock:
+            all_clients = list(self._ws_clients)
+            if self._ws_client_pending_connection:
+                all_clients.append(self._ws_client_pending_connection)
+            self._ws_client_pending_connection = None
 
-        for ws_client in self._ws_clients:
-            if ws_client.is_connected():
-                tasks.add(ws_client.disconnect())
+            disconnect_tasks = [c.disconnect() for c in all_clients if c.is_connected()]
+            if disconnect_tasks:
+                await asyncio.gather(*disconnect_tasks, return_exceptions=True)
 
-        if tasks:
-            await asyncio.gather(*tasks)
+        self._cleanup_expired_books()
 
     def _create_websocket_client(self) -> PolymarketWebSocketClient:
         self._log.info("Creating new PolymarketWebSocketClient", LogColor.MAGENTA)
@@ -190,6 +196,21 @@ class PolymarketDataClient(LiveMarketDataClient):
         local_book = OrderBook(instrument_id, book_type=BookType.L2_MBP)
         self._local_books[instrument_id] = local_book
         return local_book
+
+    def _cleanup_expired_books(self) -> None:
+        now_ns = self._clock.timestamp_ns()
+        expired_instruments = []
+
+        for instrument_id in list(self._local_books.keys()):
+            instrument = self._cache.instrument(instrument_id)
+            if instrument and instrument.expiration_ns < now_ns:
+                expired_instruments.append(instrument_id)
+
+        if expired_instruments:
+            for instrument_id in expired_instruments:
+                self._local_books.pop(instrument_id, None)
+                self._last_quotes.pop(instrument_id, None)
+            self._log.info(f"Cleaned up {len(expired_instruments)} expired book(s)")
 
     def _send_all_instruments_to_data_engine(self) -> None:
         for instrument in self._instrument_provider.get_all().values():
@@ -219,41 +240,67 @@ class PolymarketDataClient(LiveMarketDataClient):
             self._log.info(f"Delaying websocket connections start for {delay_secs}s...")
 
             await asyncio.sleep(delay_secs)
-            self._ws_clients.append(ws_client)
-            await ws_client.connect()
+
+            # Clear pending client atomically (so new subscriptions create a new client)
+            async with self._subscribe_lock:
+                # It could have been another client already
+                if self._ws_client_pending_connection is ws_client:
+                    self._ws_client_pending_connection = None
+
+            # Don't hold the lock during connect
+            try:
+                await ws_client.connect()
+            except Exception as e:
+                self._log.error(f"Failed to connect WebSocket client: {e}")
+                return
+
+            # Add to active clients list atomically
+            async with self._subscribe_lock:
+                self._ws_clients.append(ws_client)
         finally:
-            self._ws_client_pending_connection = None
-            self._delayed_ws_client_connection_task = None
+            current_task = asyncio.current_task()
+            if current_task:
+                self._delayed_ws_client_connection_tasks.discard(current_task)
 
     async def _subscribe_asset_book(self, instrument_id):
-        create_connect_task = False
-        # Polymarket only supports 500 subscriptions per client
-        if (
-            self._ws_client_pending_connection is None
-            or len(self._ws_client_pending_connection.asset_subscriptions()) >= 500
-        ):
-            self._ws_client_pending_connection = self._create_websocket_client()
-            create_connect_task = True
-
+        # Compute token_id outside lock (pure function, no shared state)
         token_id = get_polymarket_token_id(instrument_id)
-        if token_id in self._ws_client_pending_connection.asset_subscriptions():
-            return  # Already subscribed
 
-        self._ws_client_pending_connection.subscribe_book(token_id)
+        ws_client = None
+        delay = None
 
-        if create_connect_task:
-            self._delayed_ws_client_connection_task = self.create_task(
-                self._delayed_ws_client_connection(
-                    self._ws_client_pending_connection,
-                    (
-                        self._config.ws_connection_delay_secs
-                        if self._ws_clients
-                        else self._config.ws_connection_initial_delay_secs
-                    ),
-                ),
+        # Critical section: need to synchronize all operations on the pending connection client
+        async with self._subscribe_lock:
+            # Polymarket only supports 500 subscriptions per client
+            if (
+                self._ws_client_pending_connection is None
+                or len(self._ws_client_pending_connection.asset_subscriptions()) >= 500
+                or self._ws_client_pending_connection.is_connected()
+            ):
+                # Create new client if: no pending client, client is full (>=500 subs), or already connected
+                self._ws_client_pending_connection = self._create_websocket_client()
+                ws_client = self._ws_client_pending_connection
+                delay = (
+                    self._config.ws_connection_delay_secs
+                    if self._ws_clients
+                    else self._config.ws_connection_initial_delay_secs
+                )
+
+            if token_id in self._ws_client_pending_connection.asset_subscriptions():
+                return  # Already subscribed
+
+            self._ws_client_pending_connection.subscribe_book(token_id)
+
+        # End of critical section: no need to lock to create task
+        if ws_client is not None:
+            task = self.create_task(
+                self._delayed_ws_client_connection(ws_client, delay),
                 log_msg="Delayed start PolymarketWebSocketClient connection",
                 success_msg="Finished delaying start of PolymarketWebSocketClient connection",
             )
+
+            async with self._subscribe_lock:
+                self._delayed_ws_client_connection_tasks.add(task)
 
     async def _subscribe_order_book_deltas(self, command: SubscribeOrderBook) -> None:
         if command.book_type == BookType.L3_MBO:
@@ -410,6 +457,10 @@ class PolymarketDataClient(LiveMarketDataClient):
         now_ns = self._clock.timestamp_ns()
         deltas = ws_message.parse_to_snapshot(instrument=instrument, ts_init=now_ns)
 
+        if deltas is None:
+            # Skip empty snapshots (can occur near market resolution)
+            return
+
         self._handle_deltas(instrument, deltas)
 
         if instrument.id in self.subscribed_quote_ticks():
@@ -427,14 +478,16 @@ class PolymarketDataClient(LiveMarketDataClient):
             self._handle_data(quote)
 
     def _handle_deltas(self, instrument: BinaryOption, deltas: OrderBookDeltas) -> None:
-        if self._config.compute_effective_deltas:
+        # Always maintain local book for quote generation
+        book_old = self._local_books.get(instrument.id)
+        book_new = OrderBook(instrument.id, book_type=BookType.L2_MBP)
+        book_new.apply_deltas(deltas)
+        self._local_books[instrument.id] = book_new
+
+        if self._config.compute_effective_deltas and book_old is not None:
             # Compute effective deltas (reduce snapshot based on old and new book states),
             # prioritizing a smaller data footprint over computational efficiency.
             t0 = self._clock.timestamp_ns()
-            book_old = self._local_books.get(instrument.id)
-            book_new = OrderBook(instrument.id, book_type=BookType.L2_MBP)
-            book_new.apply_deltas(deltas)
-            self._local_books[instrument.id] = book_new
             deltas = compute_effective_deltas(book_old, book_new, instrument)
 
             interval_ms = (self._clock.timestamp_ns() - t0) / 1_000_000
@@ -538,14 +591,13 @@ class PolymarketDataClient(LiveMarketDataClient):
 
             last_quote = self._last_quotes.get(instrument.id)
 
-            if last_quote is not None:
-                if (
-                    quote.bid_price == last_quote.bid_price
-                    and quote.ask_price == last_quote.ask_price
-                    and quote.bid_size == last_quote.bid_size
-                    and quote.ask_size == last_quote.ask_size
-                ):
-                    return  # No top-of-book change
+            if last_quote is not None and (
+                quote.bid_price == last_quote.bid_price
+                and quote.ask_price == last_quote.ask_price
+                and quote.bid_size == last_quote.bid_size
+                and quote.ask_size == last_quote.ask_size
+            ):
+                return  # No top-of-book change
 
             self._last_quotes[instrument.id] = quote
             self._handle_data(quote)
@@ -566,9 +618,8 @@ class PolymarketDataClient(LiveMarketDataClient):
     ) -> None:
         now_ns = self._clock.timestamp_ns()
 
-        old_book = self._local_books.pop(instrument.id, None)
-        if old_book is not None:
-            self._last_quotes.pop(instrument.id, None)
+        old_book = self._local_books.get(instrument.id)
+        old_quote = self._last_quotes.get(instrument.id)
 
         instrument = update_instrument(instrument, change=ws_message, ts_init=now_ns)
 
@@ -584,6 +635,7 @@ class PolymarketDataClient(LiveMarketDataClient):
                 instrument=instrument,
                 change=ws_message,
                 old_book=old_book,
+                old_quote=old_quote,
                 ts_init=now_ns,
             )
 
@@ -592,6 +644,7 @@ class PolymarketDataClient(LiveMarketDataClient):
         instrument: BinaryOption,
         change: PolymarketTickSizeChange,
         old_book: OrderBook,
+        old_quote: QuoteTick | None,
         ts_init: int,
     ) -> None:
         snapshot = self._build_snapshot_from_book(
@@ -601,6 +654,11 @@ class PolymarketDataClient(LiveMarketDataClient):
         )
 
         deltas = snapshot.parse_to_snapshot(instrument=instrument, ts_init=ts_init)
+
+        if deltas is None:
+            self._local_books.pop(instrument.id, None)
+            self._last_quotes.pop(instrument.id, None)
+            return
 
         new_book = OrderBook(instrument.id, book_type=BookType.L2_MBP)
         new_book.apply_deltas(deltas)
@@ -622,6 +680,8 @@ class PolymarketDataClient(LiveMarketDataClient):
             if quote is not None:
                 self._last_quotes[instrument.id] = quote
                 self._handle_data(quote)
+            elif old_quote is None:
+                self._last_quotes.pop(instrument.id, None)
 
     def _build_snapshot_from_book(
         self,

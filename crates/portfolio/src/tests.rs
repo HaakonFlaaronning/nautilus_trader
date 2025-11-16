@@ -884,10 +884,7 @@ fn test_opening_one_long_position_updates_portfolio(
             .unwrap()
             .is_zero(),
     );
-    assert_eq!(
-        portfolio.net_position(&instrument_audusd.id()),
-        Decimal::new(561, 3)
-    );
+    assert_eq!(portfolio.net_position(&instrument_audusd.id()), dec!(0.561));
     assert!(portfolio.is_net_long(&instrument_audusd.id()));
     assert!(!portfolio.is_net_short(&instrument_audusd.id()));
     assert!(!portfolio.is_flat(&instrument_audusd.id()));
@@ -973,10 +970,7 @@ fn test_opening_one_long_position_updates_portfolio_with_bar(
             .unwrap()
             .is_zero(),
     );
-    assert_eq!(
-        portfolio.net_position(&instrument_audusd.id()),
-        Decimal::new(561, 3)
-    );
+    assert_eq!(portfolio.net_position(&instrument_audusd.id()), dec!(0.561));
     assert!(portfolio.is_net_long(&instrument_audusd.id()));
     assert!(!portfolio.is_net_short(&instrument_audusd.id()));
     assert!(!portfolio.is_flat(&instrument_audusd.id()));
@@ -1085,10 +1079,7 @@ fn test_opening_one_short_position_updates_portfolio(
             .as_decimal(),
         dec!(-12.2)
     );
-    assert_eq!(
-        portfolio.net_position(&instrument_audusd.id()),
-        Decimal::new(-2, 0)
-    );
+    assert_eq!(portfolio.net_position(&instrument_audusd.id()), dec!(-2));
 
     assert!(!portfolio.is_net_long(&instrument_audusd.id()));
     assert!(portfolio.is_net_short(&instrument_audusd.id()));
@@ -2165,7 +2156,7 @@ fn test_portfolio_realized_pnl_with_position_snapshots_netting_oms(
     portfolio
         .cache
         .borrow_mut()
-        .add_position(position2.clone(), OmsType::Netting)
+        .add_position(position2, OmsType::Netting)
         .unwrap();
 
     // Calculate realized PnL - should include snapshot PnL

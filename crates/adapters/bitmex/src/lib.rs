@@ -64,7 +64,11 @@ pub mod python;
 pub use crate::{
     common::{consts::BITMEX_VENUE, enums::BitmexSide},
     data::BitmexDataClient,
-    execution::BitmexExecutionClient,
+    execution::{
+        BitmexExecutionClient,
+        canceller::{BroadcasterMetrics, CancelBroadcaster, CancelBroadcasterConfig, ClientStats},
+        submitter::{SubmitBroadcaster, SubmitBroadcasterConfig},
+    },
     http::{client::BitmexHttpClient, error::BitmexHttpError},
     websocket::{client::BitmexWebSocketClient, error::BitmexWsError},
 };

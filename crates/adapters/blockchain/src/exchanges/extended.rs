@@ -16,22 +16,12 @@
 use std::{ops::Deref, sync::Arc};
 
 use hypersync_client::simple_types::Log;
-use nautilus_model::{
-    defi::{
-        dex::{Dex, SharedDex},
-        token::Token,
-    },
-    enums::OrderSide,
-    types::{Price, Quantity},
-};
+use nautilus_model::defi::dex::{Dex, SharedDex};
 
 use crate::events::{
-    burn::BurnEvent, collect::CollectEvent, initialize::InitializeEvent, mint::MintEvent,
-    pool_created::PoolCreatedEvent, swap::SwapEvent,
+    burn::BurnEvent, collect::CollectEvent, flash::FlashEvent, initialize::InitializeEvent,
+    mint::MintEvent, pool_created::PoolCreatedEvent, swap::SwapEvent,
 };
-
-type ConvertTradeDataFn =
-    fn(&Token, &Token, &SwapEvent) -> anyhow::Result<(OrderSide, Quantity, Price)>;
 
 /// Extended DEX wrapper that adds provider-specific event parsing capabilities to the domain `Dex` model.
 #[derive(Debug, Clone)]
@@ -50,8 +40,8 @@ pub struct DexExtended {
     pub parse_burn_event_fn: Option<fn(SharedDex, Log) -> anyhow::Result<BurnEvent>>,
     /// Function to parse collect events.
     pub parse_collect_event_fn: Option<fn(SharedDex, Log) -> anyhow::Result<CollectEvent>>,
-    /// Function to convert to trade data.
-    pub convert_to_trade_data_fn: Option<ConvertTradeDataFn>,
+    /// Function to parse flash events.
+    pub parse_flash_event_fn: Option<fn(SharedDex, Log) -> anyhow::Result<FlashEvent>>,
 }
 
 impl DexExtended {
@@ -66,7 +56,7 @@ impl DexExtended {
             parse_mint_event_fn: None,
             parse_burn_event_fn: None,
             parse_collect_event_fn: None,
-            convert_to_trade_data_fn: None,
+            parse_flash_event_fn: None,
         }
     }
 
@@ -118,9 +108,12 @@ impl DexExtended {
         self.parse_collect_event_fn = Some(parse_collect_event);
     }
 
-    /// Sets the function used to convert trade data for this Dex.
-    pub fn set_convert_trade_data(&mut self, convert_trade_data: ConvertTradeDataFn) {
-        self.convert_to_trade_data_fn = Some(convert_trade_data);
+    /// Sets the function used to parse flash events for this Dex.
+    pub fn set_flash_event_parsing(
+        &mut self,
+        parse_flash_event: fn(SharedDex, Log) -> anyhow::Result<FlashEvent>,
+    ) {
+        self.parse_flash_event_fn = Some(parse_flash_event);
     }
 
     /// Parses a pool creation event log using this DEX's specific parsing function.
@@ -151,28 +144,6 @@ impl DexExtended {
         } else {
             anyhow::bail!(
                 "Parsing of swap event in not defined in this dex: {}:{}",
-                self.dex.chain,
-                self.dex.name
-            )
-        }
-    }
-
-    /// Convert to trade data from a log using this DEX's specific parsing function.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the DEX does not have a trade data converter defined or if conversion fails.
-    pub fn convert_to_trade_data(
-        &self,
-        token0: &Token,
-        token1: &Token,
-        swap_event: &SwapEvent,
-    ) -> anyhow::Result<(OrderSide, Quantity, Price)> {
-        if let Some(convert_to_trade_data_fn) = &self.convert_to_trade_data_fn {
-            convert_to_trade_data_fn(token0, token1, swap_event)
-        } else {
-            anyhow::bail!(
-                "Converting to trade data is not defined in this dex: {}:{}",
                 self.dex.chain,
                 self.dex.name
             )
@@ -218,6 +189,10 @@ impl DexExtended {
     }
 
     /// Parses an event log into an `InitializeEvent` struct.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DEX does not support initialize events or parsing fails.
     pub fn parse_initialize_event(&self, log: Log) -> anyhow::Result<InitializeEvent> {
         if let Some(parse_initialize_event_fn) = &self.parse_initialize_event_fn {
             parse_initialize_event_fn(self.dex.clone(), log)

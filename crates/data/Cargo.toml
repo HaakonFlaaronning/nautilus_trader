@@ -6,12 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "Core data handling machinery for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "nautilus_data"
@@ -41,11 +44,7 @@ python = [
   "pyo3",
 ]
 high-precision = ["nautilus-model/high-precision"]
-defi = [
-  "nautilus-common/defi",
-  "nautilus-model/defi",
-  "alloy-primitives",
-]
+defi = ["nautilus-common/defi", "nautilus-model/defi", "alloy-primitives"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -29,7 +29,6 @@ use nautilus_model::{
     },
 };
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
-use tracing::warn;
 use ustr::Ustr;
 
 use crate::{
@@ -39,6 +38,14 @@ use crate::{
     },
     websocket::messages::BitmexMarginMsg,
 };
+
+/// Strip NautilusTrader identifier from BitMEX rejection/cancellation reasons.
+///
+/// BitMEX appends our `text` field as `\nNautilusTrader` to their messages.
+#[must_use]
+pub fn clean_reason(reason: &str) -> String {
+    reason.replace("\nNautilusTrader", "").trim().to_string()
+}
 
 /// Parses a Nautilus instrument ID from the given BitMEX `symbol` value.
 #[must_use]
@@ -230,8 +237,10 @@ pub fn normalize_trade_bin_prices(
 
     if high < max_price || low > min_price {
         match bar_type {
-            Some(bt) => warn!(symbol = %symbol, ?bt, "Adjusting BitMEX trade bin extremes"),
-            None => warn!(symbol = %symbol, "Adjusting BitMEX trade bin extremes"),
+            Some(bt) => {
+                tracing::warn!(symbol = %symbol, ?bt, "Adjusting BitMEX trade bin extremes");
+            }
+            None => tracing::warn!(symbol = %symbol, "Adjusting BitMEX trade bin extremes"),
         }
         high = max_price;
         low = min_price;
@@ -247,11 +256,11 @@ pub fn normalize_trade_bin_volume(volume: Option<i64>, symbol: &Ustr) -> u64 {
     match volume {
         Some(v) if v >= 0 => v as u64,
         Some(v) => {
-            warn!(symbol = %symbol, volume = v, "Received negative volume in BitMEX trade bin");
+            tracing::warn!(symbol = %symbol, volume = v, "Received negative volume in BitMEX trade bin");
             0
         }
         None => {
-            warn!(symbol = %symbol, "Trade bin missing volume, defaulting to 0");
+            tracing::warn!(symbol = %symbol, "Trade bin missing volume, defaulting to 0");
             0
         }
     }
@@ -356,7 +365,11 @@ pub fn parse_account_state(
             tracing::warn!(
                 "Unknown currency '{currency_str}' in margin message, creating default crypto currency"
             );
-            Currency::new(&currency_str, 8, 0, &currency_str, CurrencyType::Crypto)
+            let currency = Currency::new(&currency_str, 8, 0, &currency_str, CurrencyType::Crypto);
+            if let Err(e) = Currency::register(currency, false) {
+                tracing::error!("Failed to register currency '{currency_str}': {e}");
+            }
+            currency
         }
     };
 
@@ -446,16 +459,29 @@ pub fn parse_account_state(
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use nautilus_model::{
-        enums::AccountType,
-        identifiers::{InstrumentId, Symbol},
-        instruments::CurrencyPair,
-        types::{Price, fixed::FIXED_PRECISION},
-    };
+    use nautilus_model::{instruments::CurrencyPair, types::fixed::FIXED_PRECISION};
     use rstest::rstest;
     use ustr::Ustr;
 
     use super::*;
+
+    #[rstest]
+    fn test_clean_reason_strips_nautilus_trader() {
+        assert_eq!(
+            clean_reason(
+                "Canceled: Order had execInst of ParticipateDoNotInitiate\nNautilusTrader"
+            ),
+            "Canceled: Order had execInst of ParticipateDoNotInitiate"
+        );
+
+        assert_eq!(clean_reason("Some error\nNautilusTrader"), "Some error");
+        assert_eq!(
+            clean_reason("Multiple lines\nSome content\nNautilusTrader"),
+            "Multiple lines\nSome content"
+        );
+        assert_eq!(clean_reason("No identifier here"), "No identifier here");
+        assert_eq!(clean_reason("  \nNautilusTrader  "), "");
+    }
 
     fn make_test_spot_instrument(size_increment: f64, size_precision: u8) -> InstrumentAny {
         let instrument_id = InstrumentId::from("SOLUSDT.BITMEX");

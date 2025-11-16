@@ -15,8 +15,10 @@
 
 //! Functions translating raw OKX WebSocket frames into Nautilus data types.
 
+use std::str::FromStr;
+
 use ahash::AHashMap;
-use nautilus_core::nanos::UnixNanos;
+use nautilus_core::{UUID4, nanos::UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, Data, FundingRateUpdate, IndexPriceUpdate,
@@ -30,8 +32,9 @@ use nautilus_model::{
     identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{Money, Price, Quantity},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
@@ -44,16 +47,60 @@ use super::{
 use crate::{
     common::{
         consts::{OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE},
-        enums::{OKXBookAction, OKXCandleConfirm, OKXOrderStatus, OKXOrderType, OKXTriggerType},
+        enums::{
+            OKXBookAction, OKXCandleConfirm, OKXInstrumentType, OKXOrderCategory, OKXOrderStatus,
+            OKXOrderType, OKXSide, OKXTargetCurrency, OKXTriggerType,
+        },
         models::OKXInstrument,
         parse::{
-            okx_channel_to_bar_spec, parse_client_order_id, parse_fee, parse_funding_rate_msg,
-            parse_instrument_any, parse_message_vec, parse_millisecond_timestamp, parse_price,
-            parse_quantity,
+            determine_order_type, is_market_price, okx_channel_to_bar_spec, parse_client_order_id,
+            parse_fee, parse_fee_currency, parse_funding_rate_msg, parse_instrument_any,
+            parse_message_vec, parse_millisecond_timestamp, parse_price, parse_quantity,
         },
     },
     websocket::messages::{ExecutionReport, NautilusWsMessage, OKXFundingRateMsg},
 };
+
+/// Extracts fee rates from a cached instrument.
+///
+/// Returns a tuple of (margin_init, margin_maint, maker_fee, taker_fee).
+/// All values are None if the instrument type doesn't support fees.
+fn extract_fees_from_cached_instrument(
+    instrument: &InstrumentAny,
+) -> (
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+) {
+    match instrument {
+        InstrumentAny::CurrencyPair(pair) => (
+            Some(pair.margin_init),
+            Some(pair.margin_maint),
+            Some(pair.maker_fee),
+            Some(pair.taker_fee),
+        ),
+        InstrumentAny::CryptoPerpetual(perp) => (
+            Some(perp.margin_init),
+            Some(perp.margin_maint),
+            Some(perp.maker_fee),
+            Some(perp.taker_fee),
+        ),
+        InstrumentAny::CryptoFuture(future) => (
+            Some(future.margin_init),
+            Some(future.margin_maint),
+            Some(future.maker_fee),
+            Some(future.taker_fee),
+        ),
+        InstrumentAny::CryptoOption(option) => (
+            Some(option.margin_init),
+            Some(option.margin_maint),
+            Some(option.maker_fee),
+            Some(option.taker_fee),
+        ),
+        _ => (None, None, None, None),
+    }
+}
 
 /// Parses vector of OKX book messages into Nautilus order book deltas.
 ///
@@ -334,7 +381,7 @@ pub fn parse_book_msg(
             ts_event,
             ts_init,
         );
-        deltas.push(delta)
+        deltas.push(delta);
     }
 
     for ask in &msg.asks {
@@ -358,7 +405,7 @@ pub fn parse_book_msg(
             ts_event,
             ts_init,
         );
-        deltas.push(delta)
+        deltas.push(delta);
     }
 
     OrderBookDeltas::new_checked(instrument_id, deltas)
@@ -611,18 +658,46 @@ pub fn parse_order_msg_vec(
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
     fee_cache: &AHashMap<Ustr, Money>,
+    filled_qty_cache: &AHashMap<Ustr, Quantity>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<ExecutionReport>> {
     let mut order_reports = Vec::with_capacity(data.len());
 
     for msg in data {
-        match parse_order_msg(&msg, account_id, instruments, fee_cache, ts_init) {
+        match parse_order_msg(
+            &msg,
+            account_id,
+            instruments,
+            fee_cache,
+            filled_qty_cache,
+            ts_init,
+        ) {
             Ok(report) => order_reports.push(report),
             Err(e) => tracing::error!("Failed to parse execution report from message: {e}"),
         }
     }
 
     Ok(order_reports)
+}
+
+/// Checks if acc_fill_sz has increased compared to the previous filled quantity.
+fn has_acc_fill_sz_increased(
+    acc_fill_sz: &Option<String>,
+    previous_filled_qty: Option<Quantity>,
+    size_precision: u8,
+) -> bool {
+    if let Some(acc_str) = acc_fill_sz {
+        if acc_str.is_empty() || acc_str == "0" {
+            return false;
+        }
+        if let Ok(current_filled) = parse_quantity(acc_str, size_precision) {
+            if let Some(prev_qty) = previous_filled_qty {
+                return current_filled > prev_qty;
+            }
+            return !current_filled.is_zero();
+        }
+    }
+    false
 }
 
 /// Parses a single OKX order message into an [`ExecutionReport`].
@@ -636,6 +711,7 @@ pub fn parse_order_msg(
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
     fee_cache: &AHashMap<Ustr, Money>,
+    filled_qty_cache: &AHashMap<Ustr, Quantity>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<ExecutionReport> {
     let instrument = instruments
@@ -643,11 +719,27 @@ pub fn parse_order_msg(
         .ok_or_else(|| anyhow::anyhow!("No instrument found for inst_id: {}", msg.inst_id))?;
 
     let previous_fee = fee_cache.get(&msg.ord_id).copied();
+    let previous_filled_qty = filled_qty_cache.get(&msg.ord_id).copied();
+
+    let has_new_fill = (!msg.fill_sz.is_empty() && msg.fill_sz != "0")
+        || !msg.trade_id.is_empty()
+        || has_acc_fill_sz_increased(
+            &msg.acc_fill_sz,
+            previous_filled_qty,
+            instrument.size_precision(),
+        );
 
     match msg.state {
-        OKXOrderStatus::Filled | OKXOrderStatus::PartiallyFilled => {
-            parse_fill_report(msg, instrument, account_id, previous_fee, ts_init)
-                .map(ExecutionReport::Fill)
+        OKXOrderStatus::Filled | OKXOrderStatus::PartiallyFilled if has_new_fill => {
+            parse_fill_report(
+                msg,
+                instrument,
+                account_id,
+                previous_fee,
+                previous_filled_qty,
+                ts_init,
+            )
+            .map(ExecutionReport::Fill)
         }
         _ => parse_order_status_report(msg, instrument, account_id, ts_init)
             .map(ExecutionReport::Order),
@@ -703,7 +795,7 @@ pub fn parse_algo_order_status_report(
     let order_side: OrderSide = msg.side.into();
 
     // Determine order type based on ord_px for conditional/stop orders
-    let order_type = if msg.ord_px == "-1" {
+    let order_type = if is_market_price(&msg.ord_px) {
         OrderType::StopMarket
     } else {
         OrderType::StopLimit
@@ -782,16 +874,20 @@ pub fn parse_order_status_report(
     let order_side: OrderSide = msg.side.into();
 
     let okx_order_type = msg.ord_type;
-    // For Trigger orders that come through regular orders channel (after being triggered),
-    // we determine the type based on whether they have a price
-    let order_type = if okx_order_type == OKXOrderType::Trigger {
-        if msg.px.is_empty() || msg.px == "0" {
-            OrderType::StopMarket
-        } else {
-            OrderType::StopLimit
+
+    // Determine order type based on presence of limit price for certain OKX order types
+    let order_type = match okx_order_type {
+        OKXOrderType::Trigger => {
+            if is_market_price(&msg.px) {
+                OrderType::StopMarket
+            } else {
+                OrderType::StopLimit
+            }
         }
-    } else {
-        msg.ord_type.into()
+        OKXOrderType::Fok | OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => {
+            determine_order_type(okx_order_type, &msg.px)
+        }
+        _ => msg.ord_type.into(),
     };
     let order_status: OrderStatus = msg.state.into();
 
@@ -802,11 +898,112 @@ pub fn parse_order_status_report(
     };
 
     let size_precision = instrument.size_precision();
-    let quantity = parse_quantity(&msg.sz, size_precision)?;
-    let filled_qty = parse_quantity(&msg.acc_fill_sz.clone().unwrap_or_default(), size_precision)?;
+
+    // Parse quantities based on target currency
+    // OKX always returns acc_fill_sz in base currency, but sz depends on tgt_ccy
+
+    // Determine if this is a quote-quantity order
+    // Method 1: Explicit tgt_ccy field set to QuoteCcy
+    let is_quote_qty_explicit = msg.tgt_ccy == Some(OKXTargetCurrency::QuoteCcy);
+
+    // Method 2: Use OKX defaults when tgt_ccy is None (old orders or missing field)
+    // OKX API defaults for SPOT market orders: BUY orders use quote_ccy, SELL orders use base_ccy
+    // Note: tgtCcy only applies to SPOT market orders (not limit orders)
+    // For limit orders, sz is always in base currency regardless of side
+    let is_quote_qty_heuristic = msg.tgt_ccy.is_none()
+        && (msg.inst_type == OKXInstrumentType::Spot || msg.inst_type == OKXInstrumentType::Margin)
+        && msg.side == OKXSide::Buy
+        && order_type == OrderType::Market;
+
+    let (quantity, filled_qty) = if is_quote_qty_explicit || is_quote_qty_heuristic {
+        // Quote-quantity order: sz is in quote currency, need to convert to base
+        let sz_quote_dec = Decimal::from_str(&msg.sz).map_err(|e| {
+            anyhow::anyhow!("Failed to parse sz='{}' as quote quantity: {}", msg.sz, e)
+        })?;
+
+        // Determine the price to use for conversion
+        // Priority: 1) limit price (px) for limit orders, 2) avg_px for market orders
+        let conversion_price_dec =
+            if !is_market_price(&msg.px) {
+                // Limit order: use the limit price (msg.px)
+                Some(
+                    Decimal::from_str(&msg.px)
+                        .map_err(|e| anyhow::anyhow!("Failed to parse px='{}': {}", msg.px, e))?,
+                )
+            } else if !msg.avg_px.is_empty() && msg.avg_px != "0" {
+                // Market order with fills: use average fill price
+                Some(Decimal::from_str(&msg.avg_px).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse avg_px='{}': {}", msg.avg_px, e)
+                })?)
+            } else {
+                None
+            };
+
+        // Convert quote quantity to base: quantity_base = sz_quote / price
+        let quantity_base = if let Some(price) = conversion_price_dec {
+            if !price.is_zero() {
+                Quantity::from_decimal(sz_quote_dec / price, size_precision)?
+            } else {
+                parse_quantity(&msg.sz, size_precision)?
+            }
+        } else {
+            // No price available, can't convert - use sz as-is temporarily
+            // This will be corrected once the order gets filled and price is available
+            parse_quantity(&msg.sz, size_precision)?
+        };
+
+        let filled_qty =
+            parse_quantity(&msg.acc_fill_sz.clone().unwrap_or_default(), size_precision)?;
+
+        (quantity_base, filled_qty)
+    } else {
+        // Base-quantity order: both sz and acc_fill_sz are in base currency
+        let quantity = parse_quantity(&msg.sz, size_precision)?;
+        let filled_qty =
+            parse_quantity(&msg.acc_fill_sz.clone().unwrap_or_default(), size_precision)?;
+
+        (quantity, filled_qty)
+    };
+
+    // For quote-quantity orders marked as FILLED, adjust quantity to match filled_qty
+    // to avoid precision mismatches from quote-to-base conversion
+    let (quantity, filled_qty) = if (is_quote_qty_explicit || is_quote_qty_heuristic)
+        && msg.state == OKXOrderStatus::Filled
+        && filled_qty.is_positive()
+    {
+        (filled_qty, filled_qty)
+    } else {
+        (quantity, filled_qty)
+    };
 
     let ts_accepted = parse_millisecond_timestamp(msg.c_time);
     let ts_last = parse_millisecond_timestamp(msg.u_time);
+
+    let is_liquidation = matches!(
+        msg.category,
+        OKXOrderCategory::FullLiquidation | OKXOrderCategory::PartialLiquidation
+    );
+
+    let is_adl = msg.category == OKXOrderCategory::Adl;
+
+    if is_liquidation {
+        tracing::warn!(
+            order_id = msg.ord_id.as_str(),
+            category = ?msg.category,
+            inst_id = msg.inst_id.as_str(),
+            state = ?msg.state,
+            "Liquidation order status update"
+        );
+    }
+
+    if is_adl {
+        tracing::warn!(
+            order_id = msg.ord_id.as_str(),
+            inst_id = msg.inst_id.as_str(),
+            state = ?msg.state,
+            "ADL (Auto-Deleveraging) order status update"
+        );
+    }
 
     let mut report = OrderStatusReport::new(
         account_id,
@@ -830,15 +1027,14 @@ pub fn parse_order_status_report(
     if okx_order_type == OKXOrderType::Trigger {
         // For triggered orders coming through regular orders channel,
         // set the price if it's a stop-limit order
-        if !msg.px.is_empty()
-            && msg.px != "0"
+        if !is_market_price(&msg.px)
             && let Ok(price) = parse_price(&msg.px, price_precision)
         {
             report = report.with_price(price);
         }
     } else {
         // For regular orders, use px field
-        if !msg.px.is_empty()
+        if !is_market_price(&msg.px)
             && let Ok(price) = parse_price(&msg.px, price_precision)
         {
             report = report.with_price(price);
@@ -848,7 +1044,7 @@ pub fn parse_order_status_report(
     if !msg.avg_px.is_empty()
         && let Ok(avg_px) = msg.avg_px.parse::<f64>()
     {
-        report = report.with_avg_px(avg_px);
+        report = report.with_avg_px(avg_px)?;
     }
 
     if matches!(
@@ -900,28 +1096,160 @@ pub fn parse_fill_report(
     instrument: &InstrumentAny,
     account_id: AccountId,
     previous_fee: Option<Money>,
+    previous_filled_qty: Option<Quantity>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let client_order_id = parse_client_order_id(&msg.cl_ord_id);
     let venue_order_id = VenueOrderId::new(msg.ord_id);
-    let trade_id = TradeId::from(msg.trade_id.as_str());
+
+    // TODO: Extract to dedicated function:
+    // OKX may not provide a trade_id, so generate a UUID4 as fallback
+    let trade_id = if msg.trade_id.is_empty() {
+        TradeId::from(UUID4::new().to_string().as_str())
+    } else {
+        TradeId::from(msg.trade_id.as_str())
+    };
+
     let order_side: OrderSide = msg.side.into();
 
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-    let last_px = parse_price(&msg.fill_px, price_precision)?;
-    let last_qty = parse_quantity(&msg.fill_sz, size_precision)?;
 
-    let fee_currency = Currency::from(&msg.fee_ccy);
-    let total_fee = parse_fee(msg.fee.as_deref(), fee_currency)?;
+    let price_str = if !msg.fill_px.is_empty() {
+        &msg.fill_px
+    } else if !msg.avg_px.is_empty() {
+        &msg.avg_px
+    } else {
+        &msg.px
+    };
+    let last_px = parse_price(price_str, price_precision).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse price (fill_px='{}', avg_px='{}', px='{}'): {}",
+            msg.fill_px,
+            msg.avg_px,
+            msg.px,
+            e
+        )
+    })?;
+
+    // OKX provides fillSz (incremental fill) or accFillSz (cumulative total)
+    // If fillSz is provided, use it directly as the incremental fill quantity
+    let last_qty = if !msg.fill_sz.is_empty() && msg.fill_sz != "0" {
+        parse_quantity(&msg.fill_sz, size_precision)
+            .map_err(|e| anyhow::anyhow!("Failed to parse fill_sz='{}': {e}", msg.fill_sz,))?
+    } else if let Some(ref acc_fill_sz) = msg.acc_fill_sz {
+        // If fillSz is missing but accFillSz is available, calculate incremental fill
+        if !acc_fill_sz.is_empty() && acc_fill_sz != "0" {
+            let current_filled = parse_quantity(acc_fill_sz, size_precision).map_err(|e| {
+                anyhow::anyhow!("Failed to parse acc_fill_sz='{}': {e}", acc_fill_sz,)
+            })?;
+
+            // Calculate incremental fill as: current_total - previous_total
+            if let Some(prev_qty) = previous_filled_qty {
+                let incremental = current_filled - prev_qty;
+                if incremental.is_zero() {
+                    anyhow::bail!(
+                        "Incremental fill quantity is zero (acc_fill_sz='{}', previous_filled_qty={})",
+                        acc_fill_sz,
+                        prev_qty
+                    );
+                }
+                incremental
+            } else {
+                // First fill, use accumulated as incremental
+                current_filled
+            }
+        } else {
+            anyhow::bail!(
+                "Cannot determine fill quantity: fill_sz is empty/zero and acc_fill_sz is empty/zero"
+            );
+        }
+    } else {
+        anyhow::bail!(
+            "Cannot determine fill quantity: fill_sz='{}' and acc_fill_sz is None",
+            msg.fill_sz
+        );
+    };
+
+    let fee_str = msg.fee.as_deref().unwrap_or("0");
+    let fee_dec = Decimal::from_str(fee_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse fee '{}': {}", fee_str, e))?;
+
+    let fee_currency = parse_fee_currency(msg.fee_ccy.as_str(), fee_dec, || {
+        format!("fill report for inst_id={}", msg.inst_id)
+    });
+
+    // OKX sends fees as negative numbers (e.g., "-2.5" for a $2.5 charge), parse_fee negates to positive
+    let total_fee = parse_fee(msg.fee.as_deref(), fee_currency)
+        .map_err(|e| anyhow::anyhow!("Failed to parse fee={:?}: {}", msg.fee, e))?;
+
+    // OKX sends cumulative fees, so we subtract the previous total to get this fill's fee
     let commission = if let Some(previous_fee) = previous_fee {
-        total_fee - previous_fee
+        let incremental = total_fee - previous_fee;
+
+        if incremental < Money::zero(fee_currency) {
+            tracing::debug!(
+                order_id = msg.ord_id.as_str(),
+                total_fee = %total_fee,
+                previous_fee = %previous_fee,
+                incremental = %incremental,
+                "Negative incremental fee detected - likely a maker rebate or fee refund"
+            );
+        }
+
+        // Skip corruption check when previous is negative (rebate), as transitions from
+        // rebate to charge legitimately have incremental > total (e.g., -1 → +2 gives +3)
+        if previous_fee >= Money::zero(fee_currency)
+            && total_fee > Money::zero(fee_currency)
+            && incremental > total_fee
+        {
+            tracing::error!(
+                order_id = msg.ord_id.as_str(),
+                total_fee = %total_fee,
+                previous_fee = %previous_fee,
+                incremental = %incremental,
+                "Incremental fee exceeds total fee - likely fee cache corruption, using total fee as fallback"
+            );
+            total_fee
+        } else {
+            incremental
+        }
     } else {
         total_fee
     };
 
     let liquidity_side: LiquiditySide = msg.exec_type.into();
     let ts_event = parse_millisecond_timestamp(msg.fill_time);
+
+    let is_liquidation = matches!(
+        msg.category,
+        OKXOrderCategory::FullLiquidation | OKXOrderCategory::PartialLiquidation
+    );
+
+    let is_adl = msg.category == OKXOrderCategory::Adl;
+
+    if is_liquidation {
+        tracing::warn!(
+            order_id = msg.ord_id.as_str(),
+            category = ?msg.category,
+            inst_id = msg.inst_id.as_str(),
+            side = ?msg.side,
+            fill_sz = %msg.fill_sz,
+            fill_px = %msg.fill_px,
+            "Liquidation order detected"
+        );
+    }
+
+    if is_adl {
+        tracing::warn!(
+            order_id = msg.ord_id.as_str(),
+            inst_id = msg.inst_id.as_str(),
+            side = ?msg.side,
+            fill_sz = %msg.fill_sz,
+            fill_px = %msg.fill_px,
+            "ADL (Auto-Deleveraging) order detected"
+        );
+    }
 
     let report = FillReport::new(
         account_id,
@@ -955,6 +1283,7 @@ pub fn parse_fill_report(
 /// Panics only in the case where `okx_channel_to_bar_spec(channel)` returns
 /// `None` after a prior `is_some` check – an unreachable scenario indicating a
 /// logic error.
+#[allow(clippy::too_many_arguments)]
 pub fn parse_ws_message_data(
     channel: &OKXWsChannel,
     data: serde_json::Value,
@@ -963,11 +1292,26 @@ pub fn parse_ws_message_data(
     size_precision: u8,
     ts_init: UnixNanos,
     funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
+    instruments_cache: &AHashMap<Ustr, InstrumentAny>,
 ) -> anyhow::Result<Option<NautilusWsMessage>> {
     match channel {
         OKXWsChannel::Instruments => {
             if let Ok(msg) = serde_json::from_value::<OKXInstrument>(data) {
-                match parse_instrument_any(&msg, ts_init)? {
+                // Look up cached instrument to extract existing fees
+                let (margin_init, margin_maint, maker_fee, taker_fee) =
+                    instruments_cache.get(&Ustr::from(&msg.inst_id)).map_or(
+                        (None, None, None, None),
+                        extract_fees_from_cached_instrument,
+                    );
+
+                match parse_instrument_any(
+                    &msg,
+                    margin_init,
+                    margin_maint,
+                    maker_fee,
+                    taker_fee,
+                    ts_init,
+                )? {
                     Some(inst_any) => Ok(Some(NautilusWsMessage::Instrument(Box::new(inst_any)))),
                     None => {
                         tracing::warn!("Empty instrument payload: {:?}", msg);
@@ -1066,29 +1410,104 @@ mod tests {
     use nautilus_core::nanos::UnixNanos;
     use nautilus_model::{
         data::bar::BAR_SPEC_1_DAY_LAST,
-        enums::AggressorSide,
-        identifiers::{ClientOrderId, InstrumentId, Symbol},
+        identifiers::{ClientOrderId, Symbol},
         instruments::CryptoPerpetual,
-        types::{Currency, Price, Quantity},
+        types::Currency,
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use super::*;
     use crate::{
         OKXPositionSide,
-        common::{enums::OKXTradeMode, parse::parse_account_state, testing::load_test_json},
+        common::{
+            enums::{OKXExecType, OKXInstrumentType, OKXOrderType, OKXSide, OKXTradeMode},
+            parse::parse_account_state,
+            testing::load_test_json,
+        },
         http::models::OKXAccount,
-        websocket::messages::{OKXWebSocketArg, OKXWebSocketEvent},
+        websocket::messages::{OKXWebSocketArg, OKXWsMessage},
     };
+
+    fn create_stub_instrument() -> CryptoPerpetual {
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("BTC-USDT-SWAP"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            2,
+            8,
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+    }
+
+    fn create_stub_order_msg(
+        fill_sz: &str,
+        acc_fill_sz: Option<String>,
+        order_id: &str,
+        trade_id: &str,
+    ) -> OKXOrderMsg {
+        OKXOrderMsg {
+            acc_fill_sz,
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_1".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("-1.0".to_string()),
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: fill_sz.to_string(),
+            fill_time: 1746947317402,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from(order_id),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::PartiallyFilled,
+            exec_type: OKXExecType::Taker,
+            sz: "0.03".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: trade_id.to_string(),
+            u_time: 1746947317402,
+        }
+    }
 
     #[rstest]
     fn test_parse_books_snapshot() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let (okx_books, action): (Vec<OKXBookMsg>, OKXBookAction) = match msg {
-            OKXWebSocketEvent::BookData { data, action, .. } => (data, action),
+            OKXWsMessage::BookData { data, action, .. } => (data, action),
             _ => panic!("Expected a `BookData` variant"),
         };
 
@@ -1130,10 +1549,10 @@ mod tests {
     #[rstest]
     fn test_parse_books_update() {
         let json_data = load_test_json("ws_books_update.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let instrument_id = InstrumentId::from("BTC-USDT.OKX");
         let (okx_books, action): (Vec<OKXBookMsg>, OKXBookAction) = match msg {
-            OKXWebSocketEvent::BookData { data, action, .. } => (data, action),
+            OKXWsMessage::BookData { data, action, .. } => (data, action),
             _ => panic!("Expected a `BookData` variant"),
         };
 
@@ -1174,9 +1593,9 @@ mod tests {
     #[rstest]
     fn test_parse_tickers() {
         let json_data = load_test_json("ws_tickers.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let okx_tickers: Vec<OKXTickerMsg> = match msg {
-            OKXWebSocketEvent::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1196,9 +1615,9 @@ mod tests {
     #[rstest]
     fn test_parse_quotes() {
         let json_data = load_test_json("ws_bbo_tbt.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let okx_quotes: Vec<OKXBookMsg> = match msg {
-            OKXWebSocketEvent::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
         let instrument_id = InstrumentId::from("BTC-USDT.OKX");
@@ -1218,9 +1637,9 @@ mod tests {
     #[rstest]
     fn test_parse_trades() {
         let json_data = load_test_json("ws_trades.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let okx_trades: Vec<OKXTradeMsg> = match msg {
-            OKXWebSocketEvent::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1240,9 +1659,9 @@ mod tests {
     #[rstest]
     fn test_parse_candle() {
         let json_data = load_test_json("ws_candle.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let okx_candles: Vec<OKXCandleMsg> = match msg {
-            OKXWebSocketEvent::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1267,10 +1686,10 @@ mod tests {
     #[rstest]
     fn test_parse_funding_rate() {
         let json_data = load_test_json("ws_funding_rate.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
 
         let okx_funding_rates: Vec<crate::websocket::messages::OKXFundingRateMsg> = match msg {
-            OKXWebSocketEvent::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1280,7 +1699,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(funding_rate.instrument_id, instrument_id);
-        assert_eq!(funding_rate.rate, Decimal::new(1, 4));
+        assert_eq!(funding_rate.rate, dec!(0.0001));
         assert_eq!(
             funding_rate.next_funding_ns,
             Some(UnixNanos::from(1744590349506000000))
@@ -1292,9 +1711,9 @@ mod tests {
     #[rstest]
     fn test_parse_book_vec() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let event: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let (msgs, action): (Vec<OKXBookMsg>, OKXBookAction) = match event {
-            OKXWebSocketEvent::BookData { data, action, .. } => (data, action),
+            OKXWsMessage::BookData { data, action, .. } => (data, action),
             _ => panic!("Expected BookData"),
         };
 
@@ -1314,9 +1733,9 @@ mod tests {
     #[rstest]
     fn test_parse_ticker_vec() {
         let json_data = load_test_json("ws_tickers.json");
-        let event: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let data_val: serde_json::Value = match event {
-            OKXWebSocketEvent::Data { data, .. } => data,
+            OKXWsMessage::Data { data, .. } => data,
             _ => panic!("Expected Data"),
         };
 
@@ -1337,9 +1756,9 @@ mod tests {
     #[rstest]
     fn test_parse_trade_vec() {
         let json_data = load_test_json("ws_trades.json");
-        let event: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let data_val: serde_json::Value = match event {
-            OKXWebSocketEvent::Data { data, .. } => data,
+            OKXWsMessage::Data { data, .. } => data,
             _ => panic!("Expected Data"),
         };
 
@@ -1359,9 +1778,9 @@ mod tests {
     #[rstest]
     fn test_parse_candle_vec() {
         let json_data = load_test_json("ws_candle.json");
-        let event: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let data_val: serde_json::Value = match event {
-            OKXWebSocketEvent::Data { data, .. } => data,
+            OKXWsMessage::Data { data, .. } => data,
             _ => panic!("Expected Data"),
         };
 
@@ -1388,11 +1807,9 @@ mod tests {
     #[rstest]
     fn test_parse_book_message() {
         let json_data = load_test_json("ws_bbo_tbt.json");
-        let msg: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let (okx_books, arg): (Vec<OKXBookMsg>, OKXWebSocketArg) = match msg {
-            OKXWebSocketEvent::Data { data, arg, .. } => {
-                (serde_json::from_value(data).unwrap(), arg)
-            }
+            OKXWsMessage::Data { data, arg, .. } => (serde_json::from_value(data).unwrap(), arg),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1504,8 +1921,16 @@ mod tests {
 
         let ts_init = UnixNanos::default();
         let fee_cache = AHashMap::new();
+        let filled_qty_cache = AHashMap::new();
 
-        let result = parse_order_msg_vec(data, account_id, &instruments, &fee_cache, ts_init);
+        let result = parse_order_msg_vec(
+            data,
+            account_id,
+            &instruments,
+            &fee_cache,
+            &filled_qty_cache,
+            ts_init,
+        );
 
         assert!(result.is_ok());
         let order_reports = result.unwrap();
@@ -1642,6 +2067,7 @@ mod tests {
             &InstrumentAny::CryptoPerpetual(instrument),
             account_id,
             None,
+            None,
             ts_init,
         );
 
@@ -1668,9 +2094,9 @@ mod tests {
     #[rstest]
     fn test_parse_book10_msg() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let event: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let msgs: Vec<OKXBookMsg> = match event {
-            OKXWebSocketEvent::BookData { data, .. } => data,
+            OKXWsMessage::BookData { data, .. } => data,
             _ => panic!("Expected BookData"),
         };
 
@@ -1717,9 +2143,9 @@ mod tests {
     #[rstest]
     fn test_parse_book10_msg_vec() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let event: OKXWebSocketEvent = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
         let msgs: Vec<OKXBookMsg> = match event {
-            OKXWebSocketEvent::BookData { data, .. } => data,
+            OKXWsMessage::BookData { data, .. } => data,
             _ => panic!("Expected BookData"),
         };
 
@@ -1779,7 +2205,7 @@ mod tests {
             c_time: 1746947317401,
             cancel_source: None,
             cancel_source_reason: None,
-            category: Ustr::from("normal"),
+            category: OKXOrderCategory::Normal,
             ccy: Ustr::from("USDT"),
             cl_ord_id: "test_order_1".to_string(),
             algo_cl_ord_id: None,
@@ -1789,7 +2215,7 @@ mod tests {
             fill_sz: "0.01".to_string(),
             fill_time: 1746947317402,
             inst_id: Ustr::from("BTC-USDT-SWAP"),
-            inst_type: crate::common::enums::OKXInstrumentType::Swap,
+            inst_type: OKXInstrumentType::Swap,
             lever: "2.0".to_string(),
             ord_id: Ustr::from("1234567890"),
             ord_type: OKXOrderType::Market,
@@ -1797,11 +2223,12 @@ mod tests {
             pos_side: OKXPositionSide::Long,
             px: "".to_string(),
             reduce_only: "false".to_string(),
-            side: crate::common::enums::OKXSide::Buy,
-            state: crate::common::enums::OKXOrderStatus::PartiallyFilled,
-            exec_type: crate::common::enums::OKXExecType::Maker,
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::PartiallyFilled,
+            exec_type: OKXExecType::Maker,
             sz: "0.03".to_string(), // Total order size
             td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
             trade_id: "trade_1".to_string(),
             u_time: 1746947317402,
         };
@@ -1810,6 +2237,7 @@ mod tests {
             &order_msg_1,
             &InstrumentAny::CryptoPerpetual(instrument),
             account_id,
+            None,
             None,
             ts_init,
         )
@@ -1825,7 +2253,7 @@ mod tests {
             c_time: 1746947317401,
             cancel_source: None,
             cancel_source_reason: None,
-            category: Ustr::from("normal"),
+            category: OKXOrderCategory::Normal,
             ccy: Ustr::from("USDT"),
             cl_ord_id: "test_order_1".to_string(),
             algo_cl_ord_id: None,
@@ -1835,7 +2263,7 @@ mod tests {
             fill_sz: "0.02".to_string(),
             fill_time: 1746947317403,
             inst_id: Ustr::from("BTC-USDT-SWAP"),
-            inst_type: crate::common::enums::OKXInstrumentType::Swap,
+            inst_type: OKXInstrumentType::Swap,
             lever: "2.0".to_string(),
             ord_id: Ustr::from("1234567890"),
             ord_type: OKXOrderType::Market,
@@ -1843,11 +2271,12 @@ mod tests {
             pos_side: OKXPositionSide::Long,
             px: "".to_string(),
             reduce_only: "false".to_string(),
-            side: crate::common::enums::OKXSide::Buy,
-            state: crate::common::enums::OKXOrderStatus::Filled,
-            exec_type: crate::common::enums::OKXExecType::Maker,
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::Filled,
+            exec_type: OKXExecType::Maker,
             sz: "0.03".to_string(), // Same total order size
             td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
             trade_id: "trade_2".to_string(),
             u_time: 1746947317403,
         };
@@ -1857,6 +2286,7 @@ mod tests {
             &InstrumentAny::CryptoPerpetual(instrument),
             account_id,
             Some(fill_report_1.commission),
+            Some(fill_report_1.last_qty),
             ts_init,
         )
         .unwrap();
@@ -1865,6 +2295,562 @@ mod tests {
         assert_eq!(fill_report_2.commission, Money::new(2.0, Currency::USDT()));
 
         // Test passed - fee was correctly split proportionally
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_with_maker_rebates() {
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("BTC-USDT-SWAP"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            2,
+            8,
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // First fill: maker rebate of $0.5 (OKX sends as "0.5", parse_fee makes it -0.5)
+        let order_msg_1 = OKXOrderMsg {
+            acc_fill_sz: Some("0.01".to_string()),
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_rebate".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("0.5".to_string()), // Rebate: positive value from OKX
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: "0.01".to_string(),
+            fill_time: 1746947317402,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from("rebate_order_123"),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::PartiallyFilled,
+            exec_type: OKXExecType::Maker,
+            sz: "0.02".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "trade_rebate_1".to_string(),
+            u_time: 1746947317402,
+        };
+
+        let fill_report_1 = parse_fill_report(
+            &order_msg_1,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        )
+        .unwrap();
+
+        // First fill gets the full rebate (negative commission)
+        assert_eq!(fill_report_1.commission, Money::new(-0.5, Currency::USDT()));
+
+        // Second fill: another maker rebate of $0.3, cumulative now $0.8
+        let order_msg_2 = OKXOrderMsg {
+            acc_fill_sz: Some("0.02".to_string()),
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_rebate".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("0.8".to_string()), // Cumulative rebate
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: "0.01".to_string(),
+            fill_time: 1746947317403,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from("rebate_order_123"),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::Filled,
+            exec_type: OKXExecType::Maker,
+            sz: "0.02".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "trade_rebate_2".to_string(),
+            u_time: 1746947317403,
+        };
+
+        let fill_report_2 = parse_fill_report(
+            &order_msg_2,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            Some(fill_report_1.commission),
+            Some(fill_report_1.last_qty),
+            ts_init,
+        )
+        .unwrap();
+
+        // Second fill: incremental = -0.8 - (-0.5) = -0.3
+        assert_eq!(fill_report_2.commission, Money::new(-0.3, Currency::USDT()));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_rebate_to_charge_transition() {
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("BTC-USDT-SWAP"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            2,
+            8,
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // First fill: maker rebate of $1.0
+        let order_msg_1 = OKXOrderMsg {
+            acc_fill_sz: Some("0.01".to_string()),
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_transition".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("1.0".to_string()), // Rebate from OKX
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: "0.01".to_string(),
+            fill_time: 1746947317402,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from("transition_order_456"),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::PartiallyFilled,
+            exec_type: OKXExecType::Maker,
+            sz: "0.02".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "trade_transition_1".to_string(),
+            u_time: 1746947317402,
+        };
+
+        let fill_report_1 = parse_fill_report(
+            &order_msg_1,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        )
+        .unwrap();
+
+        // First fill gets rebate (negative)
+        assert_eq!(fill_report_1.commission, Money::new(-1.0, Currency::USDT()));
+
+        // Second fill: taker charge of $5.0, net cumulative is now $2.0 charge
+        // This is the edge case: incremental = 2.0 - (-1.0) = 3.0, which exceeds total (2.0)
+        // But it's legitimate, not corruption
+        let order_msg_2 = OKXOrderMsg {
+            acc_fill_sz: Some("0.02".to_string()),
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_transition".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("-2.0".to_string()), // Now a charge (negative from OKX)
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: "0.01".to_string(),
+            fill_time: 1746947317403,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from("transition_order_456"),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::Filled,
+            exec_type: OKXExecType::Taker,
+            sz: "0.02".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "trade_transition_2".to_string(),
+            u_time: 1746947317403,
+        };
+
+        let fill_report_2 = parse_fill_report(
+            &order_msg_2,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            Some(fill_report_1.commission),
+            Some(fill_report_1.last_qty),
+            ts_init,
+        )
+        .unwrap();
+
+        // Second fill: incremental = 2.0 - (-1.0) = 3.0
+        // This should NOT trigger corruption detection because previous was negative
+        assert_eq!(fill_report_2.commission, Money::new(3.0, Currency::USDT()));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_negative_incremental() {
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("BTC-USDT-SWAP"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            2,
+            8,
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // First fill: charge of $2.0
+        let order_msg_1 = OKXOrderMsg {
+            acc_fill_sz: Some("0.01".to_string()),
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_neg_inc".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("-2.0".to_string()),
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: "0.01".to_string(),
+            fill_time: 1746947317402,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from("neg_inc_order_789"),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::PartiallyFilled,
+            exec_type: OKXExecType::Taker,
+            sz: "0.02".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "trade_neg_inc_1".to_string(),
+            u_time: 1746947317402,
+        };
+
+        let fill_report_1 = parse_fill_report(
+            &order_msg_1,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(fill_report_1.commission, Money::new(2.0, Currency::USDT()));
+
+        // Second fill: charge reduced to $1.5 total (refund or maker rebate on this fill)
+        // Incremental = 1.5 - 2.0 = -0.5 (negative incremental triggers debug log)
+        let order_msg_2 = OKXOrderMsg {
+            acc_fill_sz: Some("0.02".to_string()),
+            avg_px: "50000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::Normal,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "test_order_neg_inc".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("-1.5".to_string()), // Total reduced
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "50000.0".to_string(),
+            fill_sz: "0.01".to_string(),
+            fill_time: 1746947317403,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "2.0".to_string(),
+            ord_id: Ustr::from("neg_inc_order_789"),
+            ord_type: OKXOrderType::Market,
+            pnl: "0".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Buy,
+            state: OKXOrderStatus::Filled,
+            exec_type: OKXExecType::Maker,
+            sz: "0.02".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "trade_neg_inc_2".to_string(),
+            u_time: 1746947317403,
+        };
+
+        let fill_report_2 = parse_fill_report(
+            &order_msg_2,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            Some(fill_report_1.commission),
+            Some(fill_report_1.last_qty),
+            ts_init,
+        )
+        .unwrap();
+
+        // Incremental is negative: 1.5 - 2.0 = -0.5
+        assert_eq!(fill_report_2.commission, Money::new(-0.5, Currency::USDT()));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_empty_fill_sz_first_fill() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        let order_msg =
+            create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_1");
+
+        let fill_report = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(fill_report.last_qty, Quantity::from("0.01"));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_empty_fill_sz_subsequent_fills() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        let order_msg_1 =
+            create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_1");
+
+        let fill_report_1 = parse_fill_report(
+            &order_msg_1,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(fill_report_1.last_qty, Quantity::from("0.01"));
+
+        let order_msg_2 =
+            create_stub_order_msg("", Some("0.03".to_string()), "1234567890", "trade_2");
+
+        let fill_report_2 = parse_fill_report(
+            &order_msg_2,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            Some(fill_report_1.commission),
+            Some(fill_report_1.last_qty),
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(fill_report_2.last_qty, Quantity::from("0.02"));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_error_both_empty() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        let order_msg = create_stub_order_msg("", Some("".to_string()), "1234567890", "trade_1");
+
+        let result = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Cannot determine fill quantity"));
+        assert!(err_msg.contains("empty/zero"));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_error_acc_fill_sz_none() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        let order_msg = create_stub_order_msg("", None, "1234567890", "trade_1");
+
+        let result = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            None,
+            ts_init,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Cannot determine fill quantity"));
+        assert!(err_msg.contains("acc_fill_sz is None"));
+    }
+
+    #[rstest]
+    fn test_parse_order_msg_acc_fill_sz_only_update() {
+        // Test that we emit fill reports when OKX only updates acc_fill_sz without fill_sz or trade_id
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        let mut instruments = AHashMap::new();
+        instruments.insert(
+            Ustr::from("BTC-USDT-SWAP"),
+            InstrumentAny::CryptoPerpetual(instrument),
+        );
+
+        let fee_cache = AHashMap::new();
+        let mut filled_qty_cache = AHashMap::new();
+
+        // First update: acc_fill_sz = 0.01, no fill_sz, no trade_id
+        let msg_1 = create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "");
+
+        let report_1 = parse_order_msg(
+            &msg_1,
+            account_id,
+            &instruments,
+            &fee_cache,
+            &filled_qty_cache,
+            ts_init,
+        )
+        .unwrap();
+
+        // Should generate a fill report (not a status report)
+        assert!(matches!(report_1, ExecutionReport::Fill(_)));
+        if let ExecutionReport::Fill(fill) = &report_1 {
+            assert_eq!(fill.last_qty, Quantity::from("0.01"));
+        }
+
+        // Update cache
+        filled_qty_cache.insert(Ustr::from("1234567890"), Quantity::from("0.01"));
+
+        // Second update: acc_fill_sz increased to 0.03, still no fill_sz or trade_id
+        let msg_2 = create_stub_order_msg("", Some("0.03".to_string()), "1234567890", "");
+
+        let report_2 = parse_order_msg(
+            &msg_2,
+            account_id,
+            &instruments,
+            &fee_cache,
+            &filled_qty_cache,
+            ts_init,
+        )
+        .unwrap();
+
+        // Should still generate a fill report for the incremental 0.02
+        assert!(matches!(report_2, ExecutionReport::Fill(_)));
+        if let ExecutionReport::Fill(fill) = &report_2 {
+            assert_eq!(fill.last_qty, Quantity::from("0.02"));
+        }
     }
 
     #[rstest]
@@ -2097,12 +3083,14 @@ mod tests {
             InstrumentAny::CryptoPerpetual(instrument),
         );
         let fee_cache = AHashMap::new();
+        let filled_qty_cache = AHashMap::new();
 
         let result = parse_order_msg_vec(
             vec![msg.clone()],
             account_id,
             &instruments,
             &fee_cache,
+            &filled_qty_cache,
             UnixNanos::default(),
         );
 
@@ -2117,5 +3105,614 @@ mod tests {
         } else {
             panic!("Expected Fill report for filled trigger order");
         }
+    }
+
+    #[rstest]
+    fn test_parse_liquidation_order() {
+        let json_data = load_test_json("ws_orders_liquidation.json");
+        let ws_msg: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(ws_msg["data"].clone()).unwrap();
+
+        // Test liquidation order
+        let msg = &data[0];
+        assert_eq!(msg.category, OKXOrderCategory::FullLiquidation);
+        assert_eq!(msg.state, OKXOrderStatus::Filled);
+        assert_eq!(msg.inst_id.as_str(), "BTC-USDT-SWAP");
+
+        let account_id = AccountId::new("OKX-001");
+        let mut instruments = AHashMap::new();
+
+        // Create mock instrument
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("BTC-USDT-SWAP"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false, // is_inverse
+            2,     // price_precision
+            8,     // size_precision
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(), // ts_event
+            0.into(), // ts_init
+        );
+        instruments.insert(
+            Ustr::from("BTC-USDT-SWAP"),
+            InstrumentAny::CryptoPerpetual(instrument),
+        );
+        let fee_cache = AHashMap::new();
+        let filled_qty_cache = AHashMap::new();
+
+        let result = parse_order_msg_vec(
+            vec![msg.clone()],
+            account_id,
+            &instruments,
+            &fee_cache,
+            &filled_qty_cache,
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_ok());
+        let reports = result.unwrap();
+        assert_eq!(reports.len(), 1);
+
+        // Verify it's a fill report for a liquidation
+        if let ExecutionReport::Fill(fill_report) = &reports[0] {
+            assert_eq!(fill_report.order_side, OrderSide::Sell);
+            assert_eq!(fill_report.last_qty, Quantity::from("0.50000000"));
+            assert_eq!(fill_report.last_px, Price::from("40000.00"));
+            assert_eq!(fill_report.liquidity_side, LiquiditySide::Taker);
+        } else {
+            panic!("Expected Fill report for liquidation order");
+        }
+    }
+
+    #[rstest]
+    fn test_parse_adl_order() {
+        let json_data = load_test_json("ws_orders_adl.json");
+        let ws_msg: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(ws_msg["data"].clone()).unwrap();
+
+        // Test ADL order
+        let msg = &data[0];
+        assert_eq!(msg.category, OKXOrderCategory::Adl);
+        assert_eq!(msg.state, OKXOrderStatus::Filled);
+        assert_eq!(msg.inst_id.as_str(), "ETH-USDT-SWAP");
+
+        let account_id = AccountId::new("OKX-001");
+        let mut instruments = AHashMap::new();
+
+        // Create mock instrument
+        let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("ETH-USDT-SWAP"),
+            Currency::ETH(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false, // is_inverse
+            2,     // price_precision
+            8,     // size_precision
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(), // ts_event
+            0.into(), // ts_init
+        );
+        instruments.insert(
+            Ustr::from("ETH-USDT-SWAP"),
+            InstrumentAny::CryptoPerpetual(instrument),
+        );
+        let fee_cache = AHashMap::new();
+        let filled_qty_cache = AHashMap::new();
+
+        let result = parse_order_msg_vec(
+            vec![msg.clone()],
+            account_id,
+            &instruments,
+            &fee_cache,
+            &filled_qty_cache,
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_ok());
+        let reports = result.unwrap();
+        assert_eq!(reports.len(), 1);
+
+        // Verify it's a fill report for ADL
+        if let ExecutionReport::Fill(fill_report) = &reports[0] {
+            assert_eq!(fill_report.order_side, OrderSide::Buy);
+            assert_eq!(fill_report.last_qty, Quantity::from("0.30000000"));
+            assert_eq!(fill_report.last_px, Price::from("41000.00"));
+            assert_eq!(fill_report.liquidity_side, LiquiditySide::Taker);
+        } else {
+            panic!("Expected Fill report for ADL order");
+        }
+    }
+
+    #[rstest]
+    fn test_parse_unknown_category_graceful_fallback() {
+        // Test that unknown/future category values deserialize as Other instead of failing
+        let json_with_unknown_category = r#"{
+            "category": "some_future_category_we_dont_know"
+        }"#;
+
+        let result: Result<serde_json::Value, _> = serde_json::from_str(json_with_unknown_category);
+        assert!(result.is_ok());
+
+        // Test deserialization of the category field directly
+        let category_result: Result<OKXOrderCategory, _> =
+            serde_json::from_str(r#""some_future_category""#);
+        assert!(category_result.is_ok());
+        assert_eq!(category_result.unwrap(), OKXOrderCategory::Other);
+
+        // Verify known categories still work
+        let normal: OKXOrderCategory = serde_json::from_str(r#""normal""#).unwrap();
+        assert_eq!(normal, OKXOrderCategory::Normal);
+
+        let twap: OKXOrderCategory = serde_json::from_str(r#""twap""#).unwrap();
+        assert_eq!(twap, OKXOrderCategory::Twap);
+    }
+
+    #[rstest]
+    fn test_parse_partial_liquidation_order() {
+        // Create a test message with partial liquidation category
+        let account_id = AccountId::new("OKX-001");
+        let mut instruments = AHashMap::new();
+
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let instrument = CryptoPerpetual::new(
+            instrument_id,
+            Symbol::from("BTC-USDT-SWAP"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            2,
+            8,
+            Price::from("0.01"),
+            Quantity::from("0.00000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        instruments.insert(
+            Ustr::from("BTC-USDT-SWAP"),
+            InstrumentAny::CryptoPerpetual(instrument),
+        );
+
+        let partial_liq_msg = OKXOrderMsg {
+            acc_fill_sz: Some("0.25".to_string()),
+            avg_px: "39000.0".to_string(),
+            c_time: 1746947317401,
+            cancel_source: None,
+            cancel_source_reason: None,
+            category: OKXOrderCategory::PartialLiquidation,
+            ccy: Ustr::from("USDT"),
+            cl_ord_id: "".to_string(),
+            algo_cl_ord_id: None,
+            fee: Some("-9.75".to_string()),
+            fee_ccy: Ustr::from("USDT"),
+            fill_px: "39000.0".to_string(),
+            fill_sz: "0.25".to_string(),
+            fill_time: 1746947317402,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            inst_type: OKXInstrumentType::Swap,
+            lever: "10.0".to_string(),
+            ord_id: Ustr::from("2497956918703120888"),
+            ord_type: OKXOrderType::Market,
+            pnl: "-2500".to_string(),
+            pos_side: OKXPositionSide::Long,
+            px: "".to_string(),
+            reduce_only: "false".to_string(),
+            side: OKXSide::Sell,
+            state: OKXOrderStatus::Filled,
+            exec_type: OKXExecType::Taker,
+            sz: "0.25".to_string(),
+            td_mode: OKXTradeMode::Isolated,
+            tgt_ccy: None,
+            trade_id: "1518905888".to_string(),
+            u_time: 1746947317402,
+        };
+
+        let fee_cache = AHashMap::new();
+        let filled_qty_cache = AHashMap::new();
+        let result = parse_order_msg(
+            &partial_liq_msg,
+            account_id,
+            &instruments,
+            &fee_cache,
+            &filled_qty_cache,
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Verify it's a fill report for partial liquidation
+        if let ExecutionReport::Fill(fill_report) = report {
+            assert_eq!(fill_report.order_side, OrderSide::Sell);
+            assert_eq!(fill_report.last_qty, Quantity::from("0.25000000"));
+            assert_eq!(fill_report.last_px, Price::from("39000.00"));
+        } else {
+            panic!("Expected Fill report for partial liquidation order");
+        }
+    }
+
+    #[rstest]
+    fn test_websocket_instrument_update_preserves_cached_fees() {
+        use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
+
+        use crate::common::{models::OKXInstrument, parse::parse_instrument_any};
+
+        let ts_init = UnixNanos::default();
+
+        // Create initial instrument with fees (simulating HTTP load)
+        let initial_fees = (
+            Some(Decimal::new(8, 4)),  // maker_fee = 0.0008
+            Some(Decimal::new(10, 4)), // taker_fee = 0.0010
+        );
+
+        // Deserialize initial instrument from JSON
+        let initial_inst_json = serde_json::json!({
+            "instType": "SPOT",
+            "instId": "BTC-USD",
+            "baseCcy": "BTC",
+            "quoteCcy": "USD",
+            "settleCcy": "",
+            "ctVal": "",
+            "ctMult": "",
+            "ctValCcy": "",
+            "optType": "",
+            "stk": "",
+            "listTime": "1733454000000",
+            "expTime": "",
+            "lever": "",
+            "tickSz": "0.1",
+            "lotSz": "0.00000001",
+            "minSz": "0.00001",
+            "ctType": "linear",
+            "alias": "",
+            "state": "live",
+            "maxLmtSz": "9999999999",
+            "maxMktSz": "1000000",
+            "maxTwapSz": "9999999999.0000000000000000",
+            "maxIcebergSz": "9999999999.0000000000000000",
+            "maxTriggerSz": "9999999999.0000000000000000",
+            "maxStopSz": "1000000",
+            "uly": "",
+            "instFamily": "",
+            "ruleType": "normal",
+            "maxLmtAmt": "20000000",
+            "maxMktAmt": "1000000"
+        });
+
+        let initial_inst: OKXInstrument = serde_json::from_value(initial_inst_json)
+            .expect("Failed to deserialize initial instrument");
+
+        // Parse initial instrument with fees
+        let parsed_initial = parse_instrument_any(
+            &initial_inst,
+            None,
+            None,
+            initial_fees.0,
+            initial_fees.1,
+            ts_init,
+        )
+        .expect("Failed to parse initial instrument")
+        .expect("Initial instrument should not be None");
+
+        // Verify fees were applied
+        if let InstrumentAny::CurrencyPair(ref pair) = parsed_initial {
+            assert_eq!(pair.maker_fee, dec!(0.0008));
+            assert_eq!(pair.taker_fee, dec!(0.0010));
+        } else {
+            panic!("Expected CurrencyPair instrument");
+        }
+
+        // Build instrument cache with the initial instrument
+        let mut instruments_cache = AHashMap::new();
+        instruments_cache.insert(Ustr::from("BTC-USD"), parsed_initial);
+
+        // Create WebSocket update message (same structure as initial, simulating a WebSocket update)
+        let ws_update = serde_json::json!({
+            "instType": "SPOT",
+            "instId": "BTC-USD",
+            "baseCcy": "BTC",
+            "quoteCcy": "USD",
+            "settleCcy": "",
+            "ctVal": "",
+            "ctMult": "",
+            "ctValCcy": "",
+            "optType": "",
+            "stk": "",
+            "listTime": "1733454000000",
+            "expTime": "",
+            "lever": "",
+            "tickSz": "0.1",
+            "lotSz": "0.00000001",
+            "minSz": "0.00001",
+            "ctType": "linear",
+            "alias": "",
+            "state": "live",
+            "maxLmtSz": "9999999999",
+            "maxMktSz": "1000000",
+            "maxTwapSz": "9999999999.0000000000000000",
+            "maxIcebergSz": "9999999999.0000000000000000",
+            "maxTriggerSz": "9999999999.0000000000000000",
+            "maxStopSz": "1000000",
+            "uly": "",
+            "instFamily": "",
+            "ruleType": "normal",
+            "maxLmtAmt": "20000000",
+            "maxMktAmt": "1000000"
+        });
+
+        let instrument_id = InstrumentId::from("BTC-USD.OKX");
+        let mut funding_cache = AHashMap::new();
+
+        // Parse WebSocket update with cache
+        let result = parse_ws_message_data(
+            &OKXWsChannel::Instruments,
+            ws_update,
+            &instrument_id,
+            2,
+            8,
+            ts_init,
+            &mut funding_cache,
+            &instruments_cache,
+        )
+        .expect("Failed to parse WebSocket instrument update");
+
+        // Verify the update preserves the cached fees
+        if let Some(NautilusWsMessage::Instrument(boxed_inst)) = result {
+            if let InstrumentAny::CurrencyPair(pair) = *boxed_inst {
+                assert_eq!(
+                    pair.maker_fee,
+                    Decimal::new(8, 4),
+                    "Maker fee should be preserved from cache"
+                );
+                assert_eq!(
+                    pair.taker_fee,
+                    Decimal::new(10, 4),
+                    "Taker fee should be preserved from cache"
+                );
+            } else {
+                panic!("Expected CurrencyPair instrument from WebSocket update");
+            }
+        } else {
+            panic!("Expected Instrument message from WebSocket update");
+        }
+    }
+
+    #[rstest]
+    #[case::fok_order(OKXOrderType::Fok, TimeInForce::Fok)]
+    #[case::ioc_order(OKXOrderType::Ioc, TimeInForce::Ioc)]
+    #[case::optimal_limit_ioc_order(OKXOrderType::OptimalLimitIoc, TimeInForce::Ioc)]
+    #[case::market_order(OKXOrderType::Market, TimeInForce::Gtc)]
+    #[case::limit_order(OKXOrderType::Limit, TimeInForce::Gtc)]
+    fn test_parse_time_in_force_from_ord_type(
+        #[case] okx_ord_type: OKXOrderType,
+        #[case] expected_tif: TimeInForce,
+    ) {
+        let time_in_force = match okx_ord_type {
+            OKXOrderType::Fok => TimeInForce::Fok,
+            OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
+            _ => TimeInForce::Gtc,
+        };
+
+        assert_eq!(
+            time_in_force, expected_tif,
+            "OKXOrderType::{:?} should parse to TimeInForce::{:?}",
+            okx_ord_type, expected_tif
+        );
+    }
+
+    #[rstest]
+    fn test_deserialize_fok_order_message() {
+        let json_data = load_test_json("ws_orders_fok.json");
+        let ws_msg: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(ws_msg["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].ord_type, OKXOrderType::Fok);
+        assert_eq!(data[0].cl_ord_id, "FOK-TEST-001");
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT"));
+    }
+
+    #[rstest]
+    fn test_deserialize_ioc_order_message() {
+        let json_data = load_test_json("ws_orders_ioc.json");
+        let ws_msg: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(ws_msg["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].ord_type, OKXOrderType::Ioc);
+        assert_eq!(data[0].cl_ord_id, "IOC-TEST-001");
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT"));
+    }
+
+    #[rstest]
+    fn test_deserialize_optimal_limit_ioc_order_message() {
+        let json_data = load_test_json("ws_orders_optimal_limit_ioc.json");
+        let ws_msg: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(ws_msg["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].ord_type, OKXOrderType::OptimalLimitIoc);
+        assert_eq!(data[0].cl_ord_id, "OPTIMAL-IOC-TEST-001");
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+    }
+
+    #[rstest]
+    fn test_deserialize_regular_order_message() {
+        let json_data = load_test_json("ws_orders.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+        assert_eq!(data[0].state, OKXOrderStatus::Filled);
+        assert_eq!(data[0].category, OKXOrderCategory::Normal);
+    }
+
+    #[rstest]
+    fn test_deserialize_algo_order_message() {
+        let json_data = load_test_json("ws_orders_algo.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXAlgoOrderMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+    }
+
+    #[rstest]
+    fn test_deserialize_liquidation_order_message() {
+        let json_data = load_test_json("ws_orders_liquidation.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].category, OKXOrderCategory::FullLiquidation);
+    }
+
+    #[rstest]
+    fn test_deserialize_adl_order_message() {
+        let json_data = load_test_json("ws_orders_adl.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].category, OKXOrderCategory::Adl);
+    }
+
+    #[rstest]
+    fn test_deserialize_trigger_order_message() {
+        let json_data = load_test_json("ws_orders_trigger.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].ord_type, OKXOrderType::Trigger);
+        assert_eq!(data[0].category, OKXOrderCategory::Normal);
+    }
+
+    #[rstest]
+    fn test_deserialize_book_snapshot_message() {
+        let json_data = load_test_json("ws_books_snapshot.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let action: Option<OKXBookAction> =
+            serde_json::from_value(payload["action"].clone()).unwrap();
+        let data: Vec<OKXBookMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(action, Some(OKXBookAction::Snapshot));
+        assert!(!data[0].asks.is_empty());
+        assert!(!data[0].bids.is_empty());
+    }
+
+    #[rstest]
+    fn test_deserialize_book_update_message() {
+        let json_data = load_test_json("ws_books_update.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let action: Option<OKXBookAction> =
+            serde_json::from_value(payload["action"].clone()).unwrap();
+        let data: Vec<OKXBookMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(action, Some(OKXBookAction::Update));
+        assert!(!data[0].asks.is_empty());
+        assert!(!data[0].bids.is_empty());
+    }
+
+    #[rstest]
+    fn test_deserialize_ticker_message() {
+        let json_data = load_test_json("ws_tickers.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXTickerMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT"));
+        assert_eq!(data[0].last_px, "9999.99");
+    }
+
+    #[rstest]
+    fn test_deserialize_candle_message() {
+        let json_data = load_test_json("ws_candle.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXCandleMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert!(!data[0].o.is_empty());
+        assert!(!data[0].h.is_empty());
+        assert!(!data[0].l.is_empty());
+        assert!(!data[0].c.is_empty());
+    }
+
+    #[rstest]
+    fn test_deserialize_funding_rate_message() {
+        let json_data = load_test_json("ws_funding_rate.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXFundingRateMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+    }
+
+    #[rstest]
+    fn test_deserialize_bbo_tbt_message() {
+        let json_data = load_test_json("ws_bbo_tbt.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXBookMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert!(!data[0].asks.is_empty());
+        assert!(!data[0].bids.is_empty());
+    }
+
+    #[rstest]
+    fn test_deserialize_trade_message() {
+        let json_data = load_test_json("ws_trades.json");
+        let payload: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        let data: Vec<OKXTradeMsg> = serde_json::from_value(payload["data"].clone()).unwrap();
+
+        assert!(!data.is_empty());
+        assert_eq!(data[0].inst_id, Ustr::from("BTC-USD"));
     }
 }

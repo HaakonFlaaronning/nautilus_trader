@@ -15,9 +15,12 @@
 
 //! Enumerations that model Bybit string/int enums across HTTP and WebSocket payloads.
 
-use nautilus_model::enums::{AggressorSide, OrderSide};
+use std::fmt::{Display, Formatter};
+
+use nautilus_model::enums::{AggressorSide, OrderSide, TriggerType};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use strum::{AsRefStr, EnumIter, EnumString};
 
 /// Unified margin account status values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize_repr, Deserialize_repr)]
@@ -36,8 +39,26 @@ pub enum BybitUnifiedMarginStatus {
 }
 
 /// Margin mode used by Bybit when switching risk profiles.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    strum::Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.bybit")
+)]
 pub enum BybitMarginMode {
     IsolatedMargin,
     RegularMargin,
@@ -45,8 +66,26 @@ pub enum BybitMarginMode {
 }
 
 /// Position mode as returned by the v5 API.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize_repr, Deserialize_repr)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    strum::Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize_repr,
+    Deserialize_repr,
+)]
 #[repr(i32)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.bybit")
+)]
 pub enum BybitPositionMode {
     /// Merged single position mode.
     MergedSingle = 0,
@@ -67,16 +106,81 @@ pub enum BybitPositionIdx {
 }
 
 /// Account type enumeration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    strum::Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "UPPERCASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.bybit")
+)]
 pub enum BybitAccountType {
     Unified,
 }
 
-/// Product categories supported by the v5 API.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+/// Environments supported by the Bybit API stack.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    strum::Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.bybit")
+)]
+pub enum BybitEnvironment {
+    /// Live trading environment.
+    Mainnet,
+    /// Demo (paper trading) environment.
+    Demo,
+    /// Testnet environment for spot/derivatives.
+    Testnet,
+}
+
+/// Product categories supported by the v5 API.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    strum::Display,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.bybit")
+)]
 pub enum BybitProductType {
+    #[default]
     Spot,
     Linear,
     Inverse,
@@ -124,6 +228,28 @@ pub enum BybitInstrumentStatus {
 }
 
 impl BybitProductType {
+    /// Returns the canonical lowercase identifier used for REST/WS routes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::Linear => "linear",
+            Self::Inverse => "inverse",
+            Self::Option => "option",
+        }
+    }
+
+    /// Returns the uppercase suffix used in instrument identifiers (e.g. `-LINEAR`).
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Spot => "-SPOT",
+            Self::Linear => "-LINEAR",
+            Self::Inverse => "-INVERSE",
+            Self::Option => "-OPTION",
+        }
+    }
+
     /// Returns `true` if the product is a spot instrument.
     #[must_use]
     pub fn is_spot(self) -> bool {
@@ -226,6 +352,27 @@ pub enum BybitKlineInterval {
     Month1,
 }
 
+impl Display for BybitKlineInterval {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Minute1 => "1",
+            Self::Minute3 => "3",
+            Self::Minute5 => "5",
+            Self::Minute15 => "15",
+            Self::Minute30 => "30",
+            Self::Hour1 => "60",
+            Self::Hour2 => "120",
+            Self::Hour4 => "240",
+            Self::Hour6 => "360",
+            Self::Hour12 => "720",
+            Self::Day1 => "D",
+            Self::Week1 => "W",
+            Self::Month1 => "M",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Order status values returned by Bybit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum BybitOrderStatus {
@@ -278,6 +425,17 @@ impl From<BybitOrderSide> for OrderSide {
             BybitOrderSide::Buy => Self::Buy,
             BybitOrderSide::Sell => Self::Sell,
             BybitOrderSide::Unknown => Self::NoOrderSide,
+        }
+    }
+}
+
+impl From<BybitTriggerType> for TriggerType {
+    fn from(value: BybitTriggerType) -> Self {
+        match value {
+            BybitTriggerType::None => Self::Default,
+            BybitTriggerType::LastPrice => Self::LastPrice,
+            BybitTriggerType::IndexPrice => Self::IndexPrice,
+            BybitTriggerType::MarkPrice => Self::MarkPrice,
         }
     }
 }
@@ -398,6 +556,8 @@ pub enum BybitTriggerDirection {
 pub enum BybitTpSlMode {
     Full,
     Partial,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Time-in-force enumeration.

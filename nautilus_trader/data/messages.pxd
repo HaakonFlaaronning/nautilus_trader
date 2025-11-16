@@ -84,8 +84,6 @@ cdef class SubscribeFundingRates(SubscribeData):
 cdef class SubscribeBars(SubscribeData):
     cdef readonly BarType bar_type
     """The bar type for the subscription."""
-    cdef readonly bint await_partial
-    """If the bar aggregator should await the arrival of a historical partial bar prior to actively aggregating new bars."""
 
 
 cdef class SubscribeInstrumentStatus(SubscribeData):
@@ -193,6 +191,11 @@ cdef class RequestTradeTicks(RequestData):
 cdef class RequestBars(RequestData):
     cdef readonly BarType bar_type
     """The bar type for the request.\n\n:returns: `BarType`"""
+
+
+cdef class RequestJoin(RequestData):
+    cdef readonly tuple request_ids
+    """The tuple of sub-request IDs.\n\n:returns: `tuple[UUID4]`"""
 
 
 cdef class DataResponse(Response):

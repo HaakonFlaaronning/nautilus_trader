@@ -15,7 +15,9 @@
 
 //! Bybit API credential storage and signing helpers.
 
-use std::fmt::Debug;
+#![allow(unused_assignments)] // Fields are used in methods, false positive from nightly
+
+use std::fmt::{Debug, Formatter};
 
 use aws_lc_rs::hmac;
 use hex;
@@ -31,7 +33,7 @@ pub struct Credential {
 }
 
 impl Debug for Credential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Credential")
             .field("api_key", &self.api_key)
             .field("api_secret", &"<redacted>")
@@ -46,7 +48,7 @@ impl Credential {
         let api_key = api_key.into();
         let api_secret_bytes = api_secret.into().into_bytes();
 
-        let api_key = Ustr::from(api_key.as_str());
+        let api_key = Ustr::from(&api_key);
 
         Self {
             api_key,
@@ -58,6 +60,33 @@ impl Credential {
     #[must_use]
     pub fn api_key(&self) -> &Ustr {
         &self.api_key
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    ///
+    /// Shows first 4 and last 4 characters with ellipsis in between.
+    /// For keys shorter than 8 characters, shows asterisks only.
+    #[must_use]
+    pub fn masked_api_key(&self) -> String {
+        let key = self.api_key.as_str();
+        let len = key.len();
+
+        if len <= 8 {
+            "*".repeat(len)
+        } else {
+            format!("{}...{}", &key[..4], &key[len - 4..])
+        }
+    }
+
+    /// Produces the Bybit WebSocket authentication signature for the provided expiry timestamp.
+    ///
+    /// `expires` should be the millisecond timestamp used by the login payload.
+    #[must_use]
+    pub fn sign_websocket_auth(&self, expires: i64) -> String {
+        let message = format!("GET/realtime{expires}");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.api_secret);
+        let tag = hmac::sign(&key, message.as_bytes());
+        hex::encode(tag.as_ref())
     }
 
     /// Produces the Bybit HMAC signature for the provided payload.
@@ -140,5 +169,18 @@ mod tests {
 
         let expected = credential.sign_with_payload(TIMESTAMP, RECV_WINDOW, Some(""));
         assert_eq!(signature, expected);
+    }
+
+    #[rstest]
+    fn sign_websocket_auth_matches_reference() {
+        let credential = Credential::new(API_KEY, API_SECRET);
+        let expires: i64 = 1_700_000_000_000;
+
+        let signature = credential.sign_websocket_auth(expires);
+
+        assert_eq!(
+            signature,
+            "bacffe7500499eb829bb58c45d36d1b3e5ac67c14eaeba91df5e99ccee013925"
+        );
     }
 }

@@ -60,6 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,     // max_retries
         None,     // retry_delay_ms
         None,     // retry_delay_max_ms
+        None,     // recv_window_ms
+        None,     // max_requests_per_second
+        None,     // max_requests_per_minute
+        None,     // proxy_url
     )
     .expect("Failed to create HTTP client");
 
@@ -74,11 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_url,  // url: defaults to wss://ws.bitmex.com/realtime
         None,    // No API key for public feeds
         None,    // No API secret
-        None,    // Acount ID
+        None,    // Account ID
         Some(5), // 5 second heartbeat
     )
     .unwrap();
-    ws_client.initialize_instruments_cache(instruments);
+    ws_client.cache_instruments(instruments);
     ws_client.connect().await?;
 
     // Give the connection a moment to stabilize

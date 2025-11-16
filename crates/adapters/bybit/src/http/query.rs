@@ -28,19 +28,26 @@ use crate::common::enums::{
 /// Query parameters for `GET /v5/market/instruments-info`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/market/instruments-info>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+/// - <https://bybit-exchange.github.io/docs/v5/market/instrument>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitInstrumentsInfoParams {
     pub category: BybitProductType,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<BybitInstrumentStatus>,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_coin: Option<String>,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
 }
@@ -49,15 +56,20 @@ pub struct BybitInstrumentsInfoParams {
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/market/tickers>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitTickersParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub base_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub exp_date: Option<String>,
 }
 
@@ -67,6 +79,7 @@ pub struct BybitTickersParams {
 /// - <https://bybit-exchange.github.io/docs/v5/market/kline>
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(setter(into, strip_option), default)]
 pub struct BybitKlinesParams {
     pub category: BybitProductType,
     pub symbol: String,
@@ -79,12 +92,26 @@ pub struct BybitKlinesParams {
     pub limit: Option<u32>,
 }
 
+impl Default for BybitKlinesParams {
+    fn default() -> Self {
+        Self {
+            category: BybitProductType::Linear,
+            symbol: String::new(),
+            interval: BybitKlineInterval::Minute1,
+            start: None,
+            end: None,
+            limit: None,
+        }
+    }
+}
+
 /// Query parameters for `GET /v5/market/recent-trade`.
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/market/recent-trade>
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(setter(into, strip_option), default)]
 pub struct BybitTradesParams {
     pub category: BybitProductType,
     pub symbol: String,
@@ -96,14 +123,29 @@ pub struct BybitTradesParams {
     pub limit: Option<u32>,
 }
 
+impl Default for BybitTradesParams {
+    fn default() -> Self {
+        Self {
+            category: BybitProductType::Linear,
+            symbol: String::new(),
+            base_coin: None,
+            option_type: None,
+            limit: None,
+        }
+    }
+}
+
 /// Query parameters for `GET /v5/asset/coin/query-info`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/asset/coin/query-info>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+/// - <https://bybit-exchange.github.io/docs/v5/asset/coin-info>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitCoinInfoParams {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub coin: Option<String>,
 }
 
@@ -111,12 +153,16 @@ pub struct BybitCoinInfoParams {
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/account/fee-rate>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitFeeRateParams {
     pub category: BybitProductType,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    #[builder(setter(strip_option))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_coin: Option<String>,
 }
@@ -130,26 +176,34 @@ pub struct BybitFeeRateParams {
 pub struct BybitWalletBalanceParams {
     pub account_type: BybitAccountType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub coin: Option<String>,
 }
 
 /// Query parameters for `GET /v5/position/list`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/position/position>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+/// - <https://bybit-exchange.github.io/docs/v5/position>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitPositionListParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub base_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub settle_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub cursor: Option<String>,
 }
 
@@ -185,8 +239,10 @@ pub struct BybitSetLeverageParams {
 pub struct BybitSwitchModeParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub coin: Option<String>,
     pub mode: BybitPositionMode,
 }
@@ -213,7 +269,8 @@ pub struct BybitSetTradingStopParams {
     pub sl_trigger_by: Option<BybitTriggerType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_price: Option<String>,
-    pub tpsl_mode: BybitTpSlMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpsl_mode: Option<BybitTpSlMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,55 +293,80 @@ pub struct BybitSetTradingStopParams {
 #[serde(rename_all = "camelCase")]
 pub struct BybitBatchPlaceOrderEntry {
     pub symbol: String,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_leverage: Option<i32>,
     pub side: BybitOrderSide,
     pub order_type: BybitOrderType,
     pub qty: String,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market_unit: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_direction: Option<BybitTriggerDirection>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_filter: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_by: Option<BybitTriggerType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_iv: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_in_force: Option<BybitTimeInForce>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_idx: Option<i32>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_loss: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp_trigger_by: Option<BybitTriggerType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sl_trigger_by: Option<BybitTriggerType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reduce_only: Option<bool>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_on_trigger: Option<bool>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smp_type: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mmp: Option<bool>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpsl_mode: Option<BybitTpSlMode>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp_limit_price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sl_limit_price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp_order_type: Option<BybitOrderType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sl_order_type: Option<BybitOrderType>,
 }
@@ -310,8 +392,10 @@ pub struct BybitPlaceOrderParams {
     #[serde(flatten)]
     pub order: BybitBatchPlaceOrderEntry,
     pub category: BybitProductType,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_tolerance_type: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_tolerance: Option<String>,
 }
@@ -325,8 +409,10 @@ pub struct BybitPlaceOrderParams {
 pub struct BybitBatchAmendOrderEntry {
     pub symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_iv: Option<String>,
@@ -380,14 +466,16 @@ pub struct BybitAmendOrderParams {
 /// Cancel entry for `POST /v5/order/cancel-batch`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/order/cancel-batch>
+/// - <https://bybit-exchange.github.io/docs/v5/order/batch-cancel>
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct BybitBatchCancelOrderEntry {
     pub symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_filter: Option<String>,
@@ -396,7 +484,7 @@ pub struct BybitBatchCancelOrderEntry {
 /// Body parameters for `POST /v5/order/cancel-batch`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/order/cancel-batch>
+/// - <https://bybit-exchange.github.io/docs/v5/order/batch-cancel>
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct BybitBatchCancelOrderParams {
@@ -420,103 +508,154 @@ pub struct BybitCancelOrderParams {
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/order/cancel-all>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitCancelAllOrdersParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub base_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub settle_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_filter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub stop_order_type: Option<String>,
 }
 
 /// Query parameters for `GET /v5/order/realtime`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/order/realtime>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+/// - <https://bybit-exchange.github.io/docs/v5/order/order-list>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitOpenOrdersParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub base_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub settle_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub open_only: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub order_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub cursor: Option<String>,
 }
 
 /// Query parameters for `GET /v5/order/history`.
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/order/order-list>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitOrderHistoryParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub base_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub settle_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub open_only: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_filter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_status: Option<BybitOrderStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub start_time: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "endTime")]
+    #[builder(setter(strip_option))]
     pub end_time: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub cursor: Option<String>,
 }
 
 /// Query parameters for `GET /v5/execution/list`.
 ///
 /// # References
-/// - <https://bybit-exchange.github.io/docs/v5/order/execution-list>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+/// - <https://bybit-exchange.github.io/docs/v5/order/execution>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitTradeHistoryParams {
     pub category: BybitProductType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub base_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub start_time: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "endTime")]
+    #[builder(setter(strip_option))]
     pub end_time: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub exec_type: Option<BybitExecType>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub cursor: Option<String>,
 }
 
@@ -524,13 +663,18 @@ pub struct BybitTradeHistoryParams {
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/user/modify-sub-apikey>
-#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
 pub struct BybitUpdateSubApiParams {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub read_only: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
     pub ips: Option<String>,
 }

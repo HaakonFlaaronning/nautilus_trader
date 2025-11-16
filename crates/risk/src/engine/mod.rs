@@ -32,9 +32,15 @@ use nautilus_common::{
     throttler::Throttler,
 };
 use nautilus_core::UUID4;
+use nautilus_execution::trailing::{
+    trailing_stop_calculate_with_bid_ask, trailing_stop_calculate_with_last,
+};
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    enums::{InstrumentClass, OrderSide, OrderStatus, TimeInForce, TradingState},
+    enums::{
+        InstrumentClass, OrderSide, OrderStatus, TimeInForce, TradingState, TrailingOffsetType,
+        TriggerType,
+    },
     events::{OrderDenied, OrderEventAny, OrderModifyRejected},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
@@ -491,7 +497,7 @@ impl RiskEngine {
         }
 
         // Check Quantity
-        risk_msg = self.check_quantity(&instrument, command.quantity);
+        risk_msg = self.check_quantity(&instrument, command.quantity, order.is_quote_quantity());
         if let Some(risk_msg) = risk_msg {
             self.reject_modify_order(order, &risk_msg);
             return; // Denied
@@ -577,7 +583,11 @@ impl RiskEngine {
     }
 
     fn check_order_quantity(&self, instrument: InstrumentAny, order: OrderAny) -> bool {
-        let risk_msg = self.check_quantity(&instrument, Some(order.quantity()));
+        let risk_msg = self.check_quantity(
+            &instrument,
+            Some(order.quantity()),
+            order.is_quote_quantity(),
+        );
         if let Some(risk_msg) = risk_msg {
             self.deny_order(order, &risk_msg);
             return false; // Denied
@@ -663,11 +673,105 @@ impl RiskEngine {
                     if let Some(trigger_price) = order.trigger_price() {
                         Some(trigger_price)
                     } else {
-                        log::warn!(
-                            "Cannot check {} order risk: no trigger price was set", // TODO: Use last_trade += offset
-                            order.order_type()
-                        );
-                        continue;
+                        // Validate trailing offset type is supported
+                        let offset_type = order.trailing_offset_type().unwrap();
+                        if !matches!(
+                            offset_type,
+                            TrailingOffsetType::Price
+                                | TrailingOffsetType::BasisPoints
+                                | TrailingOffsetType::Ticks
+                        ) {
+                            self.deny_order(
+                                order.clone(),
+                                &format!("UNSUPPORTED_TRAILING_OFFSET_TYPE: {offset_type:?}"),
+                            );
+                            return false;
+                        }
+
+                        let trigger_type = order.trigger_type().unwrap();
+                        let cache = self.cache.borrow();
+
+                        if trigger_type == TriggerType::BidAsk {
+                            if let Some(quote) = cache.quote(&instrument.id()) {
+                                match trailing_stop_calculate_with_bid_ask(
+                                    instrument.price_increment(),
+                                    order.trailing_offset_type().unwrap(),
+                                    order.order_side_specified(),
+                                    order.trailing_offset().unwrap(),
+                                    quote.bid_price,
+                                    quote.ask_price,
+                                ) {
+                                    Ok(calculated_trigger) => Some(calculated_trigger),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Cannot check {} order risk: failed to calculate trigger price from trailing offset: {e}",
+                                            order.order_type()
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "Cannot check {} order risk: no trigger price set and no bid/ask quotes available for {}",
+                                    order.order_type(),
+                                    instrument.id()
+                                );
+                                continue;
+                            }
+                        } else if let Some(last_trade) = cache.trade(&instrument.id()) {
+                            match trailing_stop_calculate_with_last(
+                                instrument.price_increment(),
+                                order.trailing_offset_type().unwrap(),
+                                order.order_side_specified(),
+                                order.trailing_offset().unwrap(),
+                                last_trade.price,
+                            ) {
+                                Ok(calculated_trigger) => Some(calculated_trigger),
+                                Err(e) => {
+                                    log::warn!(
+                                        "Cannot check {} order risk: failed to calculate trigger price from trailing offset: {}",
+                                        order.order_type(),
+                                        e
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if trigger_type == TriggerType::LastOrBidAsk {
+                            // Fallback to bid/ask when no trade data available
+                            if let Some(quote) = cache.quote(&instrument.id()) {
+                                match trailing_stop_calculate_with_bid_ask(
+                                    instrument.price_increment(),
+                                    order.trailing_offset_type().unwrap(),
+                                    order.order_side_specified(),
+                                    order.trailing_offset().unwrap(),
+                                    quote.bid_price,
+                                    quote.ask_price,
+                                ) {
+                                    Ok(calculated_trigger) => Some(calculated_trigger),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Cannot check {} order risk: failed to calculate trigger price from trailing offset: {e}",
+                                            order.order_type()
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "Cannot check {} order risk: no trigger price set and no market data available for {}",
+                                    order.order_type(),
+                                    instrument.id()
+                                );
+                                continue;
+                            }
+                        } else {
+                            log::warn!(
+                                "Cannot check {} order risk: no trigger price set and no market data available for {}",
+                                order.order_type(),
+                                instrument.id()
+                            );
+                            continue;
+                        }
                     }
                 }
                 _ => order.price(),
@@ -680,11 +784,58 @@ impl RiskEngine {
                 continue;
             };
 
+            // For quote quantity limit orders, use worst-case execution price
+            let effective_price = if order.is_quote_quantity()
+                && !instrument.is_inverse()
+                && matches!(order, OrderAny::Limit(_) | OrderAny::StopLimit(_))
+            {
+                // Get current market price for worst-case execution
+                let cache = self.cache.borrow();
+                if let Some(quote_tick) = cache.quote(&instrument.id()) {
+                    match order.order_side() {
+                        // BUY: could execute at best ask if below limit (more quantity)
+                        OrderSide::Buy => last_px.min(quote_tick.ask_price),
+                        // SELL: could execute at best bid if above limit (but less quantity, so use limit)
+                        OrderSide::Sell => last_px.max(quote_tick.bid_price),
+                        _ => last_px,
+                    }
+                } else {
+                    last_px // No market data, use limit price
+                }
+            } else {
+                last_px
+            };
+
             let effective_quantity = if order.is_quote_quantity() && !instrument.is_inverse() {
-                instrument.calculate_base_quantity(order.quantity(), last_px)
+                instrument.calculate_base_quantity(order.quantity(), effective_price)
             } else {
                 order.quantity()
             };
+
+            // Check min/max quantity against effective quantity
+            if let Some(max_quantity) = instrument.max_quantity()
+                && effective_quantity > max_quantity
+            {
+                self.deny_order(
+                    order.clone(),
+                    &format!(
+                        "QUANTITY_EXCEEDS_MAXIMUM: effective_quantity={effective_quantity}, max_quantity={max_quantity}"
+                    ),
+                );
+                return false; // Denied
+            }
+
+            if let Some(min_quantity) = instrument.min_quantity()
+                && effective_quantity < min_quantity
+            {
+                self.deny_order(
+                    order.clone(),
+                    &format!(
+                        "QUANTITY_BELOW_MINIMUM: effective_quantity={effective_quantity}, min_quantity={min_quantity}"
+                    ),
+                );
+                return false; // Denied
+            }
 
             let notional =
                 instrument.calculate_notional_value(effective_quantity, last_px, Some(true));
@@ -852,8 +1003,9 @@ impl RiskEngine {
                     }
 
                     match cum_notional_sell {
-                        Some(mut cum_notional_sell) => {
-                            cum_notional_sell.raw += cash_value.raw;
+                        Some(mut value) => {
+                            value.raw += cash_value.raw;
+                            cum_notional_sell = Some(value);
                         }
                         None => cum_notional_sell = Some(cash_value),
                     }
@@ -887,7 +1039,13 @@ impl RiskEngine {
             ));
         }
 
-        if instrument.instrument_class() != InstrumentClass::Option && price_val.raw <= 0 {
+        if !matches!(
+            instrument.instrument_class(),
+            InstrumentClass::Option
+                | InstrumentClass::FuturesSpread
+                | InstrumentClass::OptionSpread
+        ) && price_val.raw <= 0
+        {
             return Some(format!("price {price_val} invalid (<= 0)"));
         }
 
@@ -898,6 +1056,7 @@ impl RiskEngine {
         &self,
         instrument: &InstrumentAny,
         quantity: Option<Quantity>,
+        is_quote_quantity: bool,
     ) -> Option<String> {
         let quantity_val = quantity?;
 
@@ -911,6 +1070,11 @@ impl RiskEngine {
             ));
         }
 
+        // Skip min/max checks for quote quantities (they will be checked in check_orders_risk using effective_quantity)
+        if is_quote_quantity {
+            return None;
+        }
+
         // Check maximum quantity
         if let Some(max_quantity) = instrument.max_quantity()
             && quantity_val > max_quantity
@@ -920,7 +1084,7 @@ impl RiskEngine {
             ));
         }
 
-        // // Check minimum quantity
+        // Check minimum quantity
         if let Some(min_quantity) = instrument.min_quantity()
             && quantity_val < min_quantity
         {

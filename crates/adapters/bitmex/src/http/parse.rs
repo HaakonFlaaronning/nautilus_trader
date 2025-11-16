@@ -19,11 +19,8 @@ use std::str::FromStr;
 
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime, uuid::UUID4};
 use nautilus_model::{
-    currencies::CURRENCY_MAP,
     data::{Bar, BarType, TradeTick},
-    enums::{
-        ContingencyType, CurrencyType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType,
-    },
+    enums::{ContingencyType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, OrderListId, Symbol, TradeId, VenueOrderId},
     instruments::{CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
@@ -39,13 +36,28 @@ use super::models::{
 use crate::common::{
     enums::{BitmexExecInstruction, BitmexExecType, BitmexInstrumentType},
     parse::{
-        convert_contract_quantity, derive_contract_decimal_and_increment, map_bitmex_currency,
-        normalize_trade_bin_prices, normalize_trade_bin_volume, parse_aggressor_side,
-        parse_contracts_quantity, parse_instrument_id, parse_liquidity_side,
+        clean_reason, convert_contract_quantity, derive_contract_decimal_and_increment,
+        map_bitmex_currency, normalize_trade_bin_prices, normalize_trade_bin_volume,
+        parse_aggressor_side, parse_contracts_quantity, parse_instrument_id, parse_liquidity_side,
         parse_optional_datetime_to_unix_nanos, parse_position_side,
         parse_signed_contracts_quantity,
     },
 };
+
+/// Returns the appropriate position multiplier for a BitMEX instrument.
+///
+/// For inverse contracts, BitMEX uses `underlyingToSettleMultiplier` to define contract sizing,
+/// with fallback to `underlyingToPositionMultiplier` for older historical data.
+/// For linear contracts, BitMEX uses `underlyingToPositionMultiplier`.
+fn get_position_multiplier(definition: &BitmexInstrument) -> Option<f64> {
+    if definition.is_inverse {
+        definition
+            .underlying_to_settle_multiplier
+            .or(definition.underlying_to_position_multiplier)
+    } else {
+        definition.underlying_to_position_multiplier
+    }
+}
 
 /// Attempts to convert a BitMEX instrument record into a Nautilus instrument by type.
 #[must_use]
@@ -81,6 +93,18 @@ pub fn parse_instrument_any(
                 e
             })
             .ok(),
+        BitmexInstrumentType::PredictionMarket => {
+            // Prediction markets work similarly to futures (bounded 0-100, cash settled)
+            parse_futures_instrument(instrument, ts_init)
+                .map_err(|e| {
+                    tracing::warn!(
+                        "Failed to parse prediction market instrument {}: {e}",
+                        instrument.symbol,
+                    );
+                    e
+                })
+                .ok()
+        }
         BitmexInstrumentType::BasketIndex
         | BitmexInstrumentType::CryptoIndex
         | BitmexInstrumentType::FxIndex
@@ -171,16 +195,14 @@ pub fn parse_spot_instrument(
 ) -> anyhow::Result<InstrumentAny> {
     let instrument_id = parse_instrument_id(definition.symbol);
     let raw_symbol = Symbol::new(definition.symbol);
-    let base_currency = get_currency(definition.underlying.to_uppercase());
-    let quote_currency = get_currency(definition.quote_currency.to_uppercase());
+    let base_currency = get_currency(&definition.underlying.to_uppercase());
+    let quote_currency = get_currency(&definition.quote_currency.to_uppercase());
 
     let price_increment = Price::from(definition.tick_size.to_string());
 
     let max_scale = FIXED_PRECISION as u32;
-    let (contract_decimal, size_increment) = derive_contract_decimal_and_increment(
-        definition.underlying_to_position_multiplier,
-        max_scale,
-    )?;
+    let (contract_decimal, size_increment) =
+        derive_contract_decimal_and_increment(get_position_multiplier(definition), max_scale)?;
 
     let min_quantity = convert_contract_quantity(
         definition.lot_size,
@@ -264,9 +286,9 @@ pub fn parse_perpetual_instrument(
 ) -> anyhow::Result<InstrumentAny> {
     let instrument_id = parse_instrument_id(definition.symbol);
     let raw_symbol = Symbol::new(definition.symbol);
-    let base_currency = get_currency(definition.underlying.to_uppercase());
-    let quote_currency = get_currency(definition.quote_currency.to_uppercase());
-    let settlement_currency = get_currency(definition.settl_currency.as_ref().map_or_else(
+    let base_currency = get_currency(&definition.underlying.to_uppercase());
+    let quote_currency = get_currency(&definition.quote_currency.to_uppercase());
+    let settlement_currency = get_currency(&definition.settl_currency.as_ref().map_or_else(
         || definition.quote_currency.to_uppercase(),
         |s| s.to_uppercase(),
     ));
@@ -275,10 +297,8 @@ pub fn parse_perpetual_instrument(
     let price_increment = Price::from(definition.tick_size.to_string());
 
     let max_scale = FIXED_PRECISION as u32;
-    let (contract_decimal, size_increment) = derive_contract_decimal_and_increment(
-        definition.underlying_to_position_multiplier,
-        max_scale,
-    )?;
+    let (contract_decimal, size_increment) =
+        derive_contract_decimal_and_increment(get_position_multiplier(definition), max_scale)?;
 
     let lot_size =
         convert_contract_quantity(definition.lot_size, contract_decimal, max_scale, "lot size")?;
@@ -361,23 +381,25 @@ pub fn parse_futures_instrument(
 ) -> anyhow::Result<InstrumentAny> {
     let instrument_id = parse_instrument_id(definition.symbol);
     let raw_symbol = Symbol::new(definition.symbol);
-    let underlying = get_currency(definition.underlying.to_uppercase());
-    let quote_currency = get_currency(definition.quote_currency.to_uppercase());
-    let settlement_currency = get_currency(definition.settl_currency.as_ref().map_or_else(
+    let underlying = get_currency(&definition.underlying.to_uppercase());
+    let quote_currency = get_currency(&definition.quote_currency.to_uppercase());
+    let settlement_currency = get_currency(&definition.settl_currency.as_ref().map_or_else(
         || definition.quote_currency.to_uppercase(),
         |s| s.to_uppercase(),
     ));
     let is_inverse = definition.is_inverse;
 
-    let activation_ns = UnixNanos::from(definition.listing);
+    let ts_event = UnixNanos::from(definition.timestamp);
+    let activation_ns = definition
+        .listing
+        .as_ref()
+        .map_or(ts_event, |dt| UnixNanos::from(*dt));
     let expiration_ns = parse_optional_datetime_to_unix_nanos(&definition.expiry, "expiry");
     let price_increment = Price::from(definition.tick_size.to_string());
 
     let max_scale = FIXED_PRECISION as u32;
-    let (contract_decimal, size_increment) = derive_contract_decimal_and_increment(
-        definition.underlying_to_position_multiplier,
-        max_scale,
-    )?;
+    let (contract_decimal, size_increment) =
+        derive_contract_decimal_and_increment(get_position_multiplier(definition), max_scale)?;
 
     let lot_size =
         convert_contract_quantity(definition.lot_size, contract_decimal, max_scale, "lot size")?;
@@ -418,8 +440,6 @@ pub fn parse_futures_instrument(
         .max_price
         .map(|price| Price::from(price.to_string()));
     let min_price = None;
-    let ts_event = UnixNanos::from(definition.timestamp);
-
     let instrument = CryptoFuture::new(
         instrument_id,
         raw_symbol,
@@ -536,15 +556,23 @@ pub fn parse_trade_bin(
 
 /// Parse a BitMEX order into a Nautilus `OrderStatusReport`.
 ///
+/// # BitMEX Response Quirks
+///
+/// BitMEX may omit `ord_status` in responses for completed orders. When this occurs,
+/// the parser defensively infers the status from `leaves_qty` and `cum_qty`:
+/// - `leaves_qty=0, cum_qty>0` -> `Filled`
+/// - `leaves_qty=0, cum_qty<=0` -> `Canceled`
+/// - Otherwise -> Returns error (unparsable)
+///
 /// # Errors
 ///
-/// Currently this function does not return errors as all fields are handled gracefully,
-/// but returns `Result` for future error handling compatibility.
+/// Returns an error if:
+/// - Order is missing `ord_status` and status cannot be inferred from quantity fields.
+/// - Order is missing `order_qty` and cannot be reconstructed from `cum_qty` + `leaves_qty`.
 ///
 /// # Panics
 ///
 /// Panics if:
-/// - Order is missing required fields: `symbol`, `ord_type`, `time_in_force`, `ord_status`, or `order_qty`
 /// - Unsupported `ExecInstruction` type is encountered (other than `ParticipateDoNotInitiate` or `ReduceOnly`)
 pub fn parse_order_status_report(
     order: &BitmexOrder,
@@ -560,7 +588,7 @@ pub fn parse_order_status_report(
 
     // BitMEX may not include ord_type in cancel responses,
     // for robustness default to LIMIT if not provided.
-    let order_type: OrderType = order.ord_type.map(|t| t.into()).unwrap_or(OrderType::Limit);
+    let order_type: OrderType = order.ord_type.map_or(OrderType::Limit, |t| t.into());
 
     // BitMEX may not include time_in_force in cancel responses,
     // for robustness default to GTC if not provided.
@@ -569,18 +597,90 @@ pub fn parse_order_status_report(
         .and_then(|tif| tif.try_into().ok())
         .unwrap_or(TimeInForce::Gtc);
 
-    let order_status: OrderStatus = (*order
-        .ord_status
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Order missing ord_status"))?)
-    .into();
-    let quantity = parse_signed_contracts_quantity(
-        order
-            .order_qty
-            .ok_or_else(|| anyhow::anyhow!("Order missing order_qty"))?,
-        instrument,
-    );
-    let filled_qty = parse_signed_contracts_quantity(order.cum_qty.unwrap_or(0), instrument);
+    // BitMEX may omit ord_status in responses for completed orders
+    // Defensively infer from leaves_qty, cum_qty, and working_indicator when possible
+    let order_status: OrderStatus = if let Some(status) = order.ord_status.as_ref() {
+        (*status).into()
+    } else {
+        // Infer status from quantity fields and working indicator
+        match (order.leaves_qty, order.cum_qty, order.working_indicator) {
+            (Some(0), Some(cum), _) if cum > 0 => {
+                tracing::debug!(
+                    order_id = ?order.order_id,
+                    client_order_id = ?order.cl_ord_id,
+                    cum_qty = cum,
+                    "Inferred Filled from missing ordStatus (leaves_qty=0, cum_qty>0)"
+                );
+                OrderStatus::Filled
+            }
+            (Some(0), _, _) => {
+                tracing::debug!(
+                    order_id = ?order.order_id,
+                    client_order_id = ?order.cl_ord_id,
+                    cum_qty = ?order.cum_qty,
+                    "Inferred Canceled from missing ordStatus (leaves_qty=0, cum_qty<=0)"
+                );
+                OrderStatus::Canceled
+            }
+            // BitMEX cancel responses may omit all quantity fields but include working_indicator
+            (None, None, Some(false)) => {
+                tracing::debug!(
+                    order_id = ?order.order_id,
+                    client_order_id = ?order.cl_ord_id,
+                    "Inferred Canceled from missing ordStatus with working_indicator=false"
+                );
+                OrderStatus::Canceled
+            }
+            _ => {
+                let order_json = serde_json::to_string(order)?;
+                anyhow::bail!(
+                    "Order missing ord_status and cannot infer (order_id={}, client_order_id={:?}, leaves_qty={:?}, cum_qty={:?}, working_indicator={:?}, order_json={})",
+                    order.order_id,
+                    order.cl_ord_id,
+                    order.leaves_qty,
+                    order.cum_qty,
+                    order.working_indicator,
+                    order_json
+                );
+            }
+        }
+    };
+
+    // Try to get order_qty, or reconstruct from cum_qty + leaves_qty
+    let (quantity, filled_qty) = if let Some(qty) = order.order_qty {
+        let quantity = parse_signed_contracts_quantity(qty, instrument);
+        let filled_qty = parse_signed_contracts_quantity(order.cum_qty.unwrap_or(0), instrument);
+        (quantity, filled_qty)
+    } else if let (Some(cum), Some(leaves)) = (order.cum_qty, order.leaves_qty) {
+        tracing::debug!(
+            order_id = ?order.order_id,
+            client_order_id = ?order.cl_ord_id,
+            cum_qty = cum,
+            leaves_qty = leaves,
+            "Reconstructing order_qty from cum_qty + leaves_qty"
+        );
+        let quantity = parse_signed_contracts_quantity(cum + leaves, instrument);
+        let filled_qty = parse_signed_contracts_quantity(cum, instrument);
+        (quantity, filled_qty)
+    } else if order_status == OrderStatus::Canceled || order_status == OrderStatus::Rejected {
+        // For canceled/rejected orders, both quantities will be reconciled from cache
+        // BitMEX sometimes omits all quantity fields in cancel responses
+        tracing::debug!(
+            order_id = ?order.order_id,
+            client_order_id = ?order.cl_ord_id,
+            status = ?order_status,
+            "Order missing quantity fields, using 0 for both (will be reconciled from cache)"
+        );
+        let zero_qty = Quantity::zero(instrument.size_precision());
+        (zero_qty, zero_qty)
+    } else {
+        anyhow::bail!(
+            "Order missing order_qty and cannot reconstruct (order_id={}, cum_qty={:?}, leaves_qty={:?})",
+            order.order_id,
+            order.cum_qty,
+            order.leaves_qty
+        );
+    };
     let report_id = UUID4::new();
     let ts_accepted = order.transact_time.map_or_else(
         || get_atomic_clock_realtime().get_time_ns(),
@@ -623,7 +723,7 @@ pub fn parse_order_status_report(
     }
 
     if let Some(avg_px) = order.avg_px {
-        report = report.with_avg_px(avg_px);
+        report = report.with_avg_px(avg_px)?;
     }
 
     if let Some(trigger_price) = order.stop_px {
@@ -665,6 +765,38 @@ pub fn parse_order_status_report(
             contingency_type = ?report.contingency_type,
             "BitMEX order missing clOrdLinkID for contingent order",
         );
+    }
+
+    // Extract rejection/cancellation reason
+    if order_status == OrderStatus::Rejected {
+        if let Some(reason) = order.ord_rej_reason.or(order.text) {
+            tracing::debug!(
+                order_id = ?order.order_id,
+                client_order_id = ?order.cl_ord_id,
+                reason = ?reason,
+                "Order rejected with reason"
+            );
+            report = report.with_cancel_reason(clean_reason(reason.as_ref()));
+        } else {
+            tracing::debug!(
+                order_id = ?order.order_id,
+                client_order_id = ?order.cl_ord_id,
+                ord_status = ?order.ord_status,
+                ord_rej_reason = ?order.ord_rej_reason,
+                text = ?order.text,
+                "Order rejected without reason from BitMEX"
+            );
+        }
+    } else if order_status == OrderStatus::Canceled
+        && let Some(reason) = order.ord_rej_reason.or(order.text)
+    {
+        tracing::trace!(
+            order_id = ?order.order_id,
+            client_order_id = ?order.cl_ord_id,
+            reason = ?reason,
+            "Order canceled with reason"
+        );
+        report = report.with_cancel_reason(clean_reason(reason.as_ref()));
     }
 
     // BitMEX does not currently include an explicit expiry timestamp
@@ -726,10 +858,8 @@ pub fn parse_fill_report(
     // Map BitMEX currency to standard currency code
     let settlement_currency_str = exec.settl_currency.unwrap_or(Ustr::from("XBT")).as_str();
     let mapped_currency = map_bitmex_currency(settlement_currency_str);
-    let commission = Money::new(
-        exec.commission.unwrap_or(0.0),
-        Currency::from(mapped_currency.as_str()),
-    );
+    let currency = get_currency(&mapped_currency);
+    let commission = Money::new(exec.commission.unwrap_or(0.0), currency);
     let liquidity_side = parse_liquidity_side(&exec.last_liquidity_ind);
     let client_order_id = exec.cl_ord_id.map(ClientOrderId::new);
     let venue_position_id = None; // Not applicable on BitMEX
@@ -788,14 +918,12 @@ pub fn parse_position_report(
     ))
 }
 
-/// Returns the currency either from the internal currency map or creates a default crypto.
-fn get_currency(code: String) -> Currency {
-    CURRENCY_MAP
-        .lock()
-        .unwrap()
-        .get(&code)
-        .copied()
-        .unwrap_or(Currency::new(&code, 8, 0, &code, CurrencyType::Crypto))
+/// Returns a currency from the internal map or creates a new crypto currency.
+///
+/// Uses [`Currency::get_or_create_crypto`] to handle unknown currency codes,
+/// which automatically registers newly listed BitMEX assets.
+pub fn get_currency(code: &str) -> Currency {
+    Currency::get_or_create_crypto(code)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -808,7 +936,6 @@ mod tests {
     use nautilus_model::{
         data::{BarSpecification, BarType},
         enums::{AggregationSource, BarAggregation, LiquiditySide, PositionSide, PriceType},
-        types::Price,
     };
     use rstest::rstest;
     use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -1033,7 +1160,7 @@ mod tests {
             foreign_notional: None,
         };
 
-        let bar = parse_trade_bin(bin.clone(), &instrument_any, &bar_type, ts_init).unwrap();
+        let bar = parse_trade_bin(bin, &instrument_any, &bar_type, ts_init).unwrap();
 
         let precision = instrument_any.price_precision();
         let expected_high = Price::from_decimal(Decimal::from_str("50010.0").unwrap(), precision)
@@ -1178,6 +1305,388 @@ mod tests {
         assert!(report.trigger_price.is_none());
         assert!(!report.post_only);
         assert!(!report.reduce_only);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_missing_order_qty_reconstructed() {
+        let order = BitmexOrder {
+            account: 789012,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("aaaabbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-cancel-test")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: Some(BitmexOrderStatus::Canceled),
+            order_qty: None,      // Missing - should be reconstructed
+            cum_qty: Some(75),    // Filled 75
+            leaves_qty: Some(25), // Remaining 25
+            price: Some(45000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            avg_px: Some(45050.0),
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        // Verify order_qty was reconstructed from cum_qty + leaves_qty
+        assert_eq!(report.quantity.as_f64(), 100.0); // 75 + 25
+        assert_eq!(report.filled_qty.as_f64(), 75.0);
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_uses_provided_order_qty() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("bbbbcccc-dddd-eeee-ffff-000000000000").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-provided-qty")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Sell),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: Some(BitmexOrderStatus::PartiallyFilled),
+            order_qty: Some(150),  // Explicitly provided
+            cum_qty: Some(50),     // Filled 50
+            leaves_qty: Some(100), // Remaining 100
+            price: Some(48000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(true),
+            ord_rej_reason: None,
+            avg_px: Some(48100.0),
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        // Verify order_qty was used directly (not reconstructed)
+        assert_eq!(report.quantity.as_f64(), 150.0);
+        assert_eq!(report.filled_qty.as_f64(), 50.0);
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_missing_order_qty_fails() {
+        let order = BitmexOrder {
+            account: 789012,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("aaaabbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-fail-test")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: Some(BitmexOrderStatus::PartiallyFilled),
+            order_qty: None,   // Missing
+            cum_qty: Some(75), // Present
+            leaves_qty: None,  // Missing - cannot reconstruct
+            price: Some(45000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+
+        // Should fail because we cannot reconstruct order_qty
+        let result = parse_order_status_report(&order, &instrument, UnixNanos::from(1));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Order missing order_qty and cannot reconstruct")
+        );
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_canceled_missing_all_quantities() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("ffff0000-1111-2222-3333-444444444444").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-cancel-no-qty")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: Some(BitmexOrderStatus::Canceled),
+            order_qty: None,  // Missing
+            cum_qty: None,    // Missing
+            leaves_qty: None, // Missing
+            price: Some(50000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        // For canceled orders with missing quantities, parser uses 0 (will be reconciled from cache)
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.quantity.as_f64(), 0.0);
+        assert_eq!(report.filled_qty.as_f64(), 0.0);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_rejected_with_reason() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("ccccdddd-eeee-ffff-0000-111111111111").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-rejected")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: Some(BitmexOrderStatus::Rejected),
+            order_qty: Some(100),
+            cum_qty: Some(0),
+            leaves_qty: Some(0),
+            price: Some(50000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: Some(Ustr::from("Insufficient margin")),
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(
+            report.cancel_reason,
+            Some("Insufficient margin".to_string())
+        );
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_rejected_with_text_fallback() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("ddddeeee-ffff-0000-1111-222222222222").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-rejected-text")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Sell),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: Some(BitmexOrderStatus::Rejected),
+            order_qty: Some(100),
+            cum_qty: Some(0),
+            leaves_qty: Some(0),
+            price: Some(50000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: Some(Ustr::from("Order would immediately execute")),
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(
+            report.cancel_reason,
+            Some("Order would immediately execute".to_string())
+        );
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_rejected_without_reason() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("eeeeffff-0000-1111-2222-333333333333").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-rejected-no-reason")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Market),
+            time_in_force: Some(BitmexTimeInForce::ImmediateOrCancel),
+            ord_status: Some(BitmexOrderStatus::Rejected),
+            order_qty: Some(50),
+            cum_qty: Some(0),
+            leaves_qty: Some(0),
+            price: None,
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(report.cancel_reason, None);
     }
 
     #[rstest]
@@ -1770,9 +2279,11 @@ mod tests {
             root_symbol: Ustr::from("XBT"),
             state: BitmexInstrumentState::Open,
             instrument_type: BitmexInstrumentType::Spot,
-            listing: DateTime::parse_from_rfc3339("2016-05-13T12:00:00.000Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            listing: Some(
+                DateTime::parse_from_rfc3339("2016-05-13T12:00:00.000Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             front: Some(
                 DateTime::parse_from_rfc3339("2016-05-13T12:00:00.000Z")
                     .unwrap()
@@ -1867,6 +2378,10 @@ mod tests {
             min_tick: None,
             funding_base_rate: None,
             funding_quote_rate: None,
+            capped: None,
+            opening_timestamp: None,
+            closing_timestamp: None,
+            prev_total_volume: None,
         }
     }
 
@@ -1876,9 +2391,11 @@ mod tests {
             root_symbol: Ustr::from("XBT"),
             state: BitmexInstrumentState::Open,
             instrument_type: BitmexInstrumentType::PerpetualContract,
-            listing: DateTime::parse_from_rfc3339("2016-05-13T12:00:00.000Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            listing: Some(
+                DateTime::parse_from_rfc3339("2016-05-13T12:00:00.000Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             front: Some(
                 DateTime::parse_from_rfc3339("2016-05-13T12:00:00.000Z")
                     .unwrap()
@@ -1893,10 +2410,10 @@ mod tests {
             underlying_symbol: Some(Ustr::from("XBT=")),
             reference: Some(Ustr::from("BMEX")),
             reference_symbol: Some(Ustr::from(".BXBT")),
-            lot_size: Some(1.0),
+            lot_size: Some(100.0),
             tick_size: 0.5,
-            multiplier: -1.0,
-            settl_currency: Some(Ustr::from("XBT")),
+            multiplier: -100000000.0,
+            settl_currency: Some(Ustr::from("XBt")),
             is_quanto: false,
             is_inverse: true,
             maker_fee: Some(-0.00025),
@@ -1943,9 +2460,9 @@ mod tests {
             calc_interval: None,
             publish_interval: None,
             publish_time: None,
-            underlying_to_position_multiplier: Some(1.0),
-            underlying_to_settle_multiplier: None,
-            quote_to_settle_multiplier: Some(0.00000001),
+            underlying_to_position_multiplier: None,
+            underlying_to_settle_multiplier: Some(-100000000.0),
+            quote_to_settle_multiplier: None,
             init_margin: Some(0.01),
             maint_margin: Some(0.005),
             risk_limit: Some(20000000000.0),
@@ -1982,6 +2499,10 @@ mod tests {
             settled_price: None,
             instant_pnl: false,
             min_tick: None,
+            capped: None,
+            opening_timestamp: None,
+            closing_timestamp: None,
+            prev_total_volume: None,
         }
     }
 
@@ -1991,9 +2512,11 @@ mod tests {
             root_symbol: Ustr::from("XBT"),
             state: BitmexInstrumentState::Open,
             instrument_type: BitmexInstrumentType::Futures,
-            listing: DateTime::parse_from_rfc3339("2024-09-27T12:00:00.000Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            listing: Some(
+                DateTime::parse_from_rfc3339("2024-09-27T12:00:00.000Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             front: Some(
                 DateTime::parse_from_rfc3339("2024-12-27T12:00:00.000Z")
                     .unwrap()
@@ -2016,10 +2539,10 @@ mod tests {
             underlying_symbol: Some(Ustr::from("XBT=")),
             reference: Some(Ustr::from("BMEX")),
             reference_symbol: Some(Ustr::from(".BXBT30M")),
-            lot_size: Some(1.0),
+            lot_size: Some(100.0),
             tick_size: 0.5,
-            multiplier: -1.0,
-            settl_currency: Some(Ustr::from("XBT")),
+            multiplier: -100000000.0,
+            settl_currency: Some(Ustr::from("XBt")),
             is_quanto: false,
             is_inverse: true,
             maker_fee: Some(-0.00025),
@@ -2058,9 +2581,9 @@ mod tests {
             calc_interval: None,
             publish_interval: None,
             publish_time: None,
-            underlying_to_position_multiplier: Some(1.0),
-            underlying_to_settle_multiplier: None,
-            quote_to_settle_multiplier: Some(0.00000001),
+            underlying_to_position_multiplier: None,
+            underlying_to_settle_multiplier: Some(-100000000.0),
+            quote_to_settle_multiplier: None,
             init_margin: Some(0.02),
             maint_margin: Some(0.01),
             risk_limit: Some(20000000000.0),
@@ -2097,6 +2620,10 @@ mod tests {
             settled_price: None,
             instant_pnl: false,
             min_tick: None,
+            capped: None,
+            opening_timestamp: None,
+            closing_timestamp: None,
+            prev_total_volume: None,
         }
     }
 
@@ -2178,5 +2705,224 @@ mod tests {
             }
             _ => panic!("Expected CryptoFuture variant"),
         }
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_missing_ord_status_infers_filled() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-filled")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: None, // Missing - should infer Filled
+            order_qty: Some(100),
+            cum_qty: Some(100), // Fully filled
+            price: Some(50000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            leaves_qty: Some(0), // No remaining quantity
+            avg_px: Some(50050.0),
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.account_id.to_string(), "BITMEX-123456");
+        assert_eq!(report.filled_qty.as_f64(), 100.0);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_missing_ord_status_infers_canceled() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("b2c3d4e5-f6a7-8901-bcde-f12345678901").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-canceled")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Sell),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: None, // Missing - should infer Canceled
+            order_qty: Some(200),
+            cum_qty: Some(0), // Nothing filled
+            price: Some(60000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(false),
+            ord_rej_reason: None,
+            leaves_qty: Some(0), // No remaining quantity
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: Some(Ustr::from("Canceled: Already filled")),
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let report = parse_order_status_report(&order, &instrument, UnixNanos::from(1)).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.account_id.to_string(), "BITMEX-123456");
+        assert_eq!(report.filled_qty.as_f64(), 0.0);
+        // Verify text/reason is still captured
+        assert_eq!(
+            report.cancel_reason.as_ref().unwrap(),
+            "Canceled: Already filled"
+        );
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_missing_ord_status_with_leaves_qty_fails() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("c3d4e5f6-a7b8-9012-cdef-123456789012").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-partial")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: None, // Missing
+            order_qty: Some(100),
+            cum_qty: Some(50),
+            price: Some(50000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(true),
+            ord_rej_reason: None,
+            leaves_qty: Some(50), // Still has remaining qty - can't infer status
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let result = parse_order_status_report(&order, &instrument, UnixNanos::from(1));
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("missing ord_status"));
+        assert!(err_msg.contains("cannot infer"));
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_missing_ord_status_no_quantities_fails() {
+        let order = BitmexOrder {
+            account: 123456,
+            symbol: Some(Ustr::from("XBTUSD")),
+            order_id: Uuid::parse_str("d4e5f6a7-b8c9-0123-def0-123456789013").unwrap(),
+            cl_ord_id: Some(Ustr::from("client-unknown")),
+            cl_ord_link_id: None,
+            side: Some(BitmexSide::Buy),
+            ord_type: Some(BitmexOrderType::Limit),
+            time_in_force: Some(BitmexTimeInForce::GoodTillCancel),
+            ord_status: None, // Missing
+            order_qty: Some(100),
+            cum_qty: None, // Missing
+            price: Some(50000.0),
+            stop_px: None,
+            display_qty: None,
+            peg_offset_value: None,
+            peg_price_type: None,
+            currency: Some(Ustr::from("USD")),
+            settl_currency: Some(Ustr::from("XBt")),
+            exec_inst: None,
+            contingency_type: None,
+            ex_destination: None,
+            triggered: None,
+            working_indicator: Some(true),
+            ord_rej_reason: None,
+            leaves_qty: None, // Missing
+            avg_px: None,
+            multi_leg_reporting_type: None,
+            text: None,
+            transact_time: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            timestamp: Some(
+                DateTime::parse_from_rfc3339("2024-01-01T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        };
+
+        let instrument =
+            parse_perpetual_instrument(&create_test_perpetual_instrument(), UnixNanos::default())
+                .unwrap();
+        let result = parse_order_status_report(&order, &instrument, UnixNanos::from(1));
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("missing ord_status"));
+        assert!(err_msg.contains("cannot infer"));
     }
 }

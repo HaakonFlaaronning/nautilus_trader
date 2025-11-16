@@ -16,7 +16,7 @@ and live deployment workloads.
 
 The platform is also universal and asset-class-agnostic — with any REST API or WebSocket stream able to be integrated via modular
 adapters. It supports high-frequency trading across a wide range of asset classes and instrument types
-including FX, Equities, Futures, Options, Crypto, DeFi, and Betting, enabling seamless operations across multiple venues simultaneously.
+including FX, Equities, Futures, Options, Crypto, DeFi, and Betting — enabling seamless operations across multiple venues simultaneously.
 
 ## Features
 
@@ -140,7 +140,7 @@ A valid UUID v4 consists of:
 
 Example: `2d89666b-1a1e-4a75-b193-4eb3b454c757`
 
-For the complete specification, refer to [RFC 4122: A Universally Unique IDentifier (UUID) URN Namespace](https://datatracker.ietf.org/doc/html/rfc4122).
+For the complete specification, refer to [RFC 4122: A Universally Unique IIdentifier (UUID) URN Namespace](https://datatracker.ietf.org/doc/html/rfc4122).
 
 ## Data types
 

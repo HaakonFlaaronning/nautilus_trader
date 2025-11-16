@@ -42,7 +42,6 @@ cdef class BarBuilder:
     cdef readonly int count
     """The builders current update count.\n\n:returns: `int`"""
 
-    cdef bint _partial_set
     cdef Price _last_close
     cdef Price _open
     cdef Price _high
@@ -50,7 +49,6 @@ cdef class BarBuilder:
     cdef Price _close
     cdef Quantity volume
 
-    cpdef void set_partial(self, Bar partial_bar)
     cpdef void update(self, Price price, Quantity size, uint64_t ts_init)
     cpdef void update_bar(self, Bar bar, Quantity volume, uint64_t ts_init)
     cpdef void reset(self)
@@ -63,17 +61,19 @@ cdef class BarAggregator:
     cdef BarBuilder _builder
     cdef object _handler
     cdef object _handler_backup
-    cdef bint _await_partial
-    cdef bint _batch_mode
-    cdef public bint is_running
 
     cdef readonly BarType bar_type
     """The aggregators bar type.\n\n:returns: `BarType`"""
+    cdef readonly bint historical_mode
+    """If the aggregator is processing historical data.\n\n:returns: `bool`"""
+    cdef readonly bint is_running
+    """If the aggregator is receiving data from the message bus.\n\n:returns: `bool`"""
 
+    cpdef void set_historical_mode(self, bint historical_mode, handler)
+    cpdef void set_running(self, bint is_running)
     cpdef void handle_quote_tick(self, QuoteTick tick)
     cpdef void handle_trade_tick(self, TradeTick tick)
     cpdef void handle_bar(self, Bar bar)
-    cpdef void set_partial(self, Bar partial_bar)
     cdef void _apply_update(self, Price price, Quantity size, uint64_t ts_init)
     cdef void _apply_update_bar(self, Bar bar, Quantity volume, uint64_t ts_init)
     cdef void _build_now_and_send(self)
@@ -101,9 +101,12 @@ cdef class RenkoBarAggregator(BarAggregator):
 
 cdef class TimeBarAggregator(BarAggregator):
     cdef Clock _clock
-    cdef bint _build_on_next_tick
-    cdef uint64_t _stored_open_ns
-    cdef uint64_t _stored_close_ns
+
+    cdef readonly timedelta interval
+    cdef readonly uint64_t interval_ns
+    cdef readonly uint64_t next_close_ns
+    cdef readonly uint64_t stored_open_ns
+
     cdef str _timer_name
     cdef bint _is_left_open
     cdef bint _timestamp_on_close
@@ -111,21 +114,13 @@ cdef class TimeBarAggregator(BarAggregator):
     cdef bint _build_with_no_updates
     cdef int _bar_build_delay
     cdef bint _add_delay
-    cdef uint64_t _batch_open_ns
-    cdef uint64_t _batch_next_close_ns
     cdef object _time_bars_origin_offset
+    cdef list _historical_events
 
-    cdef readonly timedelta interval
-    """The aggregators time interval.\n\n:returns: `timedelta`"""
-    cdef readonly uint64_t interval_ns
-    """The aggregators time interval.\n\n:returns: `uint64_t`"""
-    cdef readonly uint64_t next_close_ns
-    """The aggregators next closing time.\n\n:returns: `uint64_t`"""
-
-    cpdef void stop(self)
-    cdef timedelta _get_interval(self)
+    cpdef void set_clock(self, Clock clock)
     cdef uint64_t _get_interval_ns(self)
-    cpdef void _set_build_timer(self)
-    cdef void _batch_pre_update(self, uint64_t time_ns)
-    cdef void _batch_post_update(self, uint64_t time_ns)
+    cpdef void start_timer(self)
+    cpdef void stop_timer(self)
+    cdef void _preprocess_historical_events(self, uint64_t ts_init)
+    cdef void _postprocess_historical_events(self, uint64_t ts_init)
     cpdef void _build_bar(self, TimeEvent event)

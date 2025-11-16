@@ -297,7 +297,7 @@ impl Serialize for LogLineWrapper {
         json_obj.insert("level".to_string(), self.line.level.to_string());
         json_obj.insert("color".to_string(), self.line.color.to_string());
         json_obj.insert("component".to_string(), self.line.component.to_string());
-        json_obj.insert("message".to_string(), self.line.message.to_string());
+        json_obj.insert("message".to_string(), self.line.message.clone());
 
         json_obj.serialize(serializer)
     }
@@ -401,7 +401,7 @@ impl Logger {
         set_boxed_logger(Box::new(logger))?;
 
         // Store the sender globally so additional guards can be created
-        if LOGGER_TX.set(tx.clone()).is_err() {
+        if LOGGER_TX.set(tx).is_err() {
             debug_assert!(
                 false,
                 "LOGGER_TX already set - re-initialization not supported"
@@ -472,12 +472,7 @@ impl Logger {
         let mut file_writer_opt = if fileout_level == LevelFilter::Off {
             None
         } else {
-            FileWriter::new(
-                trader_id.clone(),
-                instance_id.clone(),
-                file_config.clone(),
-                fileout_level,
-            )
+            FileWriter::new(trader_id, instance_id, file_config, fileout_level)
         };
 
         let process_event = |event: LogEvent,
@@ -587,9 +582,14 @@ impl Logger {
     }
 }
 
-/// Gracefully shuts down the logging subsystem by preventing new log events,
-/// signaling the logging thread to close, draining pending messages, and joining
-/// the logging thread.
+/// Gracefully shuts down the logging subsystem.
+///
+/// Performs the same shutdown sequence as dropping the last `LogGuard`, but can be called
+/// explicitly for deterministic shutdown timing (e.g., testing or Windows Python applications).
+///
+/// # Safety
+///
+/// Safe to call multiple times. Thread join is skipped if called from the logging thread.
 pub(crate) fn shutdown_graceful() {
     // Prevent further logging
     LOGGING_BYPASSED.store(true, Ordering::SeqCst);
@@ -648,6 +648,14 @@ pub fn log<T: AsRef<str>>(level: LogLevel, color: LogColor, component: Ustr, mes
 /// - All log messages are properly flushed when intermediate guards are dropped.
 /// - The logging thread is cleanly terminated and joined when the last guard is dropped.
 ///
+/// # Shutdown Behavior
+///
+/// When the last guard is dropped, the logging thread is signaled to close, drains pending
+/// messages, and is joined to ensure all logs are written before process termination.
+///
+/// **Python on Windows:** Non-deterministic GC order during interpreter shutdown can
+/// occasionally prevent proper thread join, resulting in truncated logs.
+///
 /// # Limits
 ///
 /// The system supports a maximum of 255 concurrent `LogGuard` instances.
@@ -687,6 +695,10 @@ impl LogGuard {
 }
 
 impl Drop for LogGuard {
+    /// Handles cleanup when a `LogGuard` is dropped.
+    ///
+    /// Sends `Flush` if other guards remain active, otherwise sends `Close`, joins the
+    /// logging thread, and resets the subsystem state.
     fn drop(&mut self) {
         let previous_count = LOGGING_GUARDS_ACTIVE
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
@@ -734,7 +746,7 @@ impl Drop for LogGuard {
 ////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, thread::sleep, time::Duration};
+    use std::{collections::HashMap, time::Duration};
 
     use log::LevelFilter;
     use nautilus_core::UUID4;
@@ -880,7 +892,6 @@ mod tests {
                         .find(|entry| entry.path().is_file())
                         .expect("No files found in directory")
                         .path();
-                    dbg!(&log_file_path);
                     log_contents = std::fs::read_to_string(log_file_path)
                         .expect("Error while reading log file");
                     !log_contents.is_empty()
@@ -1068,96 +1079,6 @@ mod tests {
                 log_contents,
                 "{\"timestamp\":\"1970-01-20T02:20:00.000000000Z\",\"trader_id\":\"TRADER-001\",\"level\":\"INFO\",\"color\":\"NORMAL\",\"component\":\"RiskEngine\",\"message\":\"This is a test.\"}\n"
             );
-        }
-
-        #[ignore = "Flaky test: Passing locally on some systems, failing in CI"]
-        #[rstest]
-        fn test_file_rotation_and_backup_limits() {
-            // Create a temporary directory for log files
-            let temp_dir = tempdir().expect("Failed to create temporary directory");
-            let dir_path = temp_dir.path().to_str().unwrap().to_string();
-
-            // Configure a small max file size to trigger rotation quickly
-            let max_backups = 3;
-            let max_file_size = 100;
-            let file_config = FileWriterConfig {
-                directory: Some(dir_path.clone()),
-                file_name: None,
-                file_format: Some("log".to_string()),
-                file_rotate: Some((max_file_size, max_backups).into()), // 100 bytes max size, 3 max backups
-            };
-
-            // Create the file writer
-            let config = LoggerConfig::from_spec("fileout=Info;Test=Info").unwrap();
-            let log_guard = Logger::init_with_config(
-                TraderId::from("TRADER-001"),
-                UUID4::new(),
-                config,
-                file_config,
-            );
-
-            log::info!(
-                component = "Test";
-                "Test log message with enough content to exceed our small max file size limit"
-            );
-
-            sleep(Duration::from_millis(100));
-
-            // Count the number of log files in the directory
-            let files: Vec<_> = std::fs::read_dir(&dir_path)
-                .expect("Failed to read directory")
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
-                .collect();
-
-            // We should have multiple files due to rotation
-            assert_eq!(files.len(), 1);
-
-            log::info!(
-                component = "Test";
-                "Test log message with enough content to exceed our small max file size limit"
-            );
-
-            sleep(Duration::from_millis(100));
-
-            // Count the number of log files in the directory
-            let files: Vec<_> = std::fs::read_dir(&dir_path)
-                .expect("Failed to read directory")
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
-                .collect();
-
-            // We should have multiple files due to rotation
-            assert_eq!(files.len(), 2);
-
-            for _ in 0..5 {
-                // Write enough data to trigger a few rotations
-                log::info!(
-                component = "Test";
-                "Test log message with enough content to exceed our small max file size limit"
-                );
-
-                sleep(Duration::from_millis(100));
-            }
-
-            // Count the number of log files in the directory
-            let files: Vec<_> = std::fs::read_dir(&dir_path)
-                .expect("Failed to read directory")
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
-                .collect();
-
-            // We should have at most max_backups + 1 files (current file + backups)
-            assert!(
-                files.len() == max_backups as usize + 1,
-                "Expected at most {} log files, found {}",
-                max_backups,
-                files.len()
-            );
-
-            // Clean up
-            drop(log_guard);
-            drop(temp_dir);
         }
     }
 }

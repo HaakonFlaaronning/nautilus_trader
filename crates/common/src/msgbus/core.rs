@@ -16,7 +16,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fmt::{self, Display},
+    fmt::Display,
     hash::{Hash, Hasher},
     ops::Deref,
     rc::Rc,
@@ -28,7 +28,7 @@ use indexmap::IndexMap;
 use matching::is_matching_backtracking;
 use nautilus_core::{
     UUID4,
-    correctness::{FAILED, check_predicate_true, check_valid_string},
+    correctness::{FAILED, check_predicate_true, check_valid_string_ascii},
 };
 use nautilus_model::identifiers::TraderId;
 use switchboard::MessagingSwitchboard;
@@ -64,7 +64,7 @@ pub struct MStr<T> {
 }
 
 impl<T> Display for MStr<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.value)
     }
 }
@@ -112,7 +112,7 @@ impl MStr<Topic> {
     /// Returns an error if the topic has white space or invalid characters.
     pub fn topic<T: AsRef<str>>(value: T) -> anyhow::Result<Self> {
         let topic = Ustr::from(value.as_ref());
-        check_valid_string(value, stringify!(value))?;
+        check_valid_string_ascii(value, stringify!(value))?;
         check_fully_qualified_string(&topic, stringify!(Topic))?;
 
         Ok(Self {
@@ -136,7 +136,7 @@ impl MStr<Endpoint> {
     /// Returns an error if the endpoint has white space or invalid characters.
     pub fn endpoint<T: AsRef<str>>(value: T) -> anyhow::Result<Self> {
         let endpoint = Ustr::from(value.as_ref());
-        check_valid_string(value, stringify!(value))?;
+        check_valid_string_ascii(value, stringify!(value))?;
         check_fully_qualified_string(&endpoint, stringify!(Endpoint))?;
 
         Ok(Self {
@@ -325,8 +325,7 @@ impl MessageBus {
         let topic = MStr::<Topic>::topic(topic).expect(FAILED);
         self.topics
             .get(&topic)
-            .map(|subs| subs.len())
-            .unwrap_or_else(|| self.find_topic_matches(topic).len())
+            .map_or_else(|| self.find_topic_matches(topic).len(), |subs| subs.len())
     }
 
     /// Returns active subscriptions.
@@ -458,7 +457,7 @@ impl MessageBus {
     // }
 
     /// Registers message bus for the current thread.
-    pub fn register_message_bus(self) -> Rc<RefCell<MessageBus>> {
+    pub fn register_message_bus(self) -> Rc<RefCell<Self>> {
         let msgbus = Rc::new(RefCell::new(self));
         set_message_bus(msgbus.clone());
         msgbus

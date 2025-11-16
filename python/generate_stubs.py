@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# -------------------------------------------------------------------------------------------------
+#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  https://nautechsystems.io
+#
+#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+#  You may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+# -------------------------------------------------------------------------------------------------
 """
 Custom build script for nautilus-trader v2 with automatic stub generation.
 
@@ -54,10 +68,10 @@ def resolve_python_stub_root(pyproject: dict) -> Path:
     python_dir = Path(__file__).parent.resolve()
     try:
         dest_dir.relative_to(python_dir)
-    except ValueError as exc:  # pragma: no cover - defensive
+    except ValueError as e:  # pragma: no cover - defensive
         raise RuntimeError(
             "python-source must stay within the python/ package directory",
-        ) from exc
+        ) from e
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     return dest_dir
@@ -195,9 +209,11 @@ MODULE_FIXUPS: dict[str, StubFixup] = {
     ),
     "infrastructure": StubFixup(
         classes=("PostgresConnectOptions",),
-        imports=("import typing",),
+        imports=(
+            "import builtins",
+            "import typing",
+        ),
         placeholders=(
-            "class PostgresConnectOptions: ...",
             "",
             '__all__ = ["PostgresConnectOptions"]',
         ),
@@ -263,6 +279,7 @@ def relocate_class_stubs(root: Path) -> None:
         content = (
             "\n".join(header + imports_section + ["", "\n".join(body_parts), ""]).strip("\n") + "\n"
         )
+        content = normalize_type_hints(content)
         target_file.write_text(content)
 
     lib_stub.write_text(remaining.strip() + "\n")
@@ -296,6 +313,17 @@ def rename_methods(block: str) -> str:
     return block
 
 
+def normalize_type_hints(content: str) -> str:
+    """
+    Normalize type hints in generated stub content.
+    """
+    # Replace enum.Enum with Enum when "from enum import Enum" is present
+    if "from enum import Enum" in content:
+        content = re.sub(r"\benum\.Enum\b", "Enum", content)
+
+    return content
+
+
 def apply_runtime_module_fixups() -> None:
     """
     Runtime alias fixups temporarily disabled during cleanup.
@@ -316,7 +344,7 @@ def build_extension():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Nautilus Trader v2 build script")
+    parser = argparse.ArgumentParser(description="NautilusTrader v2 build script")
     parser.add_argument(
         "action",
         nargs="?",
@@ -330,13 +358,11 @@ def main():
     print(f"Starting nautilus-trader v2 {args.action}...")
 
     try:
-        if args.action in ["stubs", "all"]:
-            if not generate_stubs():
-                return 1
+        if args.action in ["stubs", "all"] and not generate_stubs():
+            return 1
 
-        if args.action in ["build", "all"]:
-            if not build_extension():
-                return 1
+        if args.action in ["build", "all"] and not build_extension():
+            return 1
 
         print(f"{'Build' if args.action != 'stubs' else 'Stub generation'} completed successfully")
         return 0

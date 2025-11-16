@@ -46,7 +46,10 @@ use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
     data::bar::BarType,
     identifiers::{AccountId, InstrumentId},
-    python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
+    python::{
+        data::data_to_pycapsule,
+        instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+    },
 };
 use pyo3::{conversion::IntoPyObjectExt, exceptions::PyRuntimeError, prelude::*};
 
@@ -55,19 +58,26 @@ use crate::websocket::{BitmexWebSocketClient, messages::NautilusWsMessage};
 #[pymethods]
 impl BitmexWebSocketClient {
     #[new]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, account_id=None, heartbeat=None))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, account_id=None, heartbeat=None, testnet=false))]
     fn py_new(
         url: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
+        testnet: bool,
     ) -> PyResult<Self> {
         // If both api_key and api_secret are None, try to load from environment
         let (final_api_key, final_api_secret) = if api_key.is_none() && api_secret.is_none() {
-            // Try to load from environment variables
-            let env_key = std::env::var("BITMEX_API_KEY").ok();
-            let env_secret = std::env::var("BITMEX_API_SECRET").ok();
+            // Choose environment variables based on testnet flag
+            let (key_var, secret_var) = if testnet {
+                ("BITMEX_TESTNET_API_KEY", "BITMEX_TESTNET_API_SECRET")
+            } else {
+                ("BITMEX_API_KEY", "BITMEX_API_SECRET")
+            };
+
+            let env_key = std::env::var(key_var).ok();
+            let env_secret = std::env::var(secret_var).ok();
             (env_key, env_secret)
         } else {
             (api_key, api_secret)
@@ -117,6 +127,13 @@ impl BitmexWebSocketClient {
         self.set_account_id(account_id);
     }
 
+    #[pyo3(name = "cache_instrument")]
+    fn py_cache_instrument(&self, py: Python, instrument: Py<PyAny>) -> PyResult<()> {
+        let inst_any = pyobject_to_instrument_any(py, instrument)?;
+        self.cache_instrument(inst_any);
+        Ok(())
+    }
+
     #[pyo3(name = "connect")]
     fn py_connect<'py>(
         &mut self,
@@ -130,8 +147,10 @@ impl BitmexWebSocketClient {
             instruments_any.push(inst_any);
         }
 
-        self.initialize_instruments_cache(instruments_any);
+        self.cache_instruments(instruments_any);
 
+        // We need to clone self to move into the async block,
+        // the clone will be connected and kept alive to maintain the handler.
         let mut client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -140,6 +159,7 @@ impl BitmexWebSocketClient {
             let stream = client.stream();
 
             tokio::spawn(async move {
+                let _client = client; // Keep client alive for the entire duration
                 tokio::pin!(stream);
 
                 while let Some(msg) = stream.next().await {
@@ -148,6 +168,13 @@ impl BitmexWebSocketClient {
                             for data in data_vec {
                                 let py_obj = data_to_pycapsule(py, data);
                                 call_python(py, &callback, py_obj);
+                            }
+                        }
+                        NautilusWsMessage::Instruments(instruments) => {
+                            for instrument in instruments {
+                                if let Ok(py_obj) = instrument_any_to_pyobject(py, instrument) {
+                                    call_python(py, &callback, py_obj);
+                                }
                             }
                         }
                         NautilusWsMessage::OrderStatusReports(reports) => {
@@ -186,7 +213,8 @@ impl BitmexWebSocketClient {
                                 call_python(py, &callback, py_obj);
                             }
                         }
-                        NautilusWsMessage::Reconnected => {} // Nothing to handle
+                        NautilusWsMessage::Reconnected => {}
+                        NautilusWsMessage::Authenticated => {}
                     });
                 }
             });

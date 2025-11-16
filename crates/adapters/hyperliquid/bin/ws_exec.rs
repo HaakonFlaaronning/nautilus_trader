@@ -15,7 +15,10 @@
 
 use std::{env, time::Duration};
 
-use nautilus_hyperliquid::{common::consts::ws_url, websocket::client::HyperliquidWebSocketClient};
+use nautilus_hyperliquid::{
+    common::{HyperliquidProductType, consts::ws_url},
+    websocket::client::HyperliquidWebSocketClient,
+};
 use tokio::{pin, signal};
 use tracing::level_filters::LevelFilter;
 
@@ -34,11 +37,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = ws_url(testnet);
     tracing::info!("WebSocket URL: {ws_url}");
 
-    let mut client = HyperliquidWebSocketClient::connect(ws_url).await?;
+    let mut client = HyperliquidWebSocketClient::new(
+        Some(ws_url.to_string()),
+        testnet,
+        HyperliquidProductType::Perp,
+        None,
+    );
+    client.connect().await?;
     tracing::info!("Connected to Hyperliquid WebSocket");
 
     // Subscribe to execution channels
-    let user_addr = std::env::var("HYPERLIQUID_USER_ADDRESS")
+    let user_addr = env::var("HYPERLIQUID_USER_ADDRESS")
         .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string());
 
     // Subscribe to all user channels using the convenience method

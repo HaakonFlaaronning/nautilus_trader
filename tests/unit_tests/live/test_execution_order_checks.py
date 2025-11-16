@@ -21,6 +21,7 @@ checks during live trading.
 """
 
 import asyncio
+import contextlib
 from decimal import Decimal
 
 import pytest
@@ -117,13 +118,12 @@ def fixture_instrument_provider():
 
 
 @pytest.fixture(name="exec_client")
-def fixture_exec_client(msgbus, cache, clock, instrument_provider):
+def fixture_exec_client(event_loop, msgbus, cache, clock, instrument_provider):
     """
     Create a mock live execution client.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     client = MockLiveExecutionClient(
-        loop=loop,
+        loop=event_loop,
         client_id=ClientId(SIM.value),
         venue=SIM,
         account_type=AccountType.CASH,
@@ -137,13 +137,12 @@ def fixture_exec_client(msgbus, cache, clock, instrument_provider):
 
 
 @pytest.fixture(name="exec_engine_open_check")
-def fixture_exec_engine_open_check(msgbus, cache, clock, exec_client):
+def fixture_exec_engine_open_check(event_loop, msgbus, cache, clock, exec_client):
     """
     Create an execution engine configured for open order checking.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     exec_engine = LiveExecutionEngine(
-        loop=loop,
+        loop=event_loop,
         msgbus=msgbus,
         cache=cache,
         clock=clock,
@@ -162,13 +161,12 @@ def fixture_exec_engine_open_check(msgbus, cache, clock, exec_client):
 
 
 @pytest.fixture(name="exec_engine_inflight_check")
-def fixture_exec_engine_inflight_check(msgbus, cache, clock, exec_client):
+def fixture_exec_engine_inflight_check(event_loop, msgbus, cache, clock, exec_client):
     """
     Create an execution engine configured for inflight order checking.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     exec_engine = LiveExecutionEngine(
-        loop=loop,
+        loop=event_loop,
         msgbus=msgbus,
         cache=cache,
         clock=clock,
@@ -188,13 +186,12 @@ def fixture_exec_engine_inflight_check(msgbus, cache, clock, exec_client):
 
 
 @pytest.fixture(name="exec_engine_basic")
-def fixture_exec_engine_basic(msgbus, cache, clock):
+def fixture_exec_engine_basic(event_loop, msgbus, cache, clock):
     """
     Create a basic execution engine without client.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     exec_engine = LiveExecutionEngine(
-        loop=loop,
+        loop=event_loop,
         msgbus=msgbus,
         cache=cache,
         clock=clock,
@@ -215,13 +212,12 @@ def fixture_exec_engine_alias(exec_engine_continuous):
 
 
 @pytest.fixture(name="exec_engine_combined")
-def fixture_exec_engine_combined(msgbus, cache, clock, exec_client):
+def fixture_exec_engine_combined(event_loop, msgbus, cache, clock, exec_client):
     """
     Create an execution engine for combined reconciliation scenarios.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     exec_engine = LiveExecutionEngine(
-        loop=loop,
+        loop=event_loop,
         msgbus=msgbus,
         cache=cache,
         clock=clock,
@@ -241,13 +237,12 @@ def fixture_exec_engine_combined(msgbus, cache, clock, exec_client):
 
 
 @pytest.fixture(name="exec_engine_open_check_custom_threshold")
-def fixture_exec_engine_open_check_custom_threshold(msgbus, cache, clock, exec_client):
+def fixture_exec_engine_open_check_custom_threshold(event_loop, msgbus, cache, clock, exec_client):
     """
     Create an execution engine with a custom open check threshold.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     exec_engine = LiveExecutionEngine(
-        loop=loop,
+        loop=event_loop,
         msgbus=msgbus,
         cache=cache,
         clock=clock,
@@ -559,22 +554,22 @@ async def test_open_check_periodic_execution(exec_engine_open_check):
     async def counting_check():
         nonlocal check_count
         check_count += 1
-        if check_count >= 2:
-            # Cancel the task after 2 checks
-            if exec_engine._reconciliation_task:
-                exec_engine._reconciliation_task.cancel()
+        # Cancel the task after 2 checks
+        if check_count >= 2 and exec_engine._reconciliation_task:
+            exec_engine._reconciliation_task.cancel()
         return await original_check()
 
     exec_engine._check_orders_consistency = counting_check
+
+    # Set startup reconciliation event so loop can start
+    exec_engine._startup_reconciliation_event.set()
 
     # Act
     task = asyncio.create_task(exec_engine._continuous_reconciliation_loop())
 
     # Wait for task to complete or timeout
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=0.5)
-    except asyncio.CancelledError:
-        pass
 
     # Assert
     assert check_count >= 2
@@ -846,21 +841,21 @@ async def test_inflight_check_periodic_execution(exec_engine_inflight_check):
     async def counting_check():
         nonlocal check_count
         check_count += 1
-        if check_count >= 2:
-            # Cancel the task after 2 checks
-            if exec_engine._reconciliation_task:
-                exec_engine._reconciliation_task.cancel()
+        # Cancel the task after 2 checks
+        if check_count >= 2 and exec_engine._reconciliation_task:
+            exec_engine._reconciliation_task.cancel()
 
     exec_engine._check_inflight_orders = counting_check
+
+    # Set startup reconciliation event so loop can start
+    exec_engine._startup_reconciliation_event.set()
 
     # Act
     task = asyncio.create_task(exec_engine._continuous_reconciliation_loop())
 
     # Wait for task to complete or timeout
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=0.5)
-    except asyncio.CancelledError:
-        pass
 
     # Assert
     assert check_count >= 2
@@ -880,20 +875,20 @@ async def test_inflight_check_handles_exceptions(exec_engine_inflight_check):
         check_count += 1
         if check_count == 1:
             raise RuntimeError("Test error")
-        elif check_count >= 2:
-            if exec_engine._reconciliation_task:
-                exec_engine._reconciliation_task.cancel()
+        elif check_count >= 2 and exec_engine._reconciliation_task:
+            exec_engine._reconciliation_task.cancel()
 
     exec_engine._check_inflight_orders = failing_check
+
+    # Set startup reconciliation event so loop can start
+    exec_engine._startup_reconciliation_event.set()
 
     # Act
     task = asyncio.create_task(exec_engine._continuous_reconciliation_loop())
 
     # Wait for task to complete or timeout
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=0.5)
-    except asyncio.CancelledError:
-        pass
 
     # Assert
     assert check_count >= 2
@@ -1085,13 +1080,12 @@ async def test_reconcile_order_without_client_order_id(
 
 
 @pytest.fixture(name="exec_engine_continuous")
-def fixture_exec_engine_continuous(msgbus, cache, clock, exec_client):
+def fixture_exec_engine_continuous(event_loop, msgbus, cache, clock, exec_client):
     """
     Create an execution engine configured for continuous reconciliation.
     """
-    loop = asyncio.get_event_loop_policy().get_event_loop()
     exec_engine = LiveExecutionEngine(
-        loop=loop,
+        loop=event_loop,
         msgbus=msgbus,
         cache=cache,
         clock=clock,
@@ -1267,22 +1261,22 @@ async def test_reconciliation_loop_runs_both_checks(
     async def counting_consistency_check():
         nonlocal consistency_check_count
         consistency_check_count += 1
-        if consistency_check_count >= 2:
-            # Stop after 2 consistency checks
-            if exec_engine._reconciliation_task:
-                exec_engine._reconciliation_task.cancel()
+        # Stop after 2 consistency checks
+        if consistency_check_count >= 2 and exec_engine._reconciliation_task:
+            exec_engine._reconciliation_task.cancel()
 
     exec_engine._check_inflight_orders = counting_problematic_check
     exec_engine._check_orders_consistency = counting_consistency_check
+
+    # Set startup reconciliation event so loop can start
+    exec_engine._startup_reconciliation_event.set()
 
     # Act
     task = asyncio.create_task(exec_engine._continuous_reconciliation_loop())
 
     # Wait for task to complete or timeout
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=0.5)
-    except asyncio.CancelledError:
-        pass
 
     # Assert
     # Problematic checks should run more frequently (50ms interval)

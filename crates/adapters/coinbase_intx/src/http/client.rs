@@ -26,9 +26,11 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use nautilus_core::{
-    UnixNanos, consts::NAUTILUS_USER_AGENT, env::get_env_var, time::get_atomic_clock_realtime,
+    MUTEX_POISONED, UnixNanos, consts::NAUTILUS_USER_AGENT, env::get_or_env_var,
+    time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
@@ -38,7 +40,10 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{Price, Quantity},
 };
-use nautilus_network::{http::HttpClient, ratelimiter::quota::Quota};
+use nautilus_network::{
+    http::{HttpClient, HttpClientError},
+    ratelimiter::quota::Quota,
+};
 use reqwest::{Method, StatusCode, header::USER_AGENT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ustr::Ustr;
@@ -102,7 +107,7 @@ pub struct CoinbaseIntxHttpInnerClient {
 
 impl Default for CoinbaseIntxHttpInnerClient {
     fn default() -> Self {
-        Self::new(None, Some(60))
+        Self::new(None, Some(60)).expect("Failed to create default Coinbase INTX HTTP client")
     }
 }
 
@@ -112,9 +117,15 @@ impl CoinbaseIntxHttpInnerClient {
     ///
     /// This version of the client has **no credentials**, so it can only
     /// call publicly accessible endpoints.
-    #[must_use]
-    pub fn new(base_url: Option<String>, timeout_secs: Option<u64>) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new(
+        base_url: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Self, HttpClientError> {
+        Ok(Self {
             base_url: base_url.unwrap_or(COINBASE_INTX_REST_URL.to_string()),
             client: HttpClient::new(
                 Self::default_headers(),
@@ -122,22 +133,26 @@ impl CoinbaseIntxHttpInnerClient {
                 vec![],
                 Some(*COINBASE_INTX_REST_QUOTA),
                 timeout_secs,
-            ),
+                None, // proxy_url
+            )?,
             credential: None,
-        }
+        })
     }
 
     /// Creates a new [`CoinbaseIntxHttpClient`] configured with credentials
     /// for authenticated requests, optionally using a custom base url.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
     pub fn with_credentials(
         api_key: String,
         api_secret: String,
         api_passphrase: String,
         base_url: String,
         timeout_secs: Option<u64>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, HttpClientError> {
+        Ok(Self {
             base_url,
             client: HttpClient::new(
                 Self::default_headers(),
@@ -145,9 +160,10 @@ impl CoinbaseIntxHttpInnerClient {
                 vec![],
                 Some(*COINBASE_INTX_REST_QUOTA),
                 timeout_secs,
-            ),
+                None, // proxy_url
+            )?,
             credential: Some(Credential::new(api_key, api_secret, api_passphrase)),
-        }
+        })
     }
 
     /// Builds the default headers to include with each request (e.g., `User-Agent`).
@@ -198,17 +214,35 @@ impl CoinbaseIntxHttpInnerClient {
     /// - Building the URL from `base_url` + `path`.
     /// - Optionally signing the request.
     /// - Deserializing JSON responses into typed models, or returning a [`CoinbaseIntxHttpError`].
-    async fn send_request<T: DeserializeOwned>(
+    async fn send_request<T: DeserializeOwned, P: Serialize>(
         &self,
         method: Method,
         path: &str,
+        params: Option<&P>,
         body: Option<Vec<u8>>,
         authenticate: bool,
     ) -> Result<T, CoinbaseIntxHttpError> {
-        let url = format!("{}{}", self.base_url, path);
+        let params_str = params
+            .map(serde_urlencoded::to_string)
+            .transpose()
+            .map_err(|e| {
+                CoinbaseIntxHttpError::JsonError(format!("Failed to serialize params: {e}"))
+            })?;
+
+        let full_path = if let Some(ref query) = params_str {
+            if query.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path}?{query}")
+            }
+        } else {
+            path.to_string()
+        };
+
+        let url = format!("{}{}", self.base_url, full_path);
 
         let headers = if authenticate {
-            Some(self.sign_request(&method, path, body.as_deref())?)
+            Some(self.sign_request(&method, &full_path, body.as_deref())?)
         } else {
             None
         };
@@ -217,7 +251,7 @@ impl CoinbaseIntxHttpInnerClient {
 
         let resp = self
             .client
-            .request(method.clone(), url, headers, body, None, None)
+            .request(method.clone(), url, None, headers, body, None, None)
             .await?;
 
         tracing::trace!("Response: {resp:?}");
@@ -268,7 +302,8 @@ impl CoinbaseIntxHttpInnerClient {
     /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn http_list_assets(&self) -> Result<Vec<CoinbaseIntxAsset>, CoinbaseIntxHttpError> {
         let path = "/api/v1/assets";
-        self.send_request(Method::GET, path, None, false).await
+        self.send_request::<_, ()>(Method::GET, path, None, None, false)
+            .await
     }
 
     /// Requests information for a specific asset.
@@ -282,7 +317,8 @@ impl CoinbaseIntxHttpInnerClient {
         asset: &str,
     ) -> Result<CoinbaseIntxAsset, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/assets/{asset}");
-        self.send_request(Method::GET, &path, None, false).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, false)
+            .await
     }
 
     /// Requests all instruments available for trading.
@@ -295,7 +331,8 @@ impl CoinbaseIntxHttpInnerClient {
         &self,
     ) -> Result<Vec<CoinbaseIntxInstrument>, CoinbaseIntxHttpError> {
         let path = "/api/v1/instruments";
-        self.send_request(Method::GET, path, None, false).await
+        self.send_request::<_, ()>(Method::GET, path, None, None, false)
+            .await
     }
 
     /// Retrieve a list of instruments with open contracts.
@@ -309,7 +346,8 @@ impl CoinbaseIntxHttpInnerClient {
         symbol: &str,
     ) -> Result<CoinbaseIntxInstrument, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/instruments/{symbol}");
-        self.send_request(Method::GET, &path, None, false).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, false)
+            .await
     }
 
     /// Return all the fee rate tiers.
@@ -322,7 +360,8 @@ impl CoinbaseIntxHttpInnerClient {
         &self,
     ) -> Result<Vec<CoinbaseIntxFeeTier>, CoinbaseIntxHttpError> {
         let path = "/api/v1/fee-rate-tiers";
-        self.send_request(Method::GET, path, None, true).await
+        self.send_request::<_, ()>(Method::GET, path, None, None, true)
+            .await
     }
 
     /// List all user portfolios.
@@ -335,7 +374,8 @@ impl CoinbaseIntxHttpInnerClient {
         &self,
     ) -> Result<Vec<CoinbaseIntxPortfolio>, CoinbaseIntxHttpError> {
         let path = "/api/v1/portfolios";
-        self.send_request(Method::GET, path, None, true).await
+        self.send_request::<_, ()>(Method::GET, path, None, None, true)
+            .await
     }
 
     /// Returns the user's specified portfolio.
@@ -349,7 +389,8 @@ impl CoinbaseIntxHttpInnerClient {
         portfolio_id: &str,
     ) -> Result<CoinbaseIntxPortfolio, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Retrieves the summary, positions, and balances of a portfolio.
@@ -363,7 +404,8 @@ impl CoinbaseIntxHttpInnerClient {
         portfolio_id: &str,
     ) -> Result<CoinbaseIntxPortfolioDetails, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}/detail");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Retrieves the high level overview of a portfolio.
@@ -377,7 +419,8 @@ impl CoinbaseIntxHttpInnerClient {
         portfolio_id: &str,
     ) -> Result<CoinbaseIntxPortfolioSummary, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}/summary");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Returns all balances for a given portfolio.
@@ -391,7 +434,8 @@ impl CoinbaseIntxHttpInnerClient {
         portfolio_id: &str,
     ) -> Result<Vec<CoinbaseIntxBalance>, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}/balances");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Retrieves the balance for a given portfolio and asset.
@@ -406,7 +450,8 @@ impl CoinbaseIntxHttpInnerClient {
         asset: &str,
     ) -> Result<CoinbaseIntxBalance, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}/balances/{asset}");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Returns all fills for a given portfolio.
@@ -420,10 +465,9 @@ impl CoinbaseIntxHttpInnerClient {
         portfolio_id: &str,
         params: GetPortfolioFillsParams,
     ) -> Result<CoinbaseIntxFillList, CoinbaseIntxHttpError> {
-        let query = serde_urlencoded::to_string(&params)
-            .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        let path = format!("/api/v1/portfolios/{portfolio_id}/fills?{query}");
-        self.send_request(Method::GET, &path, None, true).await
+        let path = format!("/api/v1/portfolios/{portfolio_id}/fills");
+        self.send_request(Method::GET, &path, Some(&params), None, true)
+            .await
     }
 
     /// Returns all positions for a given portfolio.
@@ -437,7 +481,8 @@ impl CoinbaseIntxHttpInnerClient {
         portfolio_id: &str,
     ) -> Result<Vec<CoinbaseIntxPosition>, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}/positions");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Retrieves the position for a given portfolio and symbol.
@@ -452,7 +497,8 @@ impl CoinbaseIntxHttpInnerClient {
         symbol: &str,
     ) -> Result<CoinbaseIntxPosition, CoinbaseIntxHttpError> {
         let path = format!("/api/v1/portfolios/{portfolio_id}/positions/{symbol}");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request::<_, ()>(Method::GET, &path, None, None, true)
+            .await
     }
 
     /// Retrieves the Perpetual Future and Spot fee rate tiers for the user.
@@ -465,7 +511,8 @@ impl CoinbaseIntxHttpInnerClient {
         &self,
     ) -> Result<Vec<CoinbaseIntxPortfolioFeeRates>, CoinbaseIntxHttpError> {
         let path = "/api/v1/portfolios/fee-rates";
-        self.send_request(Method::GET, path, None, true).await
+        self.send_request::<_, ()>(Method::GET, path, None, None, true)
+            .await
     }
 
     /// Create a new order.
@@ -479,7 +526,7 @@ impl CoinbaseIntxHttpInnerClient {
         let path = "/api/v1/orders";
         let body = serde_json::to_vec(&params)
             .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        self.send_request(Method::POST, path, Some(body), true)
+        self.send_request::<_, ()>(Method::POST, path, None, Some(body), true)
             .await
     }
 
@@ -497,10 +544,9 @@ impl CoinbaseIntxHttpInnerClient {
         let params = GetOrderParams {
             portfolio: portfolio_id.to_string(),
         };
-        let query = serde_urlencoded::to_string(&params)
-            .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        let path = format!("/api/v1/orders/{venue_order_id}?{query}");
-        self.send_request(Method::GET, &path, None, true).await
+        let path = format!("/api/v1/orders/{venue_order_id}");
+        self.send_request(Method::GET, &path, Some(&params), None, true)
+            .await
     }
 
     /// Returns a list of active orders resting on the order book matching the requested criteria.
@@ -514,10 +560,8 @@ impl CoinbaseIntxHttpInnerClient {
         &self,
         params: GetOrdersParams,
     ) -> Result<CoinbaseIntxOrderList, CoinbaseIntxHttpError> {
-        let query = serde_urlencoded::to_string(&params)
-            .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        let path = format!("/api/v1/orders?{query}");
-        self.send_request(Method::GET, &path, None, true).await
+        self.send_request(Method::GET, "/api/v1/orders", Some(&params), None, true)
+            .await
     }
 
     /// Cancels a single open order.
@@ -532,10 +576,9 @@ impl CoinbaseIntxHttpInnerClient {
         let params = CancelOrderParams {
             portfolio: portfolio_id.to_string(),
         };
-        let query = serde_urlencoded::to_string(&params)
-            .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        let path = format!("/api/v1/orders/{client_order_id}?{query}");
-        self.send_request(Method::DELETE, &path, None, true).await
+        let path = format!("/api/v1/orders/{client_order_id}");
+        self.send_request(Method::DELETE, &path, Some(&params), None, true)
+            .await
     }
 
     /// Cancel user orders.
@@ -546,10 +589,8 @@ impl CoinbaseIntxHttpInnerClient {
         &self,
         params: CancelOrdersParams,
     ) -> Result<Vec<CoinbaseIntxOrder>, CoinbaseIntxHttpError> {
-        let query = serde_urlencoded::to_string(&params)
-            .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        let path = format!("/api/v1/orders?{query}");
-        self.send_request(Method::DELETE, &path, None, true).await
+        self.send_request(Method::DELETE, "/api/v1/orders", Some(&params), None, true)
+            .await
     }
 
     /// Modify an open order.
@@ -566,7 +607,7 @@ impl CoinbaseIntxHttpInnerClient {
         let path = format!("/api/v1/orders/{order_id}");
         let body = serde_json::to_vec(&params)
             .map_err(|e| CoinbaseIntxHttpError::JsonError(e.to_string()))?;
-        self.send_request(Method::PUT, &path, Some(body), true)
+        self.send_request::<_, ()>(Method::PUT, &path, None, Some(body), true)
             .await
     }
 }
@@ -588,7 +629,7 @@ pub struct CoinbaseIntxHttpClient {
 
 impl Default for CoinbaseIntxHttpClient {
     fn default() -> Self {
-        Self::new(None, Some(60))
+        Self::new(None, Some(60)).expect("Failed to create default Coinbase INTX HTTP client")
     }
 }
 
@@ -598,13 +639,19 @@ impl CoinbaseIntxHttpClient {
     ///
     /// This version of the client has **no credentials**, so it can only
     /// call publicly accessible endpoints.
-    #[must_use]
-    pub fn new(base_url: Option<String>, timeout_secs: Option<u64>) -> Self {
-        Self {
-            inner: Arc::new(CoinbaseIntxHttpInnerClient::new(base_url, timeout_secs)),
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new(
+        base_url: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Self, HttpClientError> {
+        Ok(Self {
+            inner: Arc::new(CoinbaseIntxHttpInnerClient::new(base_url, timeout_secs)?),
             instruments_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_initialized: false,
-        }
+        })
     }
 
     /// Creates a new authenticated [`CoinbaseIntxHttpClient`] using environment variables and
@@ -630,25 +677,33 @@ impl CoinbaseIntxHttpClient {
         base_url: Option<String>,
         timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
-        let api_key = api_key.unwrap_or(get_env_var("COINBASE_INTX_API_KEY")?);
-        let api_secret = api_secret.unwrap_or(get_env_var("COINBASE_INTX_API_SECRET")?);
-        let api_passphrase = api_passphrase.unwrap_or(get_env_var("COINBASE_INTX_API_PASSPHRASE")?);
+        let api_key = get_or_env_var(api_key, "COINBASE_INTX_API_KEY")?;
+        let api_secret = get_or_env_var(api_secret, "COINBASE_INTX_API_SECRET")?;
+        let api_passphrase = get_or_env_var(api_passphrase, "COINBASE_INTX_API_PASSPHRASE")?;
         let base_url = base_url.unwrap_or(COINBASE_INTX_REST_URL.to_string());
         Ok(Self {
-            inner: Arc::new(CoinbaseIntxHttpInnerClient::with_credentials(
-                api_key,
-                api_secret,
-                api_passphrase,
-                base_url,
-                timeout_secs,
-            )),
+            inner: Arc::new(
+                CoinbaseIntxHttpInnerClient::with_credentials(
+                    api_key,
+                    api_secret,
+                    api_passphrase,
+                    base_url,
+                    timeout_secs,
+                )
+                .context("failed to create Coinbase INTX HTTP client")?,
+            ),
             instruments_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_initialized: false,
         })
     }
 
     fn get_instrument_from_cache(&self, symbol: Ustr) -> anyhow::Result<InstrumentAny> {
-        match self.instruments_cache.lock().unwrap().get(&symbol) {
+        match self
+            .instruments_cache
+            .lock()
+            .expect(MUTEX_POISONED)
+            .get(&symbol)
+        {
             Some(inst) => Ok(inst.clone()), // TODO: Remove this clone
             None => anyhow::bail!("Unable to process request, instrument {symbol} not in cache"),
         }

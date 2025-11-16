@@ -23,13 +23,16 @@ use nautilus_model::{
     events::AccountState,
     identifiers::{AccountId, InstrumentId},
     reports::PositionStatusReport,
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Money, Price, Quantity},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use ustr::Ustr;
 
 use crate::{
-    http::models::{HyperliquidL2Book, HyperliquidLevel},
+    http::{
+        models::{HyperliquidL2Book, HyperliquidLevel},
+        parse::get_currency,
+    },
     websocket::messages::{WsBookData, WsLevelData},
 };
 
@@ -563,16 +566,16 @@ pub enum ConversionError {
 
 impl From<anyhow::Error> for ConversionError {
     fn from(err: anyhow::Error) -> Self {
-        ConversionError::OrderBookDeltasError(err.to_string())
+        Self::OrderBookDeltasError(err.to_string())
     }
 }
 
 impl Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConversionError::InvalidPrice { value } => write!(f, "Invalid price: {}", value),
-            ConversionError::InvalidSize { value } => write!(f, "Invalid size: {}", value),
-            ConversionError::OrderBookDeltasError(msg) => {
+            Self::InvalidPrice { value } => write!(f, "Invalid price: {}", value),
+            Self::InvalidSize { value } => write!(f, "Invalid size: {}", value),
+            Self::OrderBookDeltasError(msg) => {
                 write!(f, "OrderBookDeltas error: {}", msg)
             }
         }
@@ -702,12 +705,6 @@ impl HyperliquidAccountState {
     /// This creates a standard Nautilus AccountState from the Hyperliquid-specific account state,
     /// converting balances and handling the margin account type since Hyperliquid supports leverage.
     ///
-    /// # Arguments
-    ///
-    /// * `account_id` - The account identifier for this state
-    /// * `ts_event` - When this state was observed/received
-    /// * `ts_init` - When this state object was created
-    ///
     /// # Returns
     ///
     /// A Nautilus AccountState event that can be processed by the platform
@@ -723,7 +720,7 @@ impl HyperliquidAccountState {
             .values()
             .map(|balance| {
                 // Create currency - Hyperliquid primarily uses USD/USDC
-                let currency = Currency::from(balance.asset.as_str());
+                let currency = get_currency(&balance.asset);
 
                 // Convert Decimal to f64 and create Money with proper currency
                 let total = Money::new(balance.total.to_f64().unwrap_or(0.0), currency);
@@ -865,8 +862,8 @@ pub fn parse_position_status_report(
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
-    use nautilus_model::identifiers::InstrumentId;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -1166,8 +1163,8 @@ mod tests {
         assert_eq!(info.instrument_id, instrument_id);
         assert_eq!(info.price_decimals, 3);
         assert_eq!(info.size_decimals, 4);
-        assert_eq!(info.tick_size, Some(Decimal::new(1, 3))); // 0.001
-        assert_eq!(info.step_size, Some(Decimal::new(1, 4))); // 0.0001
+        assert_eq!(info.tick_size, Some(dec!(0.001))); // 0.001
+        assert_eq!(info.step_size, Some(dec!(0.0001))); // 0.0001
     }
 
     #[tokio::test]

@@ -141,6 +141,7 @@ def test_json_primitives() -> None:
         "filters": None,
         "filter_callable": None,
         "log_warnings": True,
+        "use_gamma_markets": False,
     }
 
 
@@ -458,3 +459,25 @@ def test_decoding_environment() -> None:
 
     # Assert
     assert result == Environment(obj)
+
+
+def test_encoding_type_with_fully_qualified_name() -> None:
+    # Arrange - DatabaseConfig is a class with fully_qualified_name()
+    obj = DatabaseConfig
+
+    # Act
+    result = msgspec_encoding_hook(obj)
+
+    # Assert
+    assert result == "nautilus_trader.common.config:DatabaseConfig"
+
+
+def test_encoding_type_without_fully_qualified_name() -> None:
+    # Arrange
+    obj = int
+
+    # Act
+    result = msgspec_encoding_hook(obj)
+
+    # Assert
+    assert result == "<class 'int'>"

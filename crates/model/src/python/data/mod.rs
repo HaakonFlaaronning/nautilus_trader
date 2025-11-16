@@ -76,7 +76,7 @@ impl DataType {
 ///
 /// # Panics
 ///
-/// This function will panic if the `PyCapsule` creation fails, which may occur if
+/// This function panics if the `PyCapsule` creation fails, which may occur if
 /// there are issues with memory allocation or if the `Data` instance cannot be
 /// properly encapsulated.
 ///
@@ -117,9 +117,9 @@ pub fn data_to_pycapsule(py: Python, data: Data) -> Py<PyAny> {
 #[allow(unsafe_code)]
 pub fn drop_cvec_pycapsule(capsule: &Bound<'_, PyAny>) {
     let capsule: &Bound<'_, PyCapsule> = capsule
-        .downcast::<PyCapsule>()
+        .cast::<PyCapsule>()
         .expect("Error on downcast to `&PyCapsule`");
-    let cvec: &CVec = unsafe { &*(capsule.pointer() as *const CVec) };
+    let cvec: &CVec = unsafe { &*(capsule.pointer_checked(None).unwrap().as_ptr() as *const CVec) };
     let data: Vec<Data> =
         unsafe { Vec::from_raw_parts(cvec.ptr.cast::<Data>(), cvec.len, cvec.cap) };
     drop(data);

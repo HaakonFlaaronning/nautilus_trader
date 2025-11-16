@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.17.2
+#       jupytext_version: 1.18.1
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
 #     language: python
@@ -25,6 +25,9 @@ import numpy as np
 from nautilus_trader.adapters.databento.data_utils import data_path
 from nautilus_trader.adapters.databento.data_utils import databento_data
 from nautilus_trader.adapters.databento.data_utils import load_catalog
+from nautilus_trader.analysis.config import TearsheetConfig
+from nautilus_trader.analysis.tearsheet import create_bars_with_fills
+from nautilus_trader.analysis.tearsheet import create_tearsheet
 from nautilus_trader.backtest.config import MarginModelConfig
 from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.backtest.option_exercise import OptionExerciseConfig
@@ -153,6 +156,13 @@ class OptionStrategy(Strategy):
     def on_start(self):
         self.bar_type = BarType.from_str(f"{self.config.future_id}-1-MINUTE-LAST-EXTERNAL")
 
+        if not self.config.load_greeks:
+            self.bar_type_2 = BarType.from_str(
+                f"{self.config.future_id}-2-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            )
+        else:
+            self.bar_type_2 = BarType.from_str(f"{self.config.future_id}-2-MINUTE-LAST-EXTERNAL")
+
         self.request_instrument(self.config.option_id)
         self.request_instrument(self.config.option_id2)
         self.request_instrument(self.bar_type.instrument_id)
@@ -161,6 +171,7 @@ class OptionStrategy(Strategy):
         self.subscribe_quote_ticks(self.config.option_id)
         self.subscribe_quote_ticks(self.config.option_id2)
         self.subscribe_bars(self.bar_type)
+        self.subscribe_bars(self.bar_type_2)
 
         # Request spread instrument with ES options tick scheme properties
         self.request_instrument(
@@ -216,7 +227,7 @@ class OptionStrategy(Strategy):
 
     def on_bar(self, bar):
         self.user_log(
-            f"bar ts_init = {unix_nanos_to_iso8601(bar.ts_init)}, bar close = {bar.close}",
+            f"bar ts_init = {unix_nanos_to_iso8601(bar.ts_init)}, bar close = {bar}",
         )
 
         if not self.start_orders_done:
@@ -276,8 +287,8 @@ class OptionStrategy(Strategy):
 # %%
 # BacktestEngineConfig
 
-# When load_greeks is False, the streamed greeks can be saved after the backtest
-# When load_greeks is True, the greeks are loaded from the catalog
+# When load_greeks is False, the streamed greeks and bars can be saved after the backtest to the catalog
+# When load_greeks is True, the greeks and previously internal bars are loaded from the catalog
 load_greeks = False
 
 actors = [
@@ -317,7 +328,7 @@ strategies = [
 streaming = StreamingConfig(
     catalog_path=catalog.path,
     fs_protocol="file",
-    include_types=[GreeksData],
+    include_types=[GreeksData, Bar],
 )
 
 logging = LoggingConfig(
@@ -441,6 +452,11 @@ if not load_greeks:
         results[0].instance_id,
         GreeksData,
     )
+    catalog.convert_stream_to_data(
+        results[0].instance_id,
+        Bar,
+        identifiers=("2-MINUTE",),
+    )
 
 # %% [markdown]
 # ## backtest results
@@ -454,6 +470,33 @@ engine.trader.generate_positions_report()
 
 # %%
 engine.trader.generate_account_report(Venue("XCME"))
+
+# %%
+# Create visualization with bars and order fills (standalone)
+bar_type = BarType.from_str(f"{future_symbols[0]}.XCME-1-MINUTE-LAST-EXTERNAL")
+fig = create_bars_with_fills(
+    engine=engine,
+    bar_type=bar_type,
+    title=f"{future_symbols[0]} - Price Bars with Order Fills",
+)
+fig
+
+# %%
+# Test tearsheet integration with bars_with_fills chart using node and instance_id
+tearsheet_config = TearsheetConfig(
+    charts=["stats_table", "equity", "bars_with_fills"],
+    chart_args={
+        "bars_with_fills": {
+            "bar_type": f"{future_symbols[0]}.XCME-1-MINUTE-LAST-EXTERNAL",
+        },
+    },
+)
+
+create_tearsheet(
+    engine,
+    config=tearsheet_config,
+    output_path="tearsheet_with_bars_fills.html",
+)
 
 # %%
 node.dispose()
