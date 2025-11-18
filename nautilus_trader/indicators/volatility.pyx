@@ -271,7 +271,7 @@ cdef class BollingerBands(Indicator):
 
         """
         # Add data to queues
-        cdef double typical = close # (high + low + close) / 3.0
+        cdef double typical = close # Ninja version | Nautilus version: (high + low + close) / 3.0
 
         self._prices.append(typical)
         self._ma.update_raw(typical)

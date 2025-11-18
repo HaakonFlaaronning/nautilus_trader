@@ -213,7 +213,7 @@ pub fn swings_10() -> Swings {
 
 #[fixture]
 pub fn bb_10() -> BollingerBands {
-    BollingerBands::new(10, 0.1, Some(MovingAverageType::Simple))
+    BollingerBands::new(10, 0.1, Some(MovingAverageType::Simple), None)
 }
 
 #[fixture]

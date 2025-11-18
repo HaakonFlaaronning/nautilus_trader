@@ -20,11 +20,13 @@ pub mod dema;
 pub mod ema;
 pub mod hma;
 pub mod lr;
+pub mod ma_slope;
 pub mod rma;
 pub mod sma;
 pub mod vidya;
 pub mod vwap;
 pub mod wma;
+pub mod zlema;
 
 use nautilus_model::enums::PriceType;
 use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};

@@ -42,6 +42,8 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::average::vwap::VolumeWeightedAveragePrice>()?;
     m.add_class::<crate::average::lr::LinearRegression>()?;
     m.add_class::<crate::average::wma::WeightedMovingAverage>()?;
+    m.add_class::<crate::average::zlema::ZeroLagExponentialMovingAverage>()?;
+    m.add_class::<crate::average::ma_slope::MASlope>()?;
 
     // Book
     m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
@@ -68,6 +70,8 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::momentum::roc::RateOfChange>()?;
     m.add_class::<crate::momentum::macd::MovingAverageConvergenceDivergence>()?;
     m.add_class::<crate::momentum::obv::OnBalanceVolume>()?;
+    m.add_class::<crate::momentum::wavetrend::WaveTrendOscillator>()?;
+    m.add_class::<crate::momentum::zigzag::ZigZag>()?;
 
     // Volatility
     m.add_class::<crate::volatility::atr::AverageTrueRange>()?;

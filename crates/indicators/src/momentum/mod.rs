@@ -32,3 +32,5 @@ pub mod rsi;
 pub mod stochastics;
 pub mod swings;
 pub mod vhf;
+pub mod wavetrend;
+pub mod zigzag;
