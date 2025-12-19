@@ -48,6 +48,7 @@
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
 #![deny(missing_debug_implementations)]
 #![deny(clippy::missing_errors_doc)]
@@ -56,6 +57,10 @@
 
 pub mod common;
 pub mod files;
+pub mod testers;
+
+// Re-export for convenience
+pub use testers::{DataTester, DataTesterConfig, ExecTester, ExecTesterConfig};
 
 #[cfg(feature = "python")]
 pub mod python;

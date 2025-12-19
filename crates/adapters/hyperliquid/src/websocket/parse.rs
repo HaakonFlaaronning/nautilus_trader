@@ -31,7 +31,7 @@ use nautilus_model::{
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money, Price, Quantity, price::PriceRaw, quantity::QuantityRaw},
+    types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::{
     Decimal,
@@ -56,9 +56,7 @@ fn parse_price(
 
     let value = decimal.to_f64().ok_or_else(|| {
         anyhow::anyhow!(
-            "Failed to convert price '{}' to f64 for {} (out of range or too much precision)",
-            price_str,
-            field_name
+            "Failed to convert price '{price_str}' to f64 for {field_name} (out of range or too much precision)"
         )
     })?;
 
@@ -77,9 +75,7 @@ fn parse_quantity(
 
     let value = decimal.abs().to_f64().ok_or_else(|| {
         anyhow::anyhow!(
-            "Failed to convert quantity '{}' to f64 for {} (out of range or too much precision)",
-            quantity_str,
-            field_name
+            "Failed to convert quantity '{quantity_str}' to f64 for {field_name} (out of range or too much precision)"
         )
     })?;
 
@@ -213,28 +209,11 @@ pub fn parse_ws_candle(
     bar_type: &BarType,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
-    let price_precision = instrument.price_precision();
-    let size_precision = instrument.size_precision();
-
-    let open_decimal = Decimal::from_str(&candle.o).context("failed to parse open price")?;
-    let open_raw = open_decimal.mantissa() as PriceRaw;
-    let open = Price::from_raw(open_raw, price_precision);
-
-    let high_decimal = Decimal::from_str(&candle.h).context("failed to parse high price")?;
-    let high_raw = high_decimal.mantissa() as PriceRaw;
-    let high = Price::from_raw(high_raw, price_precision);
-
-    let low_decimal = Decimal::from_str(&candle.l).context("failed to parse low price")?;
-    let low_raw = low_decimal.mantissa() as PriceRaw;
-    let low = Price::from_raw(low_raw, price_precision);
-
-    let close_decimal = Decimal::from_str(&candle.c).context("failed to parse close price")?;
-    let close_raw = close_decimal.mantissa() as PriceRaw;
-    let close = Price::from_raw(close_raw, price_precision);
-
-    let volume_decimal = Decimal::from_str(&candle.v).context("failed to parse volume")?;
-    let volume_raw = volume_decimal.mantissa().unsigned_abs() as QuantityRaw;
-    let volume = Quantity::from_raw(volume_raw, size_precision);
+    let open = parse_price(&candle.o, instrument, "candle.o")?;
+    let high = parse_price(&candle.h, instrument, "candle.h")?;
+    let low = parse_price(&candle.l, instrument, "candle.l")?;
+    let close = parse_price(&candle.c, instrument, "candle.c")?;
+    let volume = parse_quantity(&candle.v, instrument, "candle.v")?;
 
     let ts_event = parse_millis_to_nanos(candle.t);
 
@@ -456,18 +435,10 @@ fn parse_f64_price(
     field_name: &str,
 ) -> anyhow::Result<Price> {
     if !price.is_finite() {
-        anyhow::bail!(
-            "Invalid price value for {}: {} (must be finite)",
-            field_name,
-            price
-        );
+        anyhow::bail!("Invalid price value for {field_name}: {price} (must be finite)");
     }
     Ok(Price::new(price, instrument.price_precision()))
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
@@ -553,10 +524,7 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.order_side, OrderSide::Buy);
         assert_eq!(report.order_type, OrderType::Limit);
-        assert_eq!(
-            report.order_status,
-            nautilus_model::enums::OrderStatus::Accepted
-        );
+        assert_eq!(report.order_status, OrderStatus::Accepted);
     }
 
     #[rstest]

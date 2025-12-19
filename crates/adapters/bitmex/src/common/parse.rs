@@ -15,6 +15,8 @@
 
 //! Shared parsing helpers that transform BitMEX payloads into Nautilus types.
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use nautilus_core::{nanos::UnixNanos, uuid::UUID4};
 use nautilus_model::{
@@ -148,7 +150,7 @@ pub fn derive_contract_decimal_and_increment(
     }
     contract_decimal = contract_decimal.normalize();
     let contract_precision = contract_decimal.scale() as u8;
-    let size_increment = Quantity::from_decimal(contract_decimal, contract_precision)?;
+    let size_increment = Quantity::from_decimal_dp(contract_decimal, contract_precision)?;
 
     Ok((contract_decimal, size_increment))
 }
@@ -177,7 +179,7 @@ pub fn convert_contract_quantity(
             }
             let decimal = decimal.normalize();
             let precision = decimal.scale() as u8;
-            Quantity::from_decimal(decimal, precision)
+            Quantity::from_decimal_dp(decimal, precision)
         })
         .transpose()
 }
@@ -324,14 +326,13 @@ pub const fn parse_position_side(current_qty: Option<i64>) -> PositionSide {
 ///
 /// For other currencies, converts to uppercase.
 #[must_use]
-pub fn map_bitmex_currency(bitmex_currency: &str) -> String {
+pub fn map_bitmex_currency(bitmex_currency: &str) -> Cow<'static, str> {
     match bitmex_currency {
-        "XBt" => "XBT".to_string(),
-        "USDt" => "USDT".to_string(),
-        "LAMp" => "USDT".to_string(), // Map test currency to USDT
-        "RLUSd" => "RLUSD".to_string(),
-        "MAMUSd" => "MAMUSD".to_string(),
-        other => other.to_uppercase(),
+        "XBt" => Cow::Borrowed("XBT"),
+        "USDt" | "LAMp" => Cow::Borrowed("USDT"), // LAMp is test currency
+        "RLUSd" => Cow::Borrowed("RLUSD"),
+        "MAMUSd" => Cow::Borrowed("MAMUSD"),
+        other => Cow::Owned(other.to_uppercase()),
     }
 }
 
@@ -451,10 +452,6 @@ pub fn parse_account_state(
         None,
     ))
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {

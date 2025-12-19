@@ -15,8 +15,7 @@
 
 //! Pool profiling utilities for analyzing DeFi pool event data.
 
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use alloy_primitives::{Address, I256, U160, U256};
 
 use crate::defi::{
@@ -28,6 +27,7 @@ use crate::defi::{
     pool_analysis::{
         position::PoolPosition,
         quote::SwapQuote,
+        size_estimator,
         snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
         swap_math::compute_swap_step,
     },
@@ -70,7 +70,7 @@ pub struct PoolProfiler {
     /// Pool definition.
     pub pool: SharedPool,
     /// Position tracking by position key (owner:tick_lower:tick_upper).
-    positions: HashMap<String, PoolPosition>,
+    positions: AHashMap<String, PoolPosition>,
     /// Tick map managing liquidity distribution across price ranges.
     pub tick_map: TickMap,
     /// Global pool state including current price, tick, and cumulative flows with fees.
@@ -98,7 +98,7 @@ impl PoolProfiler {
         let tick_spacing = pool.tick_spacing.expect("Pool tick spacing must be set");
         Self {
             pool,
-            positions: HashMap::new(),
+            positions: AHashMap::new(),
             tick_map: TickMap::new(tick_spacing),
             state: PoolState::default(),
             analytics: PoolAnalytics::default(),
@@ -336,7 +336,7 @@ impl PoolProfiler {
             self.pool.chain.clone(),
             self.pool.dex.clone(),
             self.pool.instrument_id,
-            self.pool.address,
+            self.pool.pool_identifier,
             block.number,
             block.transaction_hash,
             block.transaction_index,
@@ -701,6 +701,50 @@ impl PoolProfiler {
         self.quote_swap(I256::MAX, false, Some(sqrt_price_limit_x96))
     }
 
+    /// Finds the maximum trade size that produces a target slippage (including fees).
+    ///
+    /// Uses binary search to find the largest trade size that results in slippage
+    /// at or below the target. The method iteratively simulates swaps at different
+    /// sizes until it converges to the optimal size within the specified tolerance.
+    ///
+    /// # Returns
+    /// The maximum trade size (U256) that produces the target slippage
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Impact is zero or exceeds 100% (10000 bps)
+    /// - Pool is not initialized
+    /// - Swap simulations fail
+    ///
+    /// # Panics
+    /// Panics if pool is not initialized
+    pub fn size_for_impact_bps(&self, impact_bps: u32, zero_for_one: bool) -> anyhow::Result<U256> {
+        let config = size_estimator::EstimationConfig::default();
+        size_estimator::size_for_impact_bps(self, impact_bps, zero_for_one, &config)
+    }
+
+    /// Finds the maximum trade size with comprehensive search diagnostics.
+    /// This is the detailed version of [`Self::size_for_impact_bps`] that returns
+    /// extensive information about the search process.It is useful for debugging,
+    /// monitoring, and analyzing search behavior in production.
+    ///
+    /// # Returns
+    /// Detailed result with size and comprehensive search diagnostics
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Impact is zero or exceeds 100% (10000 bps)
+    /// - Pool is not initialized
+    /// - Swap simulations fail
+    pub fn size_for_impact_bps_detailed(
+        &self,
+        impact_bps: u32,
+        zero_for_one: bool,
+    ) -> anyhow::Result<size_estimator::SizeForImpactResult> {
+        let config = size_estimator::EstimationConfig::default();
+        size_estimator::size_for_impact_bps_detailed(self, impact_bps, zero_for_one, &config)
+    }
+
     /// Validates that the price limit is in the correct direction for the swap.
     ///
     /// # Errors
@@ -838,7 +882,7 @@ impl PoolProfiler {
             self.pool.chain.clone(),
             self.pool.dex.clone(),
             self.pool.instrument_id,
-            self.pool.address,
+            self.pool.pool_identifier,
             PoolLiquidityUpdateType::Mint,
             block.number,
             block.transaction_hash,
@@ -948,7 +992,7 @@ impl PoolProfiler {
             self.pool.chain.clone(),
             self.pool.dex.clone(),
             self.pool.instrument_id,
-            self.pool.address,
+            self.pool.pool_identifier,
             PoolLiquidityUpdateType::Burn,
             block.number,
             block.transaction_hash,
@@ -988,7 +1032,6 @@ impl PoolProfiler {
         ) {
             return Ok(());
         }
-
         let position_key =
             PoolPosition::get_position_key(&collect.owner, collect.tick_lower, collect.tick_upper);
         if let Some(position) = self.positions.get_mut(&position_key) {
@@ -1091,7 +1134,7 @@ impl PoolProfiler {
             self.pool.chain.clone(),
             self.pool.dex.clone(),
             self.pool.instrument_id,
-            self.pool.address,
+            self.pool.pool_identifier,
             block.number,
             block.transaction_hash,
             block.transaction_index,
@@ -1294,21 +1337,19 @@ impl PoolProfiler {
     /// - Ticks are outside MIN_TICK/MAX_TICK bounds.
     fn validate_ticks(&self, tick_lower: i32, tick_upper: i32) -> anyhow::Result<()> {
         if tick_lower >= tick_upper {
-            anyhow::bail!("Invalid tick range: {} >= {}", tick_lower, tick_upper)
+            anyhow::bail!("Invalid tick range: {tick_lower} >= {tick_upper}")
         }
 
         if tick_lower % self.pool.tick_spacing.unwrap() as i32 != 0
             || tick_upper % self.pool.tick_spacing.unwrap() as i32 != 0
         {
             anyhow::bail!(
-                "Ticks {} and {} must be multiples of the tick spacing",
-                tick_lower,
-                tick_upper
+                "Ticks {tick_lower} and {tick_upper} must be multiples of the tick spacing"
             )
         }
 
         if tick_lower < PoolTick::MIN_TICK || tick_upper > PoolTick::MAX_TICK {
-            anyhow::bail!("Invalid tick bounds for {} and {}", tick_lower, tick_upper);
+            anyhow::bail!("Invalid tick bounds for {tick_lower} and {tick_upper}");
         }
         Ok(())
     }
@@ -1388,7 +1429,7 @@ impl PoolProfiler {
         self.analytics.total_fee_collects = snapshot.analytics.total_fee_collects;
         self.analytics.total_flashes = snapshot.analytics.total_flashes;
 
-        // Rebuild positions HashMap
+        // Rebuild positions AHashMap
         self.positions.clear();
         for position in snapshot.positions {
             let key = PoolPosition::get_position_key(

@@ -30,12 +30,22 @@ use chrono::{DateTime, Utc};
 use nautilus_model::enums::OrderSide;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+/// Deserializes an empty string as None, otherwise as Some(String).
+fn deserialize_empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    Ok(s.filter(|s| !s.is_empty()))
+}
 use serde_with::{DisplayFromStr, serde_as};
 use ustr::Ustr;
 
 use crate::common::enums::{
-    DydxCandleResolution, DydxFillType, DydxLiquidity, DydxMarketStatus, DydxOrderStatus,
-    DydxPositionStatus, DydxTickerType, DydxTimeInForce,
+    DydxCandleResolution, DydxConditionType, DydxFillType, DydxLiquidity, DydxMarketStatus,
+    DydxOrderExecution, DydxOrderStatus, DydxOrderType, DydxPositionSide, DydxPositionStatus,
+    DydxTickerType, DydxTimeInForce, DydxTradeType, DydxTransferType,
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -61,54 +71,64 @@ pub struct PerpetualMarket {
     pub ticker: String,
     /// Market status (ACTIVE, PAUSED, etc.).
     pub status: DydxMarketStatus,
-    /// Base asset symbol.
-    pub base_asset: String,
-    /// Quote asset symbol.
-    pub quote_asset: String,
+    /// Base asset symbol (optional, not always returned by API).
+    #[serde(default)]
+    pub base_asset: Option<String>,
+    /// Quote asset symbol (optional, not always returned by API).
+    #[serde(default)]
+    pub quote_asset: Option<String>,
     /// Step size for order quantities (minimum increment).
     #[serde_as(as = "DisplayFromStr")]
     pub step_size: Decimal,
     /// Tick size for order prices (minimum increment).
     #[serde_as(as = "DisplayFromStr")]
     pub tick_size: Decimal,
-    /// Index price for the market.
-    #[serde_as(as = "DisplayFromStr")]
-    pub index_price: Decimal,
+    /// Index price for the market (optional, not always returned by API).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub index_price: Option<Decimal>,
     /// Oracle price for the market.
     #[serde_as(as = "DisplayFromStr")]
     pub oracle_price: Decimal,
     /// Price change over 24 hours.
+    #[serde(rename = "priceChange24H")]
     #[serde_as(as = "DisplayFromStr")]
     pub price_change_24h: Decimal,
     /// Next funding rate.
     #[serde_as(as = "DisplayFromStr")]
     pub next_funding_rate: Decimal,
-    /// Next funding time (ISO8601).
-    pub next_funding_at: DateTime<Utc>,
-    /// Minimum order size in base currency.
-    #[serde_as(as = "DisplayFromStr")]
-    pub min_order_size: Decimal,
-    /// Market type (always PERPETUAL for dYdX v4).
-    #[serde(rename = "type")]
-    pub market_type: DydxTickerType,
+    /// Next funding time (ISO8601, optional).
+    #[serde(default)]
+    pub next_funding_at: Option<DateTime<Utc>>,
+    /// Minimum order size in base currency (optional).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub min_order_size: Option<Decimal>,
+    /// Market type (always PERPETUAL for dYdX v4, optional).
+    #[serde(rename = "type", default)]
+    pub market_type: Option<DydxTickerType>,
     /// Initial margin fraction.
     #[serde_as(as = "DisplayFromStr")]
     pub initial_margin_fraction: Decimal,
     /// Maintenance margin fraction.
     #[serde_as(as = "DisplayFromStr")]
     pub maintenance_margin_fraction: Decimal,
-    /// Base position notional value.
-    #[serde_as(as = "DisplayFromStr")]
-    pub base_position_notional: Decimal,
-    /// Incremental position size for margin scaling.
-    #[serde_as(as = "DisplayFromStr")]
-    pub incremental_position_size: Decimal,
-    /// Incremental initial margin fraction.
-    #[serde_as(as = "DisplayFromStr")]
-    pub incremental_initial_margin_fraction: Decimal,
-    /// Maximum position size.
-    #[serde_as(as = "DisplayFromStr")]
-    pub max_position_size: Decimal,
+    /// Base position notional value (optional).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub base_position_notional: Option<Decimal>,
+    /// Incremental position size for margin scaling (optional).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub incremental_position_size: Option<Decimal>,
+    /// Incremental initial margin fraction (optional).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub incremental_initial_margin_fraction: Option<Decimal>,
+    /// Maximum position size (optional).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub max_position_size: Option<Decimal>,
     /// Open interest in base currency.
     #[serde_as(as = "DisplayFromStr")]
     pub open_interest: Decimal,
@@ -173,9 +193,9 @@ pub struct Trade {
     /// Height of block containing this trade.
     #[serde_as(as = "DisplayFromStr")]
     pub created_at_height: u64,
-    /// Market ticker.
+    /// Trade type (LIMIT, MARKET, LIQUIDATED, etc.).
     #[serde(rename = "type")]
-    pub market_type: DydxTickerType,
+    pub trade_type: DydxTradeType,
 }
 
 /// Response wrapper for candles endpoint.
@@ -259,6 +279,10 @@ pub struct Subaccount {
     /// Last updated height.
     #[serde_as(as = "DisplayFromStr")]
     pub updated_at_height: u64,
+    /// Latest processed block height (present in API response).
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub latest_processed_block_height: Option<u64>,
 }
 
 /// Perpetual position.
@@ -317,21 +341,20 @@ pub struct PerpetualPosition {
 pub struct AssetPosition {
     /// Asset symbol.
     pub symbol: Ustr,
-    /// Position side (always LONG for assets).
-    pub side: OrderSide,
+    /// Position side (API returns LONG/SHORT).
+    pub side: DydxPositionSide,
     /// Asset size (balance).
     #[serde_as(as = "DisplayFromStr")]
     pub size: Decimal,
     /// Asset ID.
     pub asset_id: String,
+    /// Subaccount number (present in API response).
+    #[serde(default)]
+    pub subaccount_number: u32,
 }
 
-/// Response for orders endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrdersResponse {
-    /// List of orders.
-    pub orders: Vec<Order>,
-}
+/// Response for orders endpoint - API returns array directly, not wrapped.
+pub type OrdersResponse = Vec<Order>;
 
 /// Order information.
 #[serde_as]
@@ -352,9 +375,9 @@ pub struct Order {
     /// Order size.
     #[serde_as(as = "DisplayFromStr")]
     pub size: Decimal,
-    /// Remaining size to be filled.
+    /// Total filled size.
     #[serde_as(as = "DisplayFromStr")]
-    pub remaining_size: Decimal,
+    pub total_filled: Decimal,
     /// Limit price.
     #[serde_as(as = "DisplayFromStr")]
     pub price: Decimal,
@@ -362,7 +385,7 @@ pub struct Order {
     pub status: DydxOrderStatus,
     /// Order type (LIMIT, MARKET, etc.).
     #[serde(rename = "type")]
-    pub order_type: String,
+    pub order_type: DydxOrderType,
     /// Time-in-force.
     pub time_in_force: DydxTimeInForce,
     /// Reduce-only flag.
@@ -370,6 +393,7 @@ pub struct Order {
     /// Post-only flag.
     pub post_only: bool,
     /// Order flags (bitfield).
+    #[serde_as(as = "DisplayFromStr")]
     pub order_flags: u32,
     /// Good-til-block (for short-term orders).
     #[serde_as(as = "Option<DisplayFromStr>")]
@@ -378,26 +402,51 @@ pub struct Order {
     /// Good-til-time (ISO8601).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub good_til_block_time: Option<DateTime<Utc>>,
-    /// Creation height.
-    #[serde_as(as = "DisplayFromStr")]
-    pub created_at_height: u64,
+    /// Creation height (not present for BEST_EFFORT_OPENED orders).
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_height: Option<u64>,
     /// Client metadata.
+    #[serde_as(as = "DisplayFromStr")]
     pub client_metadata: u32,
-    /// Trigger price (for stop orders).
+    /// Trigger price (for conditional orders).
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_price: Option<Decimal>,
-    /// Updated timestamp.
-    pub updated_at: DateTime<Utc>,
-    /// Updated height.
-    #[serde_as(as = "DisplayFromStr")]
-    pub updated_at_height: u64,
+    /// Condition type (STOP_LOSS, TAKE_PROFIT, UNSPECIFIED).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_type: Option<DydxConditionType>,
+    /// Conditional order trigger in subticks.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditional_order_trigger_subticks: Option<u64>,
+    /// Order execution type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<DydxOrderExecution>,
+    /// Updated timestamp (not present for BEST_EFFORT_OPENED orders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Updated height (not present for BEST_EFFORT_OPENED orders).
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at_height: Option<u64>,
+    /// Ticker symbol (e.g., "BTC-USD").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticker: Option<String>,
+    /// Subaccount number.
+    #[serde(default)]
+    pub subaccount_number: u32,
+    /// Order router address (empty string treated as None).
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_router_address: Option<String>,
 }
 
-/// Response for fills endpoint.
+/// Response for fills endpoint - API returns wrapped in {"fills": [...]}.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FillsResponse {
-    /// List of fills.
+    /// Array of fills.
     pub fills: Vec<Fill>,
 }
 
@@ -436,6 +485,7 @@ pub struct Fill {
     /// Order ID.
     pub order_id: String,
     /// Client order ID.
+    #[serde_as(as = "DisplayFromStr")]
     pub client_metadata: u32,
 }
 
@@ -455,7 +505,7 @@ pub struct Transfer {
     pub id: String,
     /// Transfer type (DEPOSIT, WITHDRAWAL, TRANSFER_OUT, TRANSFER_IN).
     #[serde(rename = "type")]
-    pub transfer_type: String,
+    pub transfer_type: DydxTransferType,
     /// Sender address.
     pub sender: TransferAccount,
     /// Recipient address.
@@ -523,7 +573,7 @@ pub struct PlaceOrderRequest {
     /// Client-generated order ID.
     pub client_id: u32,
     /// Order type flags (bitfield for short-term, reduce-only, etc.).
-    pub order_flags: u32,
+    pub order_flags: String,
     /// CLOB pair ID.
     pub clob_pair_id: u32,
     /// Order side.
@@ -567,7 +617,7 @@ pub struct CancelOrderRequest {
     /// CLOB pair ID.
     pub clob_pair_id: u32,
     /// Order flags.
-    pub order_flags: u32,
+    pub order_flags: String,
     /// Good-til-block or good-til-block-time for the cancel.
     pub good_til_block: Option<u32>,
     pub good_til_block_time: Option<u32>,

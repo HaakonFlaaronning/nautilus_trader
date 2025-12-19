@@ -87,9 +87,6 @@ pub static VENUE_MAP: LazyLock<Mutex<HashMap<&str, Venue>>> = LazyLock::new(|| {
     Mutex::new(map)
 });
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use nautilus_core::MUTEX_POISONED;
@@ -246,6 +243,7 @@ mod tests {
     }
 
     #[rstest]
+    #[allow(clippy::needless_collect)] // Collect needed for thread handles
     fn test_venue_constants_thread_safety() {
         use std::thread;
 
@@ -285,6 +283,7 @@ mod tests {
     }
 
     #[rstest]
+    #[allow(clippy::needless_collect)] // Collect needed for thread handles
     fn test_venue_map_thread_safety() {
         use std::thread;
 

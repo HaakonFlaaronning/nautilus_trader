@@ -25,7 +25,7 @@ use ahash::{AHashMap, AHashSet};
 use chrono::Utc;
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
-use nautilus_common::{logging::log_task_stopped, runtime::get_runtime};
+use nautilus_common::{live::runtime::get_runtime, logging::log_task_stopped};
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, env::get_or_env_var, time::get_atomic_clock_realtime,
 };
@@ -34,8 +34,10 @@ use nautilus_model::{
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
 };
-use nautilus_network::websocket::{MessageReader, WebSocketClient, WebSocketConfig};
-use reqwest::header::USER_AGENT;
+use nautilus_network::{
+    http::USER_AGENT,
+    websocket::{MessageReader, WebSocketClient, WebSocketConfig},
+};
 use tokio_tungstenite::tungstenite::{Error, Message};
 use ustr::Ustr;
 
@@ -137,17 +139,19 @@ impl CoinbaseIntxWebSocketClient {
         self.credential.api_key.as_str()
     }
 
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> String {
+        self.credential.api_key_masked()
+    }
+
     /// Returns a value indicating whether the client is active.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.inner
             .try_read()
             .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .map(nautilus_network::websocket::WebSocketClient::is_active)
-            })
+            .and_then(|guard| guard.as_ref().map(WebSocketClient::is_active))
             .unwrap_or(false)
     }
 
@@ -157,11 +161,7 @@ impl CoinbaseIntxWebSocketClient {
         self.inner
             .try_read()
             .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .map(nautilus_network::websocket::WebSocketClient::is_closed)
-            })
+            .and_then(|guard| guard.as_ref().map(WebSocketClient::is_closed))
             .unwrap_or(true)
     }
 
@@ -217,6 +217,7 @@ impl CoinbaseIntxWebSocketClient {
             reconnect_delay_max_ms: None,     // Use default
             reconnect_backoff_factor: None,   // Use default
             reconnect_jitter_ms: None,        // Use default
+            reconnect_max_attempts: None,
         };
         let (reader, client) =
             WebSocketClient::connect_stream(config, vec![], None, Some(post_reconnect)).await?;

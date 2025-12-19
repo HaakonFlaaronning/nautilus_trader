@@ -23,6 +23,9 @@ use ustr::Ustr;
 pub const KRAKEN: &str = "KRAKEN";
 pub static KRAKEN_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(KRAKEN)));
 
+// API Partner integration identifier
+pub const NAUTILUS_KRAKEN_BROKER_ID: &str = "AA36 N84G VVFC BKUQ";
+
 // WebSocket-specific constants
 pub const KRAKEN_PONG: &str = "pong";
 pub const KRAKEN_WS_TOPIC_DELIMITER: char = '.';
@@ -36,6 +39,6 @@ pub const KRAKEN_SPOT_WS_PRIVATE_URL: &str = "wss://ws-auth.kraken.com/v2";
 pub const KRAKEN_FUTURES_HTTP_URL: &str = "https://futures.kraken.com";
 pub const KRAKEN_FUTURES_WS_URL: &str = "wss://futures.kraken.com/ws/v1";
 
-// Testnet URLs
-pub const KRAKEN_FUTURES_TESTNET_HTTP_URL: &str = "https://demo-futures.kraken.com";
-pub const KRAKEN_FUTURES_TESTNET_WS_URL: &str = "wss://demo-futures.kraken.com/ws/v1";
+// Demo URLs
+pub const KRAKEN_FUTURES_DEMO_HTTP_URL: &str = "https://demo-futures.kraken.com";
+pub const KRAKEN_FUTURES_DEMO_WS_URL: &str = "wss://demo-futures.kraken.com/ws/v1";

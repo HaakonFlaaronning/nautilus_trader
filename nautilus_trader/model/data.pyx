@@ -125,6 +125,8 @@ from nautilus_trader.core.rust.model cimport orderbook_depth10_clone
 from nautilus_trader.core.rust.model cimport orderbook_depth10_eq
 from nautilus_trader.core.rust.model cimport orderbook_depth10_hash
 from nautilus_trader.core.rust.model cimport orderbook_depth10_new
+from nautilus_trader.core.rust.model cimport price_from_raw
+from nautilus_trader.core.rust.model cimport quantity_from_raw
 from nautilus_trader.core.rust.model cimport quote_tick_eq
 from nautilus_trader.core.rust.model cimport quote_tick_hash
 from nautilus_trader.core.rust.model cimport quote_tick_new
@@ -176,8 +178,14 @@ _SUPPORTED_BAR_AGGREGATIONS = (
     BarAggregation.MONTH,
     BarAggregation.YEAR,
     BarAggregation.TICK,
+    BarAggregation.TICK_IMBALANCE,
+    BarAggregation.TICK_RUNS,
     BarAggregation.VOLUME,
+    BarAggregation.VOLUME_IMBALANCE,
+    BarAggregation.VOLUME_RUNS,
     BarAggregation.VALUE,
+    BarAggregation.VALUE_IMBALANCE,
+    BarAggregation.VALUE_RUNS,
     BarAggregation.RENKO,
 )
 
@@ -527,6 +535,8 @@ cdef class BarSpecification:
         return cstr_to_pystr(bar_specification_to_cstr(&self._mem))
 
     def __eq__(self, BarSpecification other) -> bool:
+        if other is None:
+            return False
         return bar_specification_eq(&self._mem, &other._mem)
 
     def __lt__(self, BarSpecification other) -> bool:
@@ -1212,6 +1222,8 @@ cdef class BarType:
         return cstr_to_pystr(bar_type_to_cstr(&self._mem))
 
     def __eq__(self, BarType other) -> bool:
+        if other is None:
+            return False
         return self.to_str() == other.to_str()
 
     def __lt__(self, BarType other) -> bool:
@@ -1387,6 +1399,21 @@ cdef class BarType:
         bar_type._mem = bar_type_composite(&self._mem)
         return bar_type
 
+    cpdef tuple[InstrumentId, BarSpecification] id_spec_key(self):
+        """
+        Return the instrument ID and bar specification as a tuple key.
+
+        Useful as a hashmap key when aggregation source should be ignored,
+        such as for indicator registration where INTERNAL and EXTERNAL bars
+        should trigger the same indicators.
+
+        Returns
+        -------
+        tuple[InstrumentId, BarSpecification]
+
+        """
+        return (self.instrument_id, self.spec)
+
 
 cdef class Bar(Data):
     """
@@ -1527,6 +1554,8 @@ cdef class Bar(Data):
             )
 
     def __eq__(self, Bar other) -> bool:
+        if other is None:
+            return False
         return self.to_str() == other.to_str()
 
     def __hash__(self) -> int:
@@ -1654,11 +1683,12 @@ cdef class Bar(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ):
-        cdef Price_t open_price = price_new(open, price_prec)
-        cdef Price_t high_price = price_new(high, price_prec)
-        cdef Price_t low_price = price_new(low, price_prec)
-        cdef Price_t close_price = price_new(close, price_prec)
-        cdef Quantity_t volume_qty = quantity_new(volume, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t open_price = price_from_raw(open, price_prec)
+        cdef Price_t high_price = price_from_raw(high, price_prec)
+        cdef Price_t low_price = price_from_raw(low, price_prec)
+        cdef Price_t close_price = price_from_raw(close, price_prec)
+        cdef Quantity_t volume_qty = quantity_from_raw(volume, size_prec)
         cdef Bar bar = Bar.__new__(Bar)
         bar._mem = bar_new(
             bar_type._mem,
@@ -1807,6 +1837,19 @@ cdef class Bar(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ) -> Bar:
+        """
+        Create a bar from raw fixed-point values.
+
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            ``from_dict()`` or other higher-level construction methods instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
+
+        """
         return Bar.from_raw_c(
             bar_type,
             open,
@@ -2005,6 +2048,8 @@ cdef class DataType:
         self._hash = hash((self.type, self._key))  # Assign hash for improved time complexity
 
     def __eq__(self, DataType other) -> bool:
+        if other is None:
+            return False
         return self.type == other.type and self._key == other._key  # noqa
 
     def __lt__(self, DataType other) -> bool:
@@ -2139,6 +2184,8 @@ cdef class BookOrder:
         )
 
     def __eq__(self, BookOrder other) -> bool:
+        if other is None:
+            return False
         return book_order_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -2156,8 +2203,9 @@ cdef class BookOrder:
         uint8_t size_prec,
         uint64_t order_id,
     ):
-        cdef Price_t price = price_new(price_raw, price_prec)
-        cdef Quantity_t size = quantity_new(size_raw, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t price = price_from_raw(price_raw, price_prec)
+        cdef Quantity_t size = quantity_from_raw(size_raw, size_prec)
         cdef BookOrder order = BookOrder.__new__(BookOrder)
         order._mem = book_order_new(
             side,
@@ -2251,7 +2299,16 @@ cdef class BookOrder:
         uint64_t order_id,
     ) -> BookOrder:
         """
-        Return an book order from the given raw values.
+        Return a book order from the given raw values.
+
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            other higher-level construction methods instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
 
         Parameters
         ----------
@@ -2436,6 +2493,8 @@ cdef class OrderBookDelta(Data):
         )
 
     def __eq__(self, OrderBookDelta other) -> bool:
+        if other is None:
+            return False
         return orderbook_delta_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -2603,8 +2662,9 @@ cdef class OrderBookDelta(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ):
-        cdef Price_t price = price_new(price_raw, price_prec)
-        cdef Quantity_t size = quantity_new(size_raw, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t price = price_from_raw(price_raw, price_prec)
+        cdef Quantity_t size = quantity_from_raw(size_raw, size_prec)
         cdef BookOrder_t book_order = book_order_new(
             side,
             price,
@@ -2757,6 +2817,15 @@ cdef class OrderBookDelta(Data):
     ) -> OrderBookDelta:
         """
         Return an order book delta from the given raw values.
+
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            other higher-level construction methods instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
 
         Parameters
         ----------
@@ -3044,6 +3113,8 @@ cdef class OrderBookDeltas(Data):
             orderbook_deltas_drop(self._mem)
 
     def __eq__(self, OrderBookDeltas other) -> bool:
+        if other is None:
+            return False
         return OrderBookDeltas.to_dict_c(self) == OrderBookDeltas.to_dict_c(other)
 
     def __hash__(self) -> int:
@@ -3438,6 +3509,8 @@ cdef class OrderBookDepth10(Data):
             PyMem_Free(ask_counts_array)
 
     def __eq__(self, OrderBookDepth10 other) -> bool:
+        if other is None:
+            return False
         return orderbook_depth10_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -3847,6 +3920,8 @@ cdef class InstrumentStatus(Data):
         self._is_short_sell_restricted = is_short_sell_restricted
 
     def __eq__(self, InstrumentStatus other) -> bool:
+        if other is None:
+            return False
         return InstrumentStatus.to_dict_c(self) == InstrumentStatus.to_dict_c(other)
 
     def __hash__(self) -> int:
@@ -4066,6 +4141,8 @@ cdef class InstrumentClose(Data):
         self.ts_init = ts_init
 
     def __eq__(self, InstrumentClose other) -> bool:
+        if other is None:
+            return False
         return InstrumentClose.to_dict_c(self) == InstrumentClose.to_dict_c(other)
 
     def __hash__(self) -> int:
@@ -4319,6 +4396,8 @@ cdef class QuoteTick(Data):
         )
 
     def __eq__(self, QuoteTick other) -> bool:
+        if other is None:
+            return False
         return quote_tick_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -4477,10 +4556,11 @@ cdef class QuoteTick(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ):
-        cdef Price_t bid_price = price_new(bid_price_raw, bid_price_prec)
-        cdef Price_t ask_price = price_new(ask_price_raw, ask_price_prec)
-        cdef Quantity_t bid_size = quantity_new(bid_size_raw, bid_size_prec)
-        cdef Quantity_t ask_size = quantity_new(ask_size_raw, ask_size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t bid_price = price_from_raw(bid_price_raw, bid_price_prec)
+        cdef Price_t ask_price = price_from_raw(ask_price_raw, ask_price_prec)
+        cdef Quantity_t bid_size = quantity_from_raw(bid_size_raw, bid_size_prec)
+        cdef Quantity_t ask_size = quantity_from_raw(ask_size_raw, ask_size_prec)
         cdef QuoteTick quote = QuoteTick.__new__(QuoteTick)
         quote._mem = quote_tick_new(
             instrument_id._mem,
@@ -4621,6 +4701,15 @@ cdef class QuoteTick(Data):
         """
         Return a quote tick from the given raw values.
 
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            the regular constructor or ``from_dict`` instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
+
         Parameters
         ----------
         instrument_id : InstrumentId
@@ -4656,6 +4745,8 @@ cdef class QuoteTick(Data):
             If `bid_price_prec` != `ask_price_prec`.
         ValueError
             If `bid_size_prec` != `ask_size_prec`.
+        ValueError
+            If any raw price/size value is invalid for the given precision.
 
         """
         Condition.equal(bid_price_prec, ask_price_prec, "bid_price_prec", "ask_price_prec")
@@ -4940,6 +5031,8 @@ cdef class TradeTick(Data):
         )
 
     def __eq__(self, TradeTick other) -> bool:
+        if other is None:
+            return False
         return trade_tick_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -5071,8 +5164,9 @@ cdef class TradeTick(Data):
     ):
         Condition.positive_int(size_raw, "size_raw")
 
-        cdef Price_t price = price_new(price_raw, price_prec)
-        cdef Quantity_t size = quantity_new(size_raw, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t price = price_from_raw(price_raw, price_prec)
+        cdef Quantity_t size = quantity_from_raw(size_raw, size_prec)
 
         cdef TradeTick trade = TradeTick.__new__(TradeTick)
         trade._mem = trade_tick_new(
@@ -5239,6 +5333,15 @@ cdef class TradeTick(Data):
         """
         Return a trade tick from the given raw values.
 
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            the regular constructor or ``from_dict`` instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
+
         Parameters
         ----------
         instrument_id : InstrumentId
@@ -5263,6 +5366,11 @@ cdef class TradeTick(Data):
         Returns
         -------
         TradeTick
+
+        Raises
+        ------
+        ValueError
+            If any raw price/size value is invalid for the given precision.
 
         """
         return TradeTick.from_raw_c(
@@ -5439,6 +5547,8 @@ cdef class MarkPriceUpdate(Data):
         )
 
     def __eq__(self, MarkPriceUpdate other) -> bool:
+        if other is None:
+            return False
         return mark_price_update_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -5680,6 +5790,8 @@ cdef class IndexPriceUpdate(Data):
         )
 
     def __eq__(self, IndexPriceUpdate other) -> bool:
+        if other is None:
+            return False
         return index_price_update_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -5924,6 +6036,8 @@ cdef class FundingRateUpdate(Data):
         self._ts_init = ts_init
 
     def __eq__(self, FundingRateUpdate other) -> bool:
+        if other is None:
+            return False
         return (
             self.instrument_id == other.instrument_id
             and self.rate == other.rate

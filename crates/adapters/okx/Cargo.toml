@@ -46,13 +46,14 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-nautilus-common = { workspace = true }
+nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
 nautilus-data = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
+nautilus-system = { workspace = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -64,10 +65,9 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 derive_builder = { workspace = true }
+dotenvy = { workspace = true }
 futures-util = { workspace = true }
-indexmap = { workspace = true }
 log = { workspace = true }
-reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -87,6 +87,7 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
+
 criterion = { workspace = true }
 iai = { workspace = true }
 rstest = { workspace = true }
@@ -110,3 +111,20 @@ path = "bin/ws_data.rs"
 [[bin]]
 name = "okx-ws-exec"
 path = "bin/ws_exec.rs"
+
+# Run with `cargo run --example okx-data-tester`.
+[[example]]
+name = "okx-data-tester"
+path = "examples/node_data_tester.rs"
+required-features = []
+
+# Run with `cargo run --example okx-exec-tester`.
+[[example]]
+name = "okx-exec-tester"
+path = "examples/node_exec_tester.rs"
+required-features = []
+
+# Run with `cargo bench -p nautilus-okx --bench websocket`
+[[bench]]
+name = "websocket"
+harness = false

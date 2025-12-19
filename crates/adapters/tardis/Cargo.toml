@@ -46,6 +46,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-core = { workspace = true }
+nautilus-cryptography = { workspace = true }
 nautilus-model = { workspace = true, features = ["python"] }
 nautilus-serialization = { workspace = true }
 
@@ -77,6 +78,7 @@ tracing-subscriber = { workspace = true }
 urlencoding = { workspace = true }
 ustr = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }

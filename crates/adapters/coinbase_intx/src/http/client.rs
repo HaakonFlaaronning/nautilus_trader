@@ -41,10 +41,9 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpClientError},
+    http::{HttpClient, HttpClientError, Method, StatusCode, USER_AGENT},
     ratelimiter::quota::Quota,
 };
-use reqwest::{Method, StatusCode, header::USER_AGENT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ustr::Ustr;
 
@@ -723,6 +722,12 @@ impl CoinbaseIntxHttpClient {
     #[must_use]
     pub fn api_key(&self) -> Option<&str> {
         self.inner.credential.as_ref().map(|c| c.api_key.as_str())
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> Option<String> {
+        self.inner.credential.as_ref().map(|c| c.api_key_masked())
     }
 
     /// Checks if the client is initialized.

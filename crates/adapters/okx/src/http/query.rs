@@ -38,7 +38,7 @@ use crate::{
     http::error::BuildError,
 };
 
-#[allow(dead_code, reason = "Under development")]
+#[allow(dead_code)]
 fn serialize_string_vec<S>(values: &Option<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -496,10 +496,6 @@ pub struct GetTradeFeeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_family: Option<String>,
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {

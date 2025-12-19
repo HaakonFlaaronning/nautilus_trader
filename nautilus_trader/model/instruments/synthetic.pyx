@@ -107,13 +107,15 @@ cdef class SyntheticInstrument(Data):
         Condition.list_type(components, InstrumentId, "components")
         Condition.valid_string(formula, "formula")
 
-        if not synthetic_instrument_is_valid_formula(&self._mem, pystr_to_cstr(formula)):
+        comp_bytes = msgspec.json.encode([c.value for c in components])
+
+        if not synthetic_instrument_is_valid_formula(pystr_to_cstr(formula), pybytes_to_cstr(comp_bytes)):
             raise ValueError(f"invalid `formula`, was '{formula}'")
 
         self._mem = synthetic_instrument_new(
             symbol._mem,
             price_precision,
-            pybytes_to_cstr(msgspec.json.encode([c.value for c in components])),
+            pybytes_to_cstr(comp_bytes),
             pystr_to_cstr(formula),
             ts_event,
             ts_init,
@@ -146,6 +148,8 @@ cdef class SyntheticInstrument(Data):
     #     )
 
     def __eq__(self, SyntheticInstrument other) -> bool:
+        if other is None:
+            return False
         return self.id == other.id
 
     def __hash__(self) -> int:
@@ -255,7 +259,9 @@ cdef class SyntheticInstrument(Data):
         """
         Condition.valid_string(formula, "formula")
 
-        if not synthetic_instrument_is_valid_formula(&self._mem, pystr_to_cstr(formula)):
+        comp_bytes = msgspec.json.encode([c.value for c in self.components])
+
+        if not synthetic_instrument_is_valid_formula(pystr_to_cstr(formula), pybytes_to_cstr(comp_bytes)):
             raise ValueError(f"invalid `formula`, was '{formula}'")
 
         synthetic_instrument_change_formula(&self._mem, pystr_to_cstr(formula))

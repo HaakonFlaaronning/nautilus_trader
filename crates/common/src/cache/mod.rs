@@ -27,7 +27,7 @@ mod index;
 mod tests;
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     fmt::Debug,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,7 +43,7 @@ use nautilus_core::{
         check_key_not_in_map, check_predicate_false, check_slice_not_empty,
         check_valid_string_ascii,
     },
-    datetime::secs_to_nanos,
+    datetime::secs_to_nanos_unchecked,
 };
 use nautilus_model::{
     accounts::{Account, AccountAny},
@@ -896,7 +896,7 @@ impl Cache {
             }
         );
 
-        let buffer_ns = secs_to_nanos(buffer_secs as f64);
+        let buffer_ns = secs_to_nanos_unchecked(buffer_secs as f64);
 
         'outer: for client_order_id in self.index.orders_closed.clone() {
             if let Some(order) = self.orders.get(&client_order_id)
@@ -932,7 +932,7 @@ impl Cache {
             }
         );
 
-        let buffer_ns = secs_to_nanos(buffer_secs as f64);
+        let buffer_ns = secs_to_nanos_unchecked(buffer_secs as f64);
 
         for position_id in self.index.positions_closed.clone() {
             if let Some(position) = self.positions.get(&position_id)
@@ -1805,6 +1805,7 @@ impl Cache {
         self.positions.insert(position.id, position.clone());
         self.index.positions.insert(position.id);
         self.index.positions_open.insert(position.id);
+        self.index.positions_closed.remove(&position.id); // Cleanup for NETTING reopen
 
         log::debug!("Adding {position}");
 
@@ -2044,9 +2045,9 @@ impl Cache {
 
     /// Gets position snapshot IDs for the `instrument_id`.
     #[must_use]
-    pub fn position_snapshot_ids(&self, instrument_id: &InstrumentId) -> HashSet<PositionId> {
+    pub fn position_snapshot_ids(&self, instrument_id: &InstrumentId) -> AHashSet<PositionId> {
         // Get snapshot position IDs that match the instrument
-        let mut result = HashSet::new();
+        let mut result = AHashSet::new();
         for (position_id, _) in &self.position_snapshots {
             // Check if this position is for the requested instrument
             if let Some(position) = self.positions.get(position_id)
@@ -3425,7 +3426,7 @@ impl Cache {
 
         // Build union of open and inflight orders for audit,
         // this prevents false positives for SUBMITTED orders during venue latency.
-        let valid_order_ids: HashSet<ClientOrderId> = self
+        let valid_order_ids: AHashSet<ClientOrderId> = self
             .index
             .orders_open
             .union(&self.index.orders_inflight)

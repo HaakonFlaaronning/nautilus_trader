@@ -55,6 +55,7 @@ use std::{
     fmt::Display,
     ops::{Add, AddAssign, Deref, Sub, SubAssign},
     str::FromStr,
+    time::SystemTime,
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -348,6 +349,22 @@ impl From<DateTime<Utc>> for UnixNanos {
     }
 }
 
+impl From<SystemTime> for UnixNanos {
+    fn from(value: SystemTime) -> Self {
+        let duration = value
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime before UNIX EPOCH");
+
+        let nanos = duration.as_nanos();
+        assert!(
+            nanos <= u64::MAX as u128,
+            "SystemTime overflowed u64 nanoseconds"
+        );
+
+        Self::from(nanos as u64)
+    }
+}
+
 impl FromStr for UnixNanos {
     type Err = Box<dyn std::error::Error>;
 
@@ -541,9 +558,6 @@ impl<'de> Deserialize<'de> for UnixNanos {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
@@ -644,6 +658,20 @@ mod tests {
         let datetime = Utc.timestamp_opt(1_000_000_000, 0).unwrap(); // 1 billion seconds since epoch
         let nanos = UnixNanos::from(datetime);
         assert_eq!(nanos.as_u64(), 1_000_000_000_000_000_000);
+    }
+
+    #[rstest]
+    fn test_from_system_time() {
+        let system_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let nanos = UnixNanos::from(system_time);
+        assert_eq!(nanos.as_u64(), 1_000_000_000_000_000_000);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "SystemTime before UNIX EPOCH")]
+    fn test_from_system_time_before_epoch() {
+        let system_time = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let _ = UnixNanos::from(system_time);
     }
 
     #[rstest]

@@ -23,6 +23,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -33,12 +34,17 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{Duration as ChronoDuration, Utc};
+use nautilus_common::testing::wait_until_async;
 use nautilus_core::UnixNanos;
 use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
+use nautilus_network::http::HttpClient;
 use nautilus_okx::{
-    common::enums::{OKXInstrumentType, OKXOrderStatus, OKXPositionMode},
+    common::{
+        enums::{OKXInstrumentType, OKXOrderStatus, OKXPositionMode},
+        models::OKXInstrument,
+    },
     http::{
-        client::{OKXHttpClient, OKXRawHttpClient},
+        client::{OKXHttpClient, OKXRawHttpClient, OKXResponse},
         error::OKXHttpError,
         query::{
             GetAlgoOrdersParamsBuilder, GetInstrumentsParamsBuilder, GetOrderHistoryParams,
@@ -50,16 +56,31 @@ use nautilus_okx::{
 };
 use rstest::rstest;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 use ustr::Ustr;
 
 #[derive(Clone, Default)]
 struct TestServerState {
-    request_count: Arc<Mutex<usize>>,
-    last_history_trades_query: Arc<Mutex<Option<HashMap<String, String>>>>,
-    last_pending_orders_query: Arc<Mutex<Option<HashMap<String, String>>>>,
-    last_order_history_query: Arc<Mutex<Option<HashMap<String, String>>>>,
-    last_order_detail_query: Arc<Mutex<Option<HashMap<String, String>>>>,
+    request_count: Arc<tokio::sync::Mutex<usize>>,
+    last_history_trades_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    last_pending_orders_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    last_order_history_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    last_order_detail_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+}
+
+/// Wait for the test server to be ready by polling a health endpoint.
+async fn wait_for_server(addr: SocketAddr, path: &str) {
+    let health_url = format!("http://{addr}{path}");
+    let http_client =
+        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    wait_until_async(
+        || {
+            let url = health_url.clone();
+            let client = http_client.clone();
+            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 fn manifest_path() -> PathBuf {
@@ -81,9 +102,7 @@ fn has_auth_headers(headers: &HeaderMap) -> bool {
 
 fn load_instruments_any() -> Vec<InstrumentAny> {
     let payload = load_test_data("http_get_instruments_spot.json");
-    let response: nautilus_okx::http::client::OKXResponse<
-        nautilus_okx::common::models::OKXInstrument,
-    > = serde_json::from_value(payload).unwrap();
+    let response: OKXResponse<OKXInstrument> = serde_json::from_value(payload).unwrap();
     let ts_init = UnixNanos::default();
     response
         .data
@@ -401,7 +420,7 @@ async fn start_test_server(state: Arc<TestServerState>) -> SocketAddr {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
     addr
 }
 
@@ -409,7 +428,7 @@ async fn start_test_server(state: Arc<TestServerState>) -> SocketAddr {
 #[tokio::test]
 async fn test_http_get_instruments_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetInstrumentsParamsBuilder::default()
         .inst_type(OKXInstrumentType::Spot)
@@ -436,7 +455,7 @@ async fn test_http_get_instruments_returns_data() {
 #[tokio::test]
 async fn test_http_get_balance_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -453,7 +472,7 @@ async fn test_http_get_balance_requires_credentials() {
 #[tokio::test]
 async fn test_http_get_balance_with_credentials_succeeds() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client = OKXRawHttpClient::with_credentials(
         "test_key".to_string(),
@@ -479,7 +498,7 @@ async fn test_http_get_balance_with_credentials_succeeds() {
 async fn test_http_get_instruments_handles_rate_limit_error() {
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetInstrumentsParamsBuilder::default()
         .inst_type(OKXInstrumentType::Spot)
@@ -517,7 +536,7 @@ async fn test_http_get_instruments_handles_rate_limit_error() {
 #[tokio::test]
 async fn test_http_get_pending_orders_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -543,7 +562,7 @@ async fn test_http_get_pending_orders_requires_credentials() {
 async fn test_http_get_pending_orders_returns_live_orders() {
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client = OKXRawHttpClient::with_credentials(
         "key".to_string(),
@@ -590,7 +609,7 @@ async fn test_http_get_pending_orders_returns_live_orders() {
 async fn test_http_get_order_history_applies_filters() {
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client = OKXRawHttpClient::with_credentials(
         "key".to_string(),
@@ -633,7 +652,7 @@ async fn test_http_get_order_history_applies_filters() {
 async fn test_http_get_order_by_client_and_exchange_ids() {
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client = OKXRawHttpClient::with_credentials(
         "key".to_string(),
@@ -671,7 +690,7 @@ async fn test_http_get_order_by_client_and_exchange_ids() {
 async fn test_request_trades_pagination_parameters() {
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -766,9 +785,9 @@ async fn test_request_trades_latest_mode() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -868,9 +887,9 @@ async fn test_request_trades_chronological_order() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1006,9 +1025,9 @@ async fn test_request_trades_range_mode_pagination() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1162,9 +1181,9 @@ async fn test_request_bars_range_mode_pagination() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1214,7 +1233,7 @@ async fn test_request_trades_multi_page_chronological_order() {
     // fetches multiple pages (each page contains older trades than the previous)
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -1317,9 +1336,9 @@ async fn test_request_trades_overlapping_pages_chronological_order() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1425,9 +1444,9 @@ async fn test_request_trades_default_limit_with_end_only() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1565,9 +1584,9 @@ async fn test_request_trades_historical_with_filtered_pages() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1663,7 +1682,7 @@ async fn test_request_trades_multiple_trades_same_id() {
             .unwrap();
     });
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -1702,22 +1721,18 @@ async fn test_request_trades_multiple_trades_same_id() {
     }
 
     // Verify the 3 trades with same ID are all present (different timestamps)
-    let id_1003_trades: Vec<_> = trades
+    let id_1003_count = trades
         .iter()
         .filter(|t| t.trade_id.to_string() == "1003")
-        .collect();
-    assert_eq!(
-        id_1003_trades.len(),
-        3,
-        "Should have all 3 trades with ID 1003"
-    );
+        .count();
+    assert_eq!(id_1003_count, 3, "Should have all 3 trades with ID 1003");
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_http_get_order_algo_pending_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -1739,7 +1754,7 @@ async fn test_http_get_order_algo_pending_requires_credentials() {
 #[tokio::test]
 async fn test_http_get_order_algo_pending_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetAlgoOrdersParamsBuilder::default()
         .inst_type(OKXInstrumentType::Swap)
@@ -1770,7 +1785,7 @@ async fn test_http_get_order_algo_pending_returns_data() {
 #[tokio::test]
 async fn test_http_get_order_algo_history_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetAlgoOrdersParamsBuilder::default()
         .inst_type(OKXInstrumentType::Swap)
@@ -1804,7 +1819,7 @@ async fn test_http_get_order_algo_history_returns_data() {
 #[tokio::test]
 async fn test_http_set_position_mode_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -1826,7 +1841,7 @@ async fn test_http_set_position_mode_requires_credentials() {
 #[tokio::test]
 async fn test_http_set_position_mode_returns_response() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client = OKXRawHttpClient::with_credentials(
         "test_key".to_string(),
@@ -1856,7 +1871,7 @@ async fn test_http_set_position_mode_returns_response() {
 #[tokio::test]
 async fn test_http_get_position_tiers_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetPositionTiersParamsBuilder::default()
         .inst_type(OKXInstrumentType::Spot)
@@ -1887,7 +1902,7 @@ async fn test_http_get_position_tiers_returns_data() {
 #[tokio::test]
 async fn test_http_get_trade_fee_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -1911,7 +1926,7 @@ async fn test_http_get_trade_fee_requires_credentials() {
 #[tokio::test]
 async fn test_http_get_trade_fee_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetTradeFeeParamsBuilder::default()
         .inst_type(OKXInstrumentType::Spot)
@@ -1943,7 +1958,7 @@ async fn test_http_get_trade_fee_returns_data() {
 #[tokio::test]
 async fn test_http_get_positions_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -1962,7 +1977,7 @@ async fn test_http_get_positions_requires_credentials() {
 #[tokio::test]
 async fn test_http_get_positions_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetPositionsParamsBuilder::default().build().unwrap();
     let client = OKXRawHttpClient::with_credentials(
@@ -1989,7 +2004,7 @@ async fn test_http_get_positions_returns_data() {
 #[tokio::test]
 async fn test_http_get_fills_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
@@ -2010,7 +2025,7 @@ async fn test_http_get_fills_requires_credentials() {
 #[tokio::test]
 async fn test_http_get_fills_returns_data() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let params = GetTransactionDetailsParamsBuilder::default()
         .build()
@@ -2042,7 +2057,7 @@ async fn test_http_network_error_invalid_port() {
     let base_url = "http://127.0.0.1:1".to_string();
 
     let client =
-        OKXRawHttpClient::new(Some(base_url), Some(1), None, None, None, false, None).unwrap();
+        OKXRawHttpClient::new(Some(base_url), Some(1), Some(0), None, None, false, None).unwrap();
 
     let params = GetInstrumentsParamsBuilder::default()
         .inst_type(OKXInstrumentType::Spot)
@@ -2084,9 +2099,9 @@ async fn test_http_okx_error_response() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -2127,9 +2142,9 @@ async fn test_http_malformed_json_response() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -2173,9 +2188,9 @@ async fn test_http_500_internal_server_error() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -2217,11 +2232,11 @@ async fn test_http_503_service_unavailable() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
-        OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
+        OKXRawHttpClient::new(Some(base_url), Some(60), Some(0), None, None, false, None).unwrap();
 
     let params = GetInstrumentsParamsBuilder::default()
         .inst_type(OKXInstrumentType::Spot)
@@ -2267,9 +2282,9 @@ async fn test_http_invalid_response_structure() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 
@@ -2315,16 +2330,16 @@ async fn test_http_rate_limit_error_different_code() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client = OKXRawHttpClient::with_credentials(
         "test_key".to_string(),
         "test_secret".to_string(),
         "test_passphrase".to_string(),
         base_url,
         Some(60),
-        None,
+        Some(0),
         None,
         None,
         false,
@@ -2370,9 +2385,9 @@ async fn test_http_empty_response_data() {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_server(addr, "/api/v5/public/instruments").await;
 
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
     let client =
         OKXRawHttpClient::new(Some(base_url), Some(60), None, None, None, false, None).unwrap();
 

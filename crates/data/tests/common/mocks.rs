@@ -95,7 +95,7 @@ impl MockDataClient {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl DataClient for MockDataClient {
     fn client_id(&self) -> ClientId {
         self.client_id
@@ -654,8 +654,84 @@ impl DataClient for MockDataClient {
     }
 }
 
-// SAFETY: Cannot be sent across thread boundaries
+// SAFETY: MockDataClient contains Rc<RefCell<...>> fields which are not thread-safe.
+// These implementations exist to satisfy trait bounds but the type must only be used
+// on a single thread. Tests ensure single-threaded access.
+// WARNING: Actually sending this type across threads is undefined behavior.
 #[allow(unsafe_code)]
 unsafe impl Send for MockDataClient {}
 #[allow(unsafe_code)]
 unsafe impl Sync for MockDataClient {}
+
+/// A mock data client that fails on connect for testing error propagation.
+pub struct FailingMockDataClient {
+    pub client_id: ClientId,
+    pub venue: Option<Venue>,
+    pub error_message: String,
+}
+
+impl FailingMockDataClient {
+    /// Creates a new [`FailingMockDataClient`] that will fail with the given error message.
+    #[must_use]
+    pub fn new(
+        client_id: ClientId,
+        venue: Option<Venue>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_id,
+            venue,
+            error_message: error_message.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl DataClient for FailingMockDataClient {
+    fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    fn venue(&self) -> Option<Venue> {
+        self.venue
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("{}", self.error_message)
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        false
+    }
+
+    fn is_disconnected(&self) -> bool {
+        true
+    }
+}
+
+// Note: FailingMockDataClient only contains Send+Sync types (ClientId, Venue, String),
+// so these impls may be redundant. Kept for consistency with MockDataClient.
+#[allow(unsafe_code)]
+unsafe impl Send for FailingMockDataClient {}
+#[allow(unsafe_code)]
+unsafe impl Sync for FailingMockDataClient {}

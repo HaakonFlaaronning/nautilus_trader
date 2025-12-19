@@ -107,7 +107,7 @@ def create_tester_factory(trader_id, msgbus, cache, clock, portfolio):
         testers.append(tester)
         return tester
 
-    yield _create_tester
+    return _create_tester
 
 
 # ================================================================================================
@@ -1838,7 +1838,7 @@ def test_on_order_book_depth_calls_without_error(
         clock=clock,
     )
 
-    depth = TestDataStubs.order_book_depth10(instrument_id)
+    depth = TestDataStubs.order_book_depth10(instrument_id=instrument_id)
 
     # Act & Assert - should not raise
     tester.on_order_book_depth(depth)

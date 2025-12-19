@@ -15,6 +15,8 @@
 
 //! Configuration structures for the OKX adapter.
 
+use nautilus_model::identifiers::{AccountId, TraderId};
+
 use crate::common::{
     enums::{OKXContractType, OKXInstrumentType, OKXMarginMode, OKXVipLevel},
     urls::{
@@ -100,10 +102,14 @@ impl OKXDataClientConfig {
         Self::default()
     }
 
-    /// Returns `true` when all API credential fields are populated.
+    /// Returns `true` when all API credential fields are available (in config or env vars).
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
-        self.api_key.is_some() && self.api_secret.is_some() && self.api_passphrase.is_some()
+        let has_key = self.api_key.is_some() || std::env::var("OKX_API_KEY").is_ok();
+        let has_secret = self.api_secret.is_some() || std::env::var("OKX_API_SECRET").is_ok();
+        let has_passphrase =
+            self.api_passphrase.is_some() || std::env::var("OKX_API_PASSPHRASE").is_ok();
+        has_key && has_secret && has_passphrase
     }
 
     /// Returns the HTTP base URL, falling back to the default when unset.
@@ -138,6 +144,10 @@ impl OKXDataClientConfig {
 /// Configuration for the OKX execution client.
 #[derive(Clone, Debug)]
 pub struct OKXExecClientConfig {
+    /// The trader ID for the client.
+    pub trader_id: TraderId,
+    /// The account ID for the client.
+    pub account_id: AccountId,
     /// Optional API key for authenticated endpoints.
     pub api_key: Option<String>,
     /// Optional API secret for authenticated endpoints.
@@ -187,6 +197,8 @@ pub struct OKXExecClientConfig {
 impl Default for OKXExecClientConfig {
     fn default() -> Self {
         Self {
+            trader_id: TraderId::from("TRADER-001"),
+            account_id: AccountId::from("OKX-001"),
             api_key: None,
             api_secret: None,
             api_passphrase: None,
@@ -218,10 +230,14 @@ impl OKXExecClientConfig {
         Self::default()
     }
 
-    /// Returns `true` when all API credential fields are populated.
+    /// Returns `true` when all API credential fields are available (in config or env vars).
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
-        self.api_key.is_some() && self.api_secret.is_some() && self.api_passphrase.is_some()
+        let has_key = self.api_key.is_some() || std::env::var("OKX_API_KEY").is_ok();
+        let has_secret = self.api_secret.is_some() || std::env::var("OKX_API_SECRET").is_ok();
+        let has_passphrase =
+            self.api_passphrase.is_some() || std::env::var("OKX_API_PASSPHRASE").is_ok();
+        has_key && has_secret && has_passphrase
     }
 
     /// Returns the HTTP base URL, falling back to the default when unset.

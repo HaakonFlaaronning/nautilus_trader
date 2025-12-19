@@ -47,6 +47,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use book::{BookSnapshotInfo, BookSnapshotter, BookUpdater};
 use config::DataEngineConfig;
+use futures::future::join_all;
 use handlers::{BarBarHandler, BarQuoteHandler, BarTradeHandler};
 use indexmap::IndexMap;
 use nautilus_common::{
@@ -66,7 +67,7 @@ use nautilus_core::{
     correctness::{
         FAILED, check_key_in_map, check_key_not_in_map, check_predicate_false, check_predicate_true,
     },
-    datetime::millis_to_nanos,
+    datetime::millis_to_nanos_unchecked,
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
@@ -80,6 +81,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
 };
+#[cfg(feature = "streaming")]
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use ustr::Ustr;
 
@@ -90,8 +92,10 @@ use crate::defi::engine as _;
 use crate::engine::pool::PoolUpdater;
 use crate::{
     aggregation::{
-        BarAggregator, RenkoBarAggregator, TickBarAggregator, TimeBarAggregator,
-        ValueBarAggregator, VolumeBarAggregator,
+        BarAggregator, RenkoBarAggregator, TickBarAggregator, TickImbalanceBarAggregator,
+        TickRunsBarAggregator, TimeBarAggregator, ValueBarAggregator, ValueImbalanceBarAggregator,
+        ValueRunsBarAggregator, VolumeBarAggregator, VolumeImbalanceBarAggregator,
+        VolumeRunsBarAggregator,
     },
     client::DataClientAdapter,
 };
@@ -104,6 +108,7 @@ pub struct DataEngine {
     pub(crate) external_clients: AHashSet<ClientId>,
     clients: IndexMap<ClientId, DataClientAdapter>,
     default_client: Option<DataClientAdapter>,
+    #[cfg(feature = "streaming")]
     catalogs: AHashMap<Ustr, ParquetDataCatalog>,
     routing_map: IndexMap<Venue, ClientId>,
     book_intervals: AHashMap<NonZeroUsize, AHashSet<InstrumentId>>,
@@ -149,6 +154,7 @@ impl DataEngine {
             external_clients,
             clients: IndexMap::new(),
             default_client: None,
+            #[cfg(feature = "streaming")]
             catalogs: AHashMap::new(),
             routing_map: IndexMap::new(),
             book_intervals: AHashMap::new(),
@@ -195,8 +201,9 @@ impl DataEngine {
     /// # Panics
     ///
     /// Panics if a catalog with the same `name` has already been registered.
+    #[cfg(feature = "streaming")]
     pub fn register_catalog(&mut self, catalog: ParquetDataCatalog, name: Option<String>) {
-        let name = Ustr::from(&name.unwrap_or("catalog_0".to_string()));
+        let name = Ustr::from(name.as_deref().unwrap_or("catalog_0"));
 
         check_key_not_in_map(&name, &self.catalogs, "name", "catalogs").expect(FAILED);
 
@@ -309,6 +316,55 @@ impl DataEngine {
         }
 
         self.clock.borrow_mut().cancel_timers();
+    }
+
+    /// Connects all registered data clients concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any client fails to connect.
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let futures: Vec<_> = self
+            .get_clients_mut()
+            .into_iter()
+            .map(|client| client.connect())
+            .collect();
+
+        let results = join_all(futures).await;
+        let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let error_msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+            anyhow::bail!("Failed to connect data clients: {}", error_msgs.join("; "))
+        }
+    }
+
+    /// Disconnects all registered data clients concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any client fails to disconnect.
+    pub async fn disconnect(&mut self) -> anyhow::Result<()> {
+        let futures: Vec<_> = self
+            .get_clients_mut()
+            .into_iter()
+            .map(|client| client.disconnect())
+            .collect();
+
+        let results = join_all(futures).await;
+        let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let error_msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+            anyhow::bail!(
+                "Failed to disconnect data clients: {}",
+                error_msgs.join("; ")
+            )
+        }
     }
 
     /// Returns `true` if all registered data clients are currently connected.
@@ -912,7 +968,7 @@ impl DataEngine {
 
         if first_for_interval {
             // Initialize snapshotter and schedule its timer
-            let interval_ns = millis_to_nanos(cmd.interval_ms.get() as f64);
+            let interval_ns = millis_to_nanos_unchecked(cmd.interval_ms.get() as f64);
             let topic = switchboard::get_book_snapshots_topic(cmd.instrument_id, cmd.interval_ms);
 
             let snap_info = BookSnapshotInfo {
@@ -1223,13 +1279,49 @@ impl DataEngine {
                     size_precision,
                     handler,
                 )) as Box<dyn BarAggregator>,
+                BarAggregation::TickImbalance => Box::new(TickImbalanceBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    handler,
+                )) as Box<dyn BarAggregator>,
+                BarAggregation::TickRuns => Box::new(TickRunsBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    handler,
+                )) as Box<dyn BarAggregator>,
                 BarAggregation::Volume => Box::new(VolumeBarAggregator::new(
                     bar_type,
                     price_precision,
                     size_precision,
                     handler,
                 )) as Box<dyn BarAggregator>,
+                BarAggregation::VolumeImbalance => Box::new(VolumeImbalanceBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    handler,
+                )) as Box<dyn BarAggregator>,
+                BarAggregation::VolumeRuns => Box::new(VolumeRunsBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    handler,
+                )) as Box<dyn BarAggregator>,
                 BarAggregation::Value => Box::new(ValueBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    handler,
+                )) as Box<dyn BarAggregator>,
+                BarAggregation::ValueImbalance => Box::new(ValueImbalanceBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    handler,
+                )) as Box<dyn BarAggregator>,
+                BarAggregation::ValueRuns => Box::new(ValueRunsBarAggregator::new(
                     bar_type,
                     price_precision,
                     size_precision,
@@ -1243,7 +1335,7 @@ impl DataEngine {
                     handler,
                 )) as Box<dyn BarAggregator>,
                 _ => panic!(
-                    "BarAggregation {:?} is not currently implemented. Supported aggregations: MILLISECOND, SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR, TICK, VOLUME, VALUE, RENKO",
+                    "BarAggregation {:?} is not currently implemented. Supported aggregations: MILLISECOND, SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR, TICK, TICK_IMBALANCE, TICK_RUNS, VOLUME, VOLUME_IMBALANCE, VOLUME_RUNS, VALUE, VALUE_IMBALANCE, VALUE_RUNS, RENKO",
                     bar_type.spec().aggregation
                 ),
             }

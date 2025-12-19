@@ -274,6 +274,8 @@ cdef class Instrument(Data):
             self._tick_scheme = get_tick_scheme(self.tick_scheme_name)
 
     def __eq__(self, Instrument other) -> bool:
+        if other is None:
+            return False
         return self.id == other.id
 
     def __hash__(self) -> int:
@@ -424,6 +426,32 @@ cdef class Instrument(Data):
 
         """
         return self.id.venue
+
+    cpdef bint is_spread(self):
+        """
+        Return whether the instrument is a spread instrument.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
+
+    cpdef list legs(self):
+        """
+        Return the list of leg tuples (instrument_id, ratio) for this spread.
+
+        Base implementation returns an empty list. Override in spread instrument
+        classes to return the actual legs.
+
+        Returns
+        -------
+        list[tuple[InstrumentId, int]]
+            List of tuples containing (instrument_id, ratio) for each leg.
+
+        """
+        return [(self.id, 1)]
 
     cpdef Currency get_base_currency(self):
         """

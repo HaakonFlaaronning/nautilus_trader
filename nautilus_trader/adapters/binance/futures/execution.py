@@ -36,6 +36,7 @@ from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFutu
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesLeverage
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesPositionRisk
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesAccountUpdateWrapper
+from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesAlgoUpdateWrapper
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesOrderUpdateWrapper
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesTradeLiteWrapper
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesUserMsgWrapper
@@ -139,6 +140,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             BinanceFuturesEventType.ACCOUNT_CONFIG_UPDATE: self._handle_account_config_update,
             BinanceFuturesEventType.LISTEN_KEY_EXPIRED: self._handle_listen_key_expired,
             BinanceFuturesEventType.TRADE_LITE: self._handle_trade_lite,
+            BinanceFuturesEventType.ALGO_UPDATE: self._handle_algo_update,
         }
 
         self._use_trade_lite = config.use_trade_lite
@@ -159,6 +161,9 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         self._decoder_futures_trade_lite_wrapper = msgspec.json.Decoder(
             BinanceFuturesTradeLiteWrapper,
         )
+        self._decoder_futures_algo_update_wrapper = msgspec.json.Decoder(
+            BinanceFuturesAlgoUpdateWrapper,
+        )
 
     async def _update_account_state(self) -> None:
         account_info: BinanceFuturesAccountInfo = (
@@ -166,7 +171,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         )
         if account_info.canTrade:
             self._log.info("Binance API key authenticated", LogColor.GREEN)
-            self._log.info(f"API key {self._http_client.api_key} has trading permissions")
+            self._log.info(f"API key {self._http_client.api_key_masked} has trading permissions")
         else:
             self._log.error("Binance API key does not have trading permissions")
         self.generate_account_state(
@@ -462,3 +467,13 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             return
         order_data = trade_lite.data.to_order_data()
         order_data.handle_order_trade_update(self)
+
+    def _handle_algo_update(self, raw: bytes) -> None:
+        algo_update = self._decoder_futures_algo_update_wrapper.decode(raw)
+        order_data = algo_update.data.o
+        self._log.debug(
+            f"ALGO_UPDATE received: caid={order_data.caid}, aid={order_data.aid}, "
+            f"status={order_data.X}, symbol={order_data.s}",
+        )
+        ts_event = millis_to_nanos(algo_update.data.T)
+        order_data.handle_algo_update(self, ts_event)

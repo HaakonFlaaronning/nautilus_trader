@@ -24,6 +24,7 @@ from nautilus_trader.adapters.binance.common.urls import get_http_base_url
 from nautilus_trader.adapters.binance.common.urls import get_ws_base_url
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
 from nautilus_trader.adapters.binance.config import BinanceExecClientConfig
+from nautilus_trader.adapters.binance.config import BinanceInstrumentProviderConfig
 from nautilus_trader.adapters.binance.futures.data import BinanceFuturesDataClient
 from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExecutionClient
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
@@ -66,8 +67,10 @@ def get_cached_binance_http_client(
         The account type for the client.
     api_key : str, optional
         The API key for the client.
+        If ``None``, the client will work for public market data only.
     api_secret : str, optional
         The API secret for the client.
+        If ``None``, the client will work for public market data only.
     key_type : BinanceKeyType, default 'HMAC'
         The private key cryptographic algorithm type.
     base_url : str, optional
@@ -84,8 +87,6 @@ def get_cached_binance_http_client(
     BinanceHttpClient
 
     """
-    api_key = api_key or get_api_key(account_type, is_testnet)
-    api_secret = api_secret or get_api_secret(account_type, is_testnet)
     default_http_base_url = get_http_base_url(account_type, is_testnet, is_us)
 
     match key_type:
@@ -123,6 +124,7 @@ def get_cached_binance_http_client(
             (global_key, global_quota),
             ("binance:fapi/v1/order", Quota.rate_per_minute(1200)),
             ("binance:fapi/v1/allOrders", Quota.rate_per_minute(int(1200 / 20))),
+            ("binance:fapi/v1/commissionRate", Quota.rate_per_minute(int(2400 / 20))),
             ("binance:fapi/v1/klines", Quota.rate_per_minute(600)),
         ]
 
@@ -189,7 +191,7 @@ def get_cached_binance_futures_instrument_provider(
     client: BinanceHttpClient,
     clock: LiveClock,
     account_type: BinanceAccountType,
-    config: InstrumentProviderConfig,
+    config: InstrumentProviderConfig | BinanceInstrumentProviderConfig,
     venue: Venue,
 ) -> BinanceFuturesInstrumentProvider:
     """
@@ -205,7 +207,7 @@ def get_cached_binance_futures_instrument_provider(
         The clock for the instrument provider.
     account_type : BinanceAccountType
         The Binance account type for the instrument provider.
-    config : InstrumentProviderConfig
+    config : InstrumentProviderConfig | BinanceInstrumentProviderConfig
         The configuration for the instrument provider.
     venue : Venue
         The venue for the instrument provider.
@@ -375,12 +377,16 @@ class BinanceLiveExecClientFactory(LiveExecClientFactory):
             If `config.account_type` is not a valid `BinanceAccountType`.
 
         """
+        # Execution client requires authentication
+        api_key = config.api_key or get_api_key(config.account_type, config.testnet)
+        api_secret = config.api_secret or get_api_secret(config.account_type, config.testnet)
+
         # Get HTTP client singleton
         client: BinanceHttpClient = get_cached_binance_http_client(
             clock=clock,
             account_type=config.account_type,
-            api_key=config.api_key,
-            api_secret=config.api_secret,
+            api_key=api_key,
+            api_secret=api_secret,
             key_type=config.key_type,
             base_url=config.base_url_http,
             is_testnet=config.testnet,

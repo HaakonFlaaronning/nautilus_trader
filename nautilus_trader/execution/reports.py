@@ -69,6 +69,7 @@ from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders import Order
 
 
 class ExecutionReport(Document):
@@ -283,7 +284,35 @@ class OrderStatusReport(ExecutionReport):
             OrderStatus.PARTIALLY_FILLED,
         )
 
+    def is_order_updated(self, order: Order) -> bool:
+        """
+        Return whether the order has been updated based on this report.
+
+        Parameters
+        ----------
+        order : Order
+            The order to compare against.
+
+        Returns
+        -------
+        bool
+
+        """
+        if order.has_price and self.price and order.price != self.price:
+            return True
+
+        if (
+            order.has_trigger_price
+            and self.trigger_price
+            and order.trigger_price != self.trigger_price
+        ):
+            return True
+
+        return order.quantity != self.quantity
+
     def __eq__(self, other: object) -> bool:
+        if other is None:
+            return False
         if not isinstance(other, OrderStatusReport):
             return False
         return (
@@ -668,6 +697,8 @@ class FillReport(ExecutionReport):
         self.ts_event = ts_event
 
     def __eq__(self, other: object) -> bool:
+        if other is None:
+            return False
         if not isinstance(other, FillReport):
             return False
         return (

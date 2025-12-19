@@ -179,11 +179,11 @@ where
     result
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
-#[allow(clippy::unnecessary_to_owned)]
+#[allow(
+    clippy::unnecessary_to_owned,
+    reason = "Required for trait bound satisfaction"
+)]
 mod tests {
     use std::collections::{HashMap, HashSet};
 

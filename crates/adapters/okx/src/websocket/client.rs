@@ -36,7 +36,7 @@ use ahash::AHashSet;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures_util::Stream;
-use nautilus_common::runtime::get_runtime;
+use nautilus_common::live::runtime::get_runtime;
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT,
     env::{get_env_var, get_or_env_var},
@@ -49,6 +49,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
+    http::USER_AGENT,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
     websocket::{
@@ -56,7 +57,6 @@ use nautilus_network::{
         WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
-use reqwest::header::USER_AGENT;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_util::sync::CancellationToken;
@@ -155,7 +155,6 @@ pub struct OKXWebSocketClient {
     subscriptions_state: SubscriptionState,
     request_id_counter: Arc<AtomicU64>,
     active_client_orders: Arc<DashMap<ClientOrderId, (TraderId, StrategyId, InstrumentId)>>,
-    emitted_order_accepted: Arc<DashMap<VenueOrderId, ()>>, // Track orders we've already emitted OrderAccepted for
     client_id_aliases: Arc<DashMap<ClientOrderId, ClientOrderId>>,
     instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
     cancellation_token: CancellationToken,
@@ -239,7 +238,6 @@ impl OKXWebSocketClient {
             subscriptions_state,
             request_id_counter: Arc::new(AtomicU64::new(1)),
             active_client_orders: Arc::new(DashMap::new()),
-            emitted_order_accepted: Arc::new(DashMap::new()),
             client_id_aliases: Arc::new(DashMap::new()),
             instruments_cache: Arc::new(DashMap::new()),
             cancellation_token: CancellationToken::new(),
@@ -317,18 +315,24 @@ impl OKXWebSocketClient {
         self.credential.clone().map(|c| c.api_key.as_str())
     }
 
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> Option<String> {
+        self.credential.clone().map(|c| c.api_key_masked())
+    }
+
     /// Returns a value indicating whether the client is active.
     pub fn is_active(&self) -> bool {
         let connection_mode_arc = self.connection_mode.load();
         ConnectionMode::from_atomic(&connection_mode_arc).is_active()
-            && !self.signal.load(Ordering::Relaxed)
+            && !self.signal.load(Ordering::Acquire)
     }
 
     /// Returns a value indicating whether the client is closed.
     pub fn is_closed(&self) -> bool {
         let connection_mode_arc = self.connection_mode.load();
         ConnectionMode::from_atomic(&connection_mode_arc).is_closed()
-            || self.signal.load(Ordering::Relaxed)
+            || self.signal.load(Ordering::Acquire)
     }
 
     /// Caches multiple instruments.
@@ -409,6 +413,7 @@ impl OKXWebSocketClient {
             reconnect_delay_max_ms: None,     // Use default
             reconnect_backoff_factor: None,   // Use default
             reconnect_jitter_ms: None,        // Use default
+            reconnect_max_attempts: None,
         };
 
         // Configure rate limits for different operation types
@@ -456,7 +461,6 @@ impl OKXWebSocketClient {
 
         let signal = self.signal.clone();
         let active_client_orders = self.active_client_orders.clone();
-        let emitted_order_accepted = self.emitted_order_accepted.clone();
         let auth_tracker = self.auth_tracker.clone();
         let subscriptions_state = self.subscriptions_state.clone();
         let client_id_aliases = self.client_id_aliases.clone();
@@ -481,7 +485,6 @@ impl OKXWebSocketClient {
                     msg_tx,
                     active_client_orders,
                     client_id_aliases,
-                    emitted_order_accepted,
                     auth_tracker.clone(),
                     subscriptions_state.clone(),
                 );
@@ -490,7 +493,7 @@ impl OKXWebSocketClient {
                 let resubscribe_all = || {
                     for entry in subscriptions_inst_id.iter() {
                         let (channel, inst_ids) = entry.pair();
-                        for inst_id in inst_ids.iter() {
+                        for inst_id in inst_ids {
                             let arg = OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: None,
@@ -518,7 +521,7 @@ impl OKXWebSocketClient {
 
                     for entry in subscriptions_inst_type.iter() {
                         let (channel, inst_types) = entry.pair();
-                        for inst_type in inst_types.iter() {
+                        for inst_type in inst_types {
                             let arg = OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: Some(*inst_type),
@@ -533,7 +536,7 @@ impl OKXWebSocketClient {
 
                     for entry in subscriptions_inst_family.iter() {
                         let (channel, inst_families) = entry.pair();
-                        for inst_family in inst_families.iter() {
+                        for inst_family in inst_families {
                             let arg = OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: None,
@@ -551,7 +554,7 @@ impl OKXWebSocketClient {
                 loop {
                     match handler.next().await {
                         Some(NautilusWsMessage::Reconnected) => {
-                            if signal.load(Ordering::Relaxed) {
+                            if signal.load(Ordering::Acquire) {
                                 continue;
                             }
 
@@ -563,11 +566,11 @@ impl OKXWebSocketClient {
                                 let mut topics = Vec::new();
                                 for entry in confirmed.iter() {
                                     let channel = entry.key();
-                                    for symbol in entry.value().iter() {
+                                    for symbol in entry.value() {
                                         if symbol.as_str() == "#" {
                                             topics.push(channel.to_string());
                                         } else {
-                                            topics.push(format!("{}{}{}", channel, OKX_WS_TOPIC_DELIMITER, symbol));
+                                            topics.push(format!("{channel}{OKX_WS_TOPIC_DELIMITER}{symbol}"));
                                         }
                                     }
                                 }
@@ -648,7 +651,7 @@ impl OKXWebSocketClient {
                                 );
                                 break;
                             }
-                            tracing::warn!("WebSocket stream ended unexpectedly");
+                            tracing::debug!("WebSocket stream closed");
                             break;
                         }
                     }
@@ -789,7 +792,7 @@ impl OKXWebSocketClient {
     pub async fn close(&mut self) -> Result<(), Error> {
         log::debug!("Starting close process");
 
-        self.signal.store(true, Ordering::Relaxed);
+        self.signal.store(true, Ordering::Release);
 
         if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
             log::warn!("Failed to send disconnect command to handler: {e}");
@@ -904,7 +907,7 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::ClientError(format!("Failed to send subscribe command: {e}")))
     }
 
-    #[allow(clippy::collapsible_if, reason = "Clearer uncollapsed")]
+    #[allow(clippy::collapsible_if)]
     async fn unsubscribe(&self, args: Vec<OKXSubscriptionArg>) -> Result<(), OKXWsError> {
         for arg in &args {
             let topic = topic_from_subscription_arg(arg);
@@ -972,7 +975,7 @@ impl OKXWebSocketClient {
 
         for entry in self.subscriptions_inst_type.iter() {
             let (channel, inst_types) = entry.pair();
-            for inst_type in inst_types.iter() {
+            for inst_type in inst_types {
                 all_args.push(OKXSubscriptionArg {
                     channel: channel.clone(),
                     inst_type: Some(*inst_type),
@@ -984,7 +987,7 @@ impl OKXWebSocketClient {
 
         for entry in self.subscriptions_inst_family.iter() {
             let (channel, inst_families) = entry.pair();
-            for inst_family in inst_families.iter() {
+            for inst_family in inst_families {
                 all_args.push(OKXSubscriptionArg {
                     channel: channel.clone(),
                     inst_type: None,
@@ -996,7 +999,7 @@ impl OKXWebSocketClient {
 
         for entry in self.subscriptions_inst_id.iter() {
             let (channel, inst_ids) = entry.pair();
-            for inst_id in inst_ids.iter() {
+            for inst_id in inst_ids {
                 all_args.push(OKXSubscriptionArg {
                     channel: channel.clone(),
                     inst_type: None,
@@ -1086,7 +1089,7 @@ impl OKXWebSocketClient {
             return Ok(());
         }
 
-        tracing::info!("Subscribing to instrument type {inst_type:?} for {instrument_id}");
+        tracing::debug!("Subscribing to instrument type {inst_type:?} for {instrument_id}");
         self.subscribe_instruments(inst_type).await
     }
 
@@ -2010,11 +2013,7 @@ impl OKXWebSocketClient {
         };
 
         log::debug!(
-            "Order type mapping: order_type={:?}, time_in_force={:?}, post_only={:?} -> okx_ord_type={:?}",
-            order_type,
-            time_in_force,
-            post_only,
-            okx_ord_type
+            "Order type mapping: order_type={order_type:?}, time_in_force={time_in_force:?}, post_only={post_only:?} -> okx_ord_type={okx_ord_type:?}"
         );
 
         builder.ord_type(okx_ord_type);
@@ -2457,10 +2456,6 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::ClientError(format!("Handler not available: {e}")))
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {

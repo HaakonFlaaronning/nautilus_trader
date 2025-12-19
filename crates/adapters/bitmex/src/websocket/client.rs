@@ -20,16 +20,22 @@
 //! are provided), manages subscriptions to market data and account update channels,
 //! and parses incoming messages into structured Nautilus domain objects.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures_util::Stream;
-use nautilus_common::runtime::get_runtime;
-use nautilus_core::{consts::NAUTILUS_USER_AGENT, env::get_env_var};
+use nautilus_common::live::runtime::get_runtime;
+use nautilus_core::{
+    consts::NAUTILUS_USER_AGENT,
+    env::{get_env_var, get_or_env_var_opt},
+};
 use nautilus_model::{
     data::bar::BarType,
     enums::OrderType,
@@ -37,14 +43,13 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::{
+    http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
         AUTHENTICATION_TIMEOUT_SECS, AuthTracker, PingHandler, SubscriptionState, WebSocketClient,
         WebSocketConfig, channel_message_handler,
     },
 };
-use reqwest::header::USER_AGENT;
-use tokio::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
@@ -138,6 +143,36 @@ impl BitmexWebSocketClient {
         })
     }
 
+    /// Creates a new [`BitmexWebSocketClient`] with environment variable credential resolution.
+    ///
+    /// If `api_key` or `api_secret` are not provided, they will be loaded from
+    /// environment variables based on the `testnet` flag:
+    /// - Testnet: `BITMEX_TESTNET_API_KEY`, `BITMEX_TESTNET_API_SECRET`
+    /// - Mainnet: `BITMEX_API_KEY`, `BITMEX_API_SECRET`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if only one of `api_key` or `api_secret` is provided.
+    pub fn new_with_env(
+        url: Option<String>,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        account_id: Option<AccountId>,
+        heartbeat: Option<u64>,
+        testnet: bool,
+    ) -> anyhow::Result<Self> {
+        let (api_key_env, api_secret_env) = if testnet {
+            ("BITMEX_TESTNET_API_KEY", "BITMEX_TESTNET_API_SECRET")
+        } else {
+            ("BITMEX_API_KEY", "BITMEX_API_SECRET")
+        };
+
+        let key = get_or_env_var_opt(api_key, api_key_env);
+        let secret = get_or_env_var_opt(api_secret, api_secret_env);
+
+        Self::new(url, key, secret, account_id, heartbeat)
+    }
+
     /// Creates a new authenticated [`BitmexWebSocketClient`] using environment variables.
     ///
     /// # Errors
@@ -161,6 +196,12 @@ impl BitmexWebSocketClient {
     #[must_use]
     pub fn api_key(&self) -> Option<&str> {
         self.credential.as_ref().map(|c| c.api_key.as_str())
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> Option<String> {
+        self.credential.as_ref().map(|c| c.api_key_masked())
     }
 
     /// Returns a value indicating whether the client is active.
@@ -335,7 +376,7 @@ impl BitmexWebSocketClient {
                                     continue;
                                 }
 
-                                for symbol in symbols.iter() {
+                                for symbol in symbols {
                                     if symbol.is_empty() {
                                         topics.push(channel.to_string());
                                     } else {
@@ -484,6 +525,7 @@ impl BitmexWebSocketClient {
             reconnect_delay_max_ms: None,     // Use default
             reconnect_backoff_factor: None,   // Use default
             reconnect_jitter_ms: None,        // Use default
+            reconnect_max_attempts: None,
         };
 
         let keyed_quotas = vec![];
@@ -556,11 +598,11 @@ impl BitmexWebSocketClient {
     ///
     /// Returns an error if the connection times out.
     pub async fn wait_until_active(&self, timeout_secs: f64) -> Result<(), BitmexWsError> {
-        let timeout = tokio::time::Duration::from_secs_f64(timeout_secs);
+        let timeout = Duration::from_secs_f64(timeout_secs);
 
         tokio::time::timeout(timeout, async {
             while !self.is_active() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -906,7 +948,7 @@ impl BitmexWebSocketClient {
     /// Returns an error if the WebSocket is not connected or if the subscription fails.
     pub async fn subscribe_bars(&self, bar_type: BarType) -> Result<(), BitmexWsError> {
         let topic = topic_from_bar_spec(bar_type.spec());
-        let symbol = bar_type.instrument_id().symbol.to_string();
+        let symbol = bar_type.instrument_id().symbol.inner();
         self.subscribe(vec![format!("{topic}:{symbol}")]).await
     }
 
@@ -1073,7 +1115,7 @@ impl BitmexWebSocketClient {
     /// Returns an error if the WebSocket is not connected or if the unsubscription fails.
     pub async fn unsubscribe_bars(&self, bar_type: BarType) -> Result<(), BitmexWsError> {
         let topic = topic_from_bar_spec(bar_type.spec());
-        let symbol = bar_type.instrument_id().symbol.to_string();
+        let symbol = bar_type.instrument_id().symbol.inner();
         self.unsubscribe(vec![format!("{topic}:{symbol}")]).await
     }
 
@@ -1202,10 +1244,6 @@ impl BitmexWebSocketClient {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
-
 #[cfg(test)]
 mod tests {
     use ahash::AHashSet;
@@ -1257,7 +1295,7 @@ mod tests {
         let mut topics_to_restore = Vec::new();
         for entry in subs.iter() {
             let (channel, symbols) = entry.pair();
-            for symbol in symbols.iter() {
+            for symbol in symbols {
                 if symbol.is_empty() {
                     topics_to_restore.push(channel.to_string());
                 } else {
@@ -1363,7 +1401,7 @@ mod tests {
         let mut topics_to_restore = Vec::new();
         for entry in subs.iter() {
             let (channel, symbols) = entry.pair();
-            for symbol in symbols.iter() {
+            for symbol in symbols {
                 if symbol.is_empty() {
                     topics_to_restore.push(channel.to_string());
                 } else {

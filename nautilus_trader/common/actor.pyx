@@ -95,6 +95,7 @@ from nautilus_trader.data.messages cimport UnsubscribeTradeTicks
 from nautilus_trader.indicators.base cimport Indicator
 from nautilus_trader.model.book cimport OrderBook
 from nautilus_trader.model.data cimport Bar
+from nautilus_trader.model.data cimport BarSpecification
 from nautilus_trader.model.data cimport BarType
 from nautilus_trader.model.data cimport DataType
 from nautilus_trader.model.data cimport FundingRateUpdate
@@ -107,6 +108,7 @@ from nautilus_trader.model.data cimport OrderBookDeltas
 from nautilus_trader.model.data cimport OrderBookDepth10
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
+from nautilus_trader.model.events.order cimport OrderCanceled
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.greeks cimport GreeksCalculator
 from nautilus_trader.model.identifiers cimport ClientId
@@ -165,7 +167,7 @@ cdef class Actor(Component):
         self._indicators: list[Indicator] = []
         self._indicators_for_quotes: dict[InstrumentId, list[Indicator]] = {}
         self._indicators_for_trades: dict[InstrumentId, list[Indicator]] = {}
-        self._indicators_for_bars: dict[BarType, list[Indicator]] = {}
+        self._indicators_for_bars: dict[tuple[InstrumentId, BarSpecification], list[Indicator]] = {}
 
         # Topic cache
 
@@ -615,6 +617,22 @@ cdef class Actor(Component):
         """
         # Optionally override in subclass
 
+    cpdef void on_order_canceled(self, OrderCanceled event):
+        """
+        Actions to be performed when running and receives an order canceled event.
+
+        Parameters
+        ----------
+        event : OrderCanceled
+            The event received.
+
+        Warnings
+        --------
+        System method (not intended to be called by user code).
+
+        """
+        # Optionally override in subclass
+
     cpdef void on_event(self, Event event):
         """
         Actions to be performed running and receives an event.
@@ -840,15 +858,15 @@ cdef class Actor(Component):
         if indicator not in self._indicators:
             self._indicators.append(indicator)
 
-        cdef BarType standard_bar_type = bar_type.standard()
-        if standard_bar_type not in self._indicators_for_bars:
-            self._indicators_for_bars[standard_bar_type] = []  # type: list[Indicator]
+        cdef tuple bar_key = bar_type.id_spec_key()
+        if bar_key not in self._indicators_for_bars:
+            self._indicators_for_bars[bar_key] = []  # type: list[Indicator]
 
-        if indicator not in self._indicators_for_bars[standard_bar_type]:
-            self._indicators_for_bars[standard_bar_type].append(indicator)
-            self.log.info(f"Registered Indicator {indicator} for {standard_bar_type} bars")
+        if indicator not in self._indicators_for_bars[bar_key]:
+            self._indicators_for_bars[bar_key].append(indicator)
+            self.log.info(f"Registered Indicator {indicator} for {bar_type.standard()} bars")
         else:
-            self.log.error(f"Indicator {indicator} already registered for {standard_bar_type} bars")
+            self.log.error(f"Indicator {indicator} already registered for {bar_type.standard()} bars")
 
 # -- ACTOR COMMANDS -------------------------------------------------------------------------------
 
@@ -1949,6 +1967,27 @@ cdef class Actor(Component):
             handler=self._handle_order_filled,
         )
 
+    cpdef void subscribe_order_cancels(self, InstrumentId instrument_id):
+        """
+        Subscribe to all order cancels for the given instrument ID.
+
+        Once subscribed, any matching order cancels published on the message bus are forwarded
+        to the `on_order_canceled` handler.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument to subscribe to cancels for.
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+        Condition.is_true(self.trader_id is not None, "The actor has not been registered")
+
+        self._msgbus.subscribe(
+            topic=f"events.cancels.{instrument_id}",
+            handler=self._handle_order_canceled,
+        )
+
     cpdef void unsubscribe_data(
         self,
         DataType data_type,
@@ -2501,6 +2540,24 @@ cdef class Actor(Component):
         self._msgbus.unsubscribe(
             topic=f"events.fills.{instrument_id}",
             handler=self._handle_order_filled,
+        )
+
+    cpdef void unsubscribe_order_cancels(self, InstrumentId instrument_id):
+        """
+        Unsubscribe from all order cancels for the given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument to unsubscribe from cancels for.
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+        Condition.is_true(self.trader_id is not None, "The actor has not been registered")
+
+        self._msgbus.unsubscribe(
+            topic=f"events.cancels.{instrument_id}",
+            handler=self._handle_order_canceled,
         )
 
     cpdef void publish_data(self, DataType data_type, Data data):
@@ -3375,6 +3432,7 @@ cdef class Actor(Component):
         """
         Condition.is_true(self.trader_id is not None, "The actor has not been registered")
         Condition.not_none(bar_type, "bar_type")
+        Condition.is_true(bar_type.is_standard(), "Use a standard bar type with request_bars. Composite bar types can be used with request_aggregated_bars")
         Condition.callable_or_none(callback, "callback")
 
         start, end = self._validate_datetime_range(start, end)
@@ -3988,7 +4046,7 @@ cdef class Actor(Component):
         Condition.not_none(bar, "bar")
 
         # Update indicators
-        cdef list indicators = self._indicators_for_bars.get(bar.bar_type)
+        cdef list indicators = self._indicators_for_bars.get(bar.bar_type.id_spec_key())
         if indicators:
             self._handle_indicators_for_bar(indicators, bar)
 
@@ -4065,6 +4123,19 @@ cdef class Actor(Component):
         if self._fsm.state == ComponentState.RUNNING:
             try:
                 self.on_order_filled(event)
+            except Exception as e:
+                self._log.exception(f"Error on handling {repr(event)}", e)
+                raise
+
+    cpdef void _handle_order_canceled(self, OrderCanceled event):
+        if str(event.strategy_id) == str(self.id):
+            # This represents a strategies automatic subscription to it's own
+            # order events, so we don't need to pass this event to the handler twice
+            return
+
+        if self._fsm.state == ComponentState.RUNNING:
+            try:
+                self.on_order_canceled(event)
             except Exception as e:
                 self._log.exception(f"Error on handling {repr(event)}", e)
                 raise

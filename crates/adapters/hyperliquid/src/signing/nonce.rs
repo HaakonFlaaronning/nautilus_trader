@@ -273,10 +273,6 @@ impl Default for NonceManager {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
-
 #[cfg(test)]
 mod tests {
     use std::thread;
@@ -345,6 +341,7 @@ mod tests {
     }
 
     #[rstest]
+    #[allow(clippy::needless_collect)] // Collect needed for thread handles
     fn test_concurrent_nonce_generation() {
         let manager = Arc::new(NonceManager::new());
         let signer = SignerId::from("concurrent_signer");

@@ -102,6 +102,18 @@ where
     }
 }
 
+/// Deserializes a u8 from a string field.
+pub fn deserialize_string_to_u8<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    if s.is_empty() {
+        return Ok(0);
+    }
+    s.parse::<u8>().map_err(serde::de::Error::custom)
+}
+
 /// Extracts the raw symbol from a Bybit symbol by removing the product type suffix.
 #[must_use]
 pub fn extract_raw_symbol(symbol: &str) -> &str {
@@ -148,8 +160,7 @@ pub fn bar_spec_to_bybit_interval(
             360 => Ok(BybitKlineInterval::Hour6),
             720 => Ok(BybitKlineInterval::Hour12),
             _ => anyhow::bail!(
-                "Bybit only supports the following minute intervals: {:?}",
-                BYBIT_MINUTE_INTERVALS
+                "Bybit only supports the following minute intervals: {BYBIT_MINUTE_INTERVALS:?}"
             ),
         },
         BarAggregation::Hour => match step {
@@ -159,8 +170,7 @@ pub fn bar_spec_to_bybit_interval(
             6 => Ok(BybitKlineInterval::Hour6),
             12 => Ok(BybitKlineInterval::Hour12),
             _ => anyhow::bail!(
-                "Bybit only supports the following hour intervals: {:?}",
-                BYBIT_HOUR_INTERVALS
+                "Bybit only supports the following hour intervals: {BYBIT_HOUR_INTERVALS:?}"
             ),
         },
         BarAggregation::Day => {
@@ -182,7 +192,7 @@ pub fn bar_spec_to_bybit_interval(
             Ok(BybitKlineInterval::Month1)
         }
         _ => {
-            anyhow::bail!("Bybit does not support {:?} bars", aggregation);
+            anyhow::bail!("Bybit does not support {aggregation:?} bars");
         }
     }
 }
@@ -1133,10 +1143,6 @@ pub fn parse_order_status_report(
 
     Ok(report)
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {

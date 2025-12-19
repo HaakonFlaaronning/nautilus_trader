@@ -22,6 +22,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use nautilus_common::{
+    live::runner::get_data_event_sender,
     messages::{
         DataEvent,
         data::{
@@ -32,16 +33,16 @@ use nautilus_common::{
             UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
-    runner::get_data_event_sender,
 };
 use nautilus_core::{
     UnixNanos,
+    datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_data::client::DataClient;
 use nautilus_model::{
     data::{Bar, BarType, Data, OrderBookDeltas_API},
-    enums::BarAggregation,
+    enums::{BarAggregation, BookType},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -411,13 +412,6 @@ impl HyperliquidDataClient {
     }
 }
 
-fn datetime_to_unix_nanos(value: Option<DateTime<Utc>>) -> Option<UnixNanos> {
-    value
-        .and_then(|dt| dt.timestamp_nanos_opt())
-        .and_then(|nanos| u64::try_from(nanos).ok())
-        .map(UnixNanos::from)
-}
-
 impl HyperliquidDataClient {
     #[allow(dead_code)]
     fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
@@ -427,7 +421,7 @@ impl HyperliquidDataClient {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl DataClient for HyperliquidDataClient {
     fn client_id(&self) -> ClientId {
         self.client_id
@@ -493,7 +487,7 @@ impl DataClient for HyperliquidDataClient {
             .context("failed to spawn WebSocket client")?;
 
         self.is_connected.store(true, Ordering::Relaxed);
-        tracing::info!("Hyperliquid data client connected");
+        tracing::info!(client_id = %self.client_id, "Connected");
 
         Ok(())
     }
@@ -525,7 +519,7 @@ impl DataClient for HyperliquidDataClient {
         }
 
         self.is_connected.store(false, Ordering::Relaxed);
-        tracing::info!("Hyperliquid data client disconnected");
+        tracing::info!(client_id = %self.client_id, "Disconnected");
 
         Ok(())
     }
@@ -693,7 +687,7 @@ impl DataClient for HyperliquidDataClient {
     fn subscribe_book_deltas(&mut self, subscription: &SubscribeBookDeltas) -> anyhow::Result<()> {
         tracing::debug!("Subscribing to book deltas: {}", subscription.instrument_id);
 
-        if subscription.book_type != nautilus_model::enums::BookType::L2_MBP {
+        if subscription.book_type != BookType::L2_MBP {
             anyhow::bail!("Hyperliquid only supports L2_MBP order book deltas");
         }
 
@@ -739,7 +733,7 @@ impl DataClient for HyperliquidDataClient {
             subscription.instrument_id
         );
 
-        if subscription.book_type != nautilus_model::enums::BookType::L2_MBP {
+        if subscription.book_type != BookType::L2_MBP {
             anyhow::bail!("Hyperliquid only supports L2_MBP order book snapshots");
         }
 
@@ -820,7 +814,7 @@ impl DataClient for HyperliquidDataClient {
         let instruments = self.instruments.read().unwrap();
         let instrument_id = subscription.bar_type.instrument_id();
         if !instruments.contains_key(&instrument_id) {
-            anyhow::bail!("Instrument {} not found", instrument_id);
+            anyhow::bail!("Instrument {instrument_id} not found");
         }
 
         drop(instruments);

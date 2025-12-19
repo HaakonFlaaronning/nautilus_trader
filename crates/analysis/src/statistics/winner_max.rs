@@ -42,12 +42,20 @@ impl PortfolioStatistic for MaxWinner {
 
     fn calculate_from_realized_pnls(&self, realized_pnls: &[f64]) -> Option<Self::Item> {
         if realized_pnls.is_empty() {
-            return Some(0.0);
+            return Some(f64::NAN);
         }
 
-        // Match old Python behavior: max(all_pnls) regardless of sign
-        // If all trades are losses, returns the "least bad" loss
-        realized_pnls
+        let winners: Vec<f64> = realized_pnls
+            .iter()
+            .filter(|&&pnl| pnl > 0.0)
+            .copied()
+            .collect();
+
+        if winners.is_empty() {
+            return Some(f64::NAN);
+        }
+
+        winners
             .iter()
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .copied()
@@ -62,10 +70,6 @@ impl PortfolioStatistic for MaxWinner {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
-
 #[cfg(test)]
 mod tests {
     use nautilus_core::approx_eq;
@@ -78,7 +82,7 @@ mod tests {
         let max_winner = MaxWinner {};
         let result = max_winner.calculate_from_realized_pnls(&[]);
         assert!(result.is_some());
-        assert!(approx_eq!(f64, result.unwrap(), 0.0, epsilon = 1e-9));
+        assert!(result.unwrap().is_nan());
     }
 
     #[rstest]
@@ -87,8 +91,7 @@ mod tests {
         let realized_pnls = vec![-100.0, -50.0, -200.0];
         let result = max_winner.calculate_from_realized_pnls(&realized_pnls);
         assert!(result.is_some());
-        // Returns the "least bad" loss (matches old Python behavior)
-        assert!(approx_eq!(f64, result.unwrap(), -50.0, epsilon = 1e-9));
+        assert!(result.unwrap().is_nan());
     }
 
     #[rstest]

@@ -171,12 +171,21 @@ impl Money {
         check_predicate_true(
             raw >= MONEY_RAW_MIN && raw <= MONEY_RAW_MAX,
             &format!(
-                "`raw` value {raw} exceeded bounds [{}, {}] for Money",
-                MONEY_RAW_MIN, MONEY_RAW_MAX
+                "`raw` value {raw} exceeded bounds [{MONEY_RAW_MIN}, {MONEY_RAW_MAX}] for Money"
             ),
         )
         .expect(FAILED);
         check_fixed_precision(currency.precision).expect(FAILED);
+
+        // TODO: Enforce spurious bits validation in v2
+        // Validate raw value has no spurious bits beyond the precision scale
+        // if raw != 0 {
+        //     #[cfg(feature = "high-precision")]
+        //     super::fixed::check_fixed_raw_i128(raw, currency.precision).expect(FAILED);
+        //     #[cfg(not(feature = "high-precision"))]
+        //     super::fixed::check_fixed_raw_i64(raw, currency.precision).expect(FAILED);
+        // }
+
         Self { raw, currency }
     }
 
@@ -201,7 +210,7 @@ impl Money {
     ///
     /// # Panics
     ///
-    /// Panics if precision is beyond [`MAX_FLOAT_PRECISION`] (16).
+    /// Panics if precision is beyond `MAX_FLOAT_PRECISION` (16).
     #[must_use]
     pub fn as_f64(&self) -> f64 {
         #[cfg(feature = "defi")]
@@ -217,7 +226,7 @@ impl Money {
     ///
     /// # Panics
     ///
-    /// Panics if precision is beyond [`MAX_FLOAT_PRECISION`] (16).
+    /// Panics if precision is beyond `MAX_FLOAT_PRECISION` (16).
     #[must_use]
     pub fn as_f64(&self) -> f64 {
         #[cfg(feature = "defi")]
@@ -239,7 +248,7 @@ impl Money {
         // to the currency's actual precision for decimal conversion.
         let rescaled_raw = self.raw / MoneyRaw::pow(10, u32::from(precision_diff));
 
-        #[allow(clippy::useless_conversion, reason = "Required for precision modes")]
+        #[allow(clippy::useless_conversion)]
         Decimal::from_i128_with_scale(i128::from(rescaled_raw), u32::from(precision))
     }
 
@@ -539,9 +548,6 @@ pub fn check_positive_money(value: Money, param: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use nautilus_core::approx_eq;

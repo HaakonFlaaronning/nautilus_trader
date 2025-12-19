@@ -10,7 +10,9 @@ IMAGE_FULL?=$(IMAGE):$(GIT_TAG)
 CARGO_AUDIT_VERSION := $(shell grep '^cargo-audit *= *"' Cargo.toml | awk -F\" '{print $$2}')
 CARGO_DENY_VERSION := $(shell grep '^cargo-deny *= *"' Cargo.toml | awk -F\" '{print $$2}')
 CARGO_LLVM_COV_VERSION := $(shell grep '^cargo-llvm-cov *= *"' Cargo.toml | awk -F\" '{print $$2}')
+CARGO_MACHETE_VERSION := $(shell grep '^cargo-machete *= *"' Cargo.toml | awk -F\" '{print $$2}')
 CARGO_NEXTEST_VERSION := $(shell grep '^cargo-nextest *= *"' Cargo.toml | awk -F\" '{print $$2}')
+CARGO_VET_VERSION := $(shell grep '^cargo-vet *= *"' Cargo.toml | awk -F\" '{print $$2}')
 LYCHEE_VERSION := $(shell grep '^lychee *= *"' Cargo.toml | awk -F\" '{print $$2}')
 UV_VERSION := $(shell cat uv-version | tr -d '\n')
 
@@ -24,6 +26,28 @@ VERBOSE ?= true
 # TARGET_DIR controls where cargo places build artifacts.
 # Can be overridden to use a separate directory: make build-debug TARGET_DIR=target-python
 TARGET_DIR ?= target
+
+# Compiler configuration
+# Uses clang by default (required by ed25519-blake2b and other deps).
+# When sccache is available, wraps the compiler for build caching.
+# Set CARGO_INCREMENTAL=0 with sccache for better cache hit rates.
+# To disable sccache: make build SCCACHE=
+SCCACHE ?= $(shell command -v sccache 2>/dev/null)
+
+ifeq ($(SCCACHE),)
+CC ?= clang
+CXX ?= clang++
+else
+CC ?= sccache clang
+CXX ?= sccache clang++
+RUSTC_WRAPPER ?= sccache
+CARGO_INCREMENTAL ?= 0
+export RUSTC_WRAPPER
+export CARGO_INCREMENTAL
+endif
+
+export CC
+export CXX
 
 # FAIL_FAST controls whether `cargo nextest` should stop after the first test
 # failure. When set to `true` the `--no-fail-fast` flag is omitted so tests
@@ -169,7 +193,7 @@ clean-build-artifacts:  #-- Clean compiled artifacts (.so, .dll, .pyc, .c files)
 .PHONY: clean-caches
 clean-caches:  #-- Clean pytest, mypy, ruff, uv, and cargo caches
 	rm -rf .pytest_cache .mypy_cache .ruff_cache 2>/dev/null || true
-	-uv cache prune
+	-uv cache prune --force
 	-cargo clean
 
 .PHONY: distclean
@@ -247,7 +271,7 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 	uv tree --outdated --depth 1 --all-groups
 	@printf "\n$(CYAN)Checking tool versions...$(RESET)\n"
 	@outdated_count=0; \
-	for tool in cargo-audit:$(CARGO_AUDIT_VERSION) cargo-deny:$(CARGO_DENY_VERSION) cargo-llvm-cov:$(CARGO_LLVM_COV_VERSION) cargo-nextest:$(CARGO_NEXTEST_VERSION) lychee:$(LYCHEE_VERSION); do \
+	for tool in cargo-audit:$(CARGO_AUDIT_VERSION) cargo-deny:$(CARGO_DENY_VERSION) cargo-llvm-cov:$(CARGO_LLVM_COV_VERSION) cargo-machete:$(CARGO_MACHETE_VERSION) cargo-nextest:$(CARGO_NEXTEST_VERSION) cargo-vet:$(CARGO_VET_VERSION) lychee:$(LYCHEE_VERSION); do \
 		name=$${tool%%:*}; current=$${tool##*:}; \
 		latest=$$(cargo search $$name --limit 1 2>/dev/null | head -1 | awk -F\" '{print $$2}'); \
 		if [ "$$current" != "$$latest" ]; then \
@@ -257,34 +281,37 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 	done; \
 	[ $$outdated_count -eq 0 ] && printf "$(GREEN)  All tools up to date ✓$(RESET)\n"
 
-.PHONY: update cargo-update
+.PHONY: update
 update: cargo-update  #-- Update all dependencies (cargo and uv)
-	uv lock --upgrade
+	uv self update && uv lock --upgrade
 
 .PHONY: install-tools
 install-tools:  #-- Install required development tools (Rust tools from Cargo.toml, uv from uv-version)
 	cargo install cargo-deny --version $(CARGO_DENY_VERSION) --locked \
+	&& cargo install cargo-machete --version $(CARGO_MACHETE_VERSION) --locked \
 	&& cargo install cargo-nextest --version $(CARGO_NEXTEST_VERSION) --locked \
 	&& cargo install cargo-llvm-cov --version $(CARGO_LLVM_COV_VERSION) --locked \
 	&& cargo install cargo-audit --version $(CARGO_AUDIT_VERSION) --locked \
+	&& cargo install cargo-vet --version $(CARGO_VET_VERSION) --locked \
 	&& cargo install lychee --version $(LYCHEE_VERSION) --locked \
 	&& uv self update $(UV_VERSION)
 
 #== Security
 
 .PHONY: security-audit
-security-audit: check-audit-installed  #-- Run security audit for Rust and Python dependencies
+security-audit: check-audit-installed  #-- Run security audit for Rust dependencies (osv-scanner runs via pre-commit)
 	$(info $(M) Running security audit for Rust dependencies...)
 	@printf "$(CYAN)Checking Rust dependencies for known vulnerabilities...$(RESET)\n"
 	cargo audit --color never || true
-	@printf "\n$(CYAN)Installed Python packages:$(RESET)\n"
-	@pip list --format=freeze 2>/dev/null | grep -E "^(aiohttp|requests|urllib3|cryptography|pyyaml|jinja2)" || echo "  (key security-relevant packages not found in pip list)"
-	@printf "\n$(YELLOW)Note: For comprehensive Python vulnerability scanning, install and run:$(RESET)\n"
-	@printf "  pip install pip-audit && pip-audit\n"
+	@printf "\n$(CYAN)Note: Python dependency scanning (osv-scanner) runs via pre-commit hooks$(RESET)\n"
 
 .PHONY: cargo-deny
 cargo-deny: check-deny-installed  #-- Run cargo-deny checks (advisories, sources, bans, licenses)
 	cargo deny --all-features check
+
+.PHONY: cargo-vet
+cargo-vet: check-vet-installed  #-- Run cargo-vet supply chain audit
+	cargo vet
 
 #== Documentation
 
@@ -343,6 +370,7 @@ check-audit-installed:  #-- Verify cargo-audit is installed
 		exit 1; \
 	fi
 
+
 .PHONY: check-deny-installed
 check-deny-installed:  #-- Verify cargo-deny is installed
 	@if ! cargo deny --version >/dev/null 2>&1; then \
@@ -371,6 +399,13 @@ check-hack-installed:  #-- Verify cargo-hack is installed
 		exit 1; \
 	fi
 
+.PHONY: check-vet-installed
+check-vet-installed:  #-- Verify cargo-vet is installed
+	@if ! cargo vet --version >/dev/null 2>&1; then \
+		echo "cargo-vet is not installed. You can install it using 'cargo install cargo-vet'"; \
+		exit 1; \
+	fi
+
 .PHONY: check-edit-installed
 check-edit-installed:  #-- Verify cargo-edit is installed
 	@if ! cargo upgrade --version >/dev/null 2>&1; then \
@@ -386,7 +421,8 @@ check-features: check-hack-installed
 check-capnp-schemas:
 	$(info $(M) Checking if Cap'n Proto schemas are up-to-date...)
 	@bash scripts/regen_capnp.sh > /dev/null 2>&1 || true
-	@if ! git diff --quiet crates/serialization/generated/capnp; then \
+	@DIFF_OUTPUT="$$(git diff -I\"ENCODED_NODE\" -- crates/serialization/generated/capnp)"; \
+	if [ -n "$$DIFF_OUTPUT" ]; then \
 		echo "$(RED)Error: Cap'n Proto generated files are out of date$(RESET)"; \
 		echo "Please run: ./scripts/regen_capnp.sh"; \
 		echo "Or: make regen-capnp"; \

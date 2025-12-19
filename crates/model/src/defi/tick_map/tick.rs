@@ -159,10 +159,6 @@ impl PoolTick {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -281,7 +277,7 @@ mod tests {
             let min_tick = PoolTick::get_min_tick(spacing);
 
             // Should be symmetric (max = -min)
-            assert_eq!(max_tick, -min_tick, "Asymmetry for spacing {}", spacing);
+            assert_eq!(max_tick, -min_tick, "Asymmetry for spacing {spacing}");
 
             // Both should be divisible by spacing
             assert_eq!(max_tick % spacing, 0);

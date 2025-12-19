@@ -25,6 +25,7 @@ use nautilus_core::UUID4;
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::engine::config::ExecutionEngineConfig;
 use nautilus_model::identifiers::TraderId;
+#[cfg(feature = "streaming")]
 use nautilus_persistence::config::StreamingConfig;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
@@ -94,8 +95,6 @@ pub struct LiveExecEngineConfig {
     pub inflight_check_threshold_ms: u32,
     /// The number of retry attempts for verifying in-flight order status.
     pub inflight_check_retries: u32,
-    /// The interval (seconds) between auditing own books against public order books.
-    pub own_books_audit_interval_secs: Option<f64>,
     /// The interval (seconds) between checks for open orders at the venue.
     pub open_check_interval_secs: Option<f64>,
     /// The lookback minutes for open order checks.
@@ -106,6 +105,16 @@ pub struct LiveExecEngineConfig {
     pub open_check_missing_retries: u32,
     /// If the `check_open_orders` requests only currently open orders from the venue.
     pub open_check_open_only: bool,
+    /// The maximum number of single-order queries per consistency check cycle.
+    pub max_single_order_queries_per_cycle: u32,
+    /// The delay (milliseconds) between consecutive single-order queries.
+    pub single_order_query_delay_ms: u32,
+    /// The interval (seconds) between checks for open positions at the venue.
+    pub position_check_interval_secs: Option<f64>,
+    /// The lookback minutes for position consistency checks.
+    pub position_check_lookback_mins: u32,
+    /// The minimum elapsed time (milliseconds) since a position update before acting on discrepancies.
+    pub position_check_threshold_ms: u32,
     /// The interval (minutes) between purging closed orders from the in-memory cache.
     pub purge_closed_orders_interval_mins: Option<u32>,
     /// The time buffer (minutes) before closed orders can be purged.
@@ -120,10 +129,12 @@ pub struct LiveExecEngineConfig {
     pub purge_account_events_lookback_mins: Option<u32>,
     /// If purge operations should also delete from the backing database.
     pub purge_from_database: bool,
+    /// The interval (seconds) between auditing own books against public order books.
+    pub own_books_audit_interval_secs: Option<f64>,
+    /// If the engine should gracefully shutdown when queue processing encounters unexpected errors.
+    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     pub qsize: u32,
-    /// If the engine should gracefully shutdown when queue processing raises unexpected exceptions.
-    pub graceful_shutdown_on_exception: bool,
 }
 
 impl Default for LiveExecEngineConfig {
@@ -140,12 +151,16 @@ impl Default for LiveExecEngineConfig {
             inflight_check_interval_ms: 2_000,
             inflight_check_threshold_ms: 5_000,
             inflight_check_retries: 5,
-            own_books_audit_interval_secs: None,
             open_check_interval_secs: None,
             open_check_lookback_mins: Some(60),
             open_check_threshold_ms: 5_000,
             open_check_missing_retries: 5,
             open_check_open_only: true,
+            max_single_order_queries_per_cycle: 5,
+            single_order_query_delay_ms: 100,
+            position_check_interval_secs: None,
+            position_check_lookback_mins: 60,
+            position_check_threshold_ms: 60_000,
             purge_closed_orders_interval_mins: None,
             purge_closed_orders_buffer_mins: None,
             purge_closed_positions_interval_mins: None,
@@ -153,8 +168,9 @@ impl Default for LiveExecEngineConfig {
             purge_account_events_interval_mins: None,
             purge_account_events_lookback_mins: None,
             purge_from_database: false,
+            own_books_audit_interval_secs: None,
+            graceful_shutdown_on_error: false,
             qsize: 100_000,
-            graceful_shutdown_on_exception: false,
         }
     }
 }
@@ -249,6 +265,7 @@ pub struct LiveNodeConfig {
     /// The portfolio configuration.
     pub portfolio: Option<PortfolioConfig>,
     /// The configuration for streaming to feather files.
+    #[cfg(feature = "streaming")]
     pub streaming: Option<StreamingConfig>,
     /// The live data engine configuration.
     pub data_engine: LiveDataEngineConfig,
@@ -280,6 +297,7 @@ impl Default for LiveNodeConfig {
             cache: None,
             msgbus: None,
             portfolio: None,
+            #[cfg(feature = "streaming")]
             streaming: None,
             data_engine: LiveDataEngineConfig::default(),
             risk_engine: LiveRiskEngineConfig::default(),
@@ -363,14 +381,11 @@ impl NautilusKernelConfig for LiveNodeConfig {
         self.portfolio.clone()
     }
 
-    fn streaming(&self) -> Option<nautilus_persistence::config::StreamingConfig> {
+    #[cfg(feature = "streaming")]
+    fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
@@ -426,7 +441,7 @@ mod tests {
         assert_eq!(config.open_check_missing_retries, 5);
         assert!(config.open_check_open_only);
         assert!(!config.purge_from_database);
-        assert!(!config.graceful_shutdown_on_exception);
+        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
         assert_eq!(config.reconciliation_startup_delay_secs, 10.0);
     }

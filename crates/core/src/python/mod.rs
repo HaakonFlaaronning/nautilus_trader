@@ -32,6 +32,8 @@ pub mod datetime;
 pub mod enums;
 pub mod parsing;
 pub mod serialization;
+/// String manipulation utilities for Python.
+pub mod string;
 pub mod uuid;
 pub mod version;
 
@@ -145,9 +147,13 @@ pub fn to_pyruntime_err(e: impl Display) -> PyErr {
 /// bool
 #[gen_stub_pyfunction(module = "nautilus_trader.core")]
 #[pyfunction(name = "is_pycapsule")]
-#[allow(clippy::needless_pass_by_value)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Python FFI requires owned types"
+)]
 #[allow(unsafe_code)]
 fn py_is_pycapsule(obj: Py<PyAny>) -> bool {
+    // SAFETY: obj.as_ptr() returns a valid Python object pointer
     unsafe {
         // PyCapsule_CheckExact checks if the object is exactly a PyCapsule
         pyo3::ffi::PyCapsule_CheckExact(obj.as_ptr()) != 0
@@ -171,6 +177,7 @@ pub fn core(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<UUID4>()?;
     m.add_function(wrap_pyfunction!(py_is_pycapsule, m)?)?;
     m.add_function(wrap_pyfunction!(casing::py_convert_to_snake_case, m)?)?;
+    m.add_function(wrap_pyfunction!(string::py_mask_api_key, m)?)?;
     m.add_function(wrap_pyfunction!(datetime::py_secs_to_nanos, m)?)?;
     m.add_function(wrap_pyfunction!(datetime::py_secs_to_millis, m)?)?;
     m.add_function(wrap_pyfunction!(datetime::py_millis_to_nanos, m)?)?;

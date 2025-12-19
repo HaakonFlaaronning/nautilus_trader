@@ -15,6 +15,8 @@
 
 import asyncio
 import pkgutil
+from datetime import UTC
+from datetime import datetime
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import Mock
@@ -38,6 +40,7 @@ from nautilus_trader.common.component import MessageBus
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.engine import ExecutionEngine
+from nautilus_trader.execution.messages import GenerateFillReports
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.model.currencies import USDC
 from nautilus_trader.model.currencies import USDC_POS
@@ -197,7 +200,7 @@ class TestPolymarketExecutionClient:
             ts_event=self.clock.timestamp_ns(),
         )
 
-        yield
+        return
 
     def _setup_test_order_with_venue_id(
         self,
@@ -342,7 +345,7 @@ class TestPolymarketExecutionClient:
         assert position.entry == OrderSide.BUY
         assert position.quantity.as_double() == 5
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_wait_for_ack_order_success(self):
         """
         Test successful order acknowledgment flow.
@@ -368,7 +371,7 @@ class TestPolymarketExecutionClient:
         # Check that the order is still in cache and has the correct venue_order_id mapped
         assert self.cache.venue_order_id(client_order_id) == venue_order_id
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_wait_for_ack_order_timeout(self):
         """
         Test order acknowledgment timeout handling.
@@ -407,7 +410,7 @@ class TestPolymarketExecutionClient:
         # Assert - should complete without raising exception
         assert True
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_wait_for_ack_order_with_event_signal(self):
         """
         Test order acknowledgment via event signal (concurrent notification path).
@@ -461,7 +464,7 @@ class TestPolymarketExecutionClient:
         # Event should have been cleaned up
         assert venue_order_id not in self.exec_client._ack_events_order
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_wait_for_ack_trade_success(self):
         """
         Test successful trade acknowledgment flow.
@@ -487,7 +490,7 @@ class TestPolymarketExecutionClient:
         # Check that the order is still in cache and trade was processed
         assert self.cache.venue_order_id(client_order_id) == venue_order_id
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_wait_for_ack_trade_timeout(self):
         """
         Test trade acknowledgment timeout handling.
@@ -526,7 +529,7 @@ class TestPolymarketExecutionClient:
         # Assert - should complete without raising exception
         assert True
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_wait_for_ack_trade_with_event_signal(self):
         """
         Test trade acknowledgment via event signal (concurrent notification path).
@@ -826,7 +829,7 @@ class TestPolymarketExecutionClient:
         cached_value = self.cache.get(expected_key)
         assert cached_value == raw_message
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_order_success(self, mocker):
         """
         Test successful order submission.
@@ -868,7 +871,7 @@ class TestPolymarketExecutionClient:
         cached_client_order_id = self.cache.client_order_id(venue_order_id)
         assert cached_client_order_id == order.client_order_id
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_order_failure(self, mocker):
         """
         Test order submission failure handling.
@@ -911,7 +914,7 @@ class TestPolymarketExecutionClient:
         cached_client_order_id = self.cache.client_order_id(venue_order_id)
         assert cached_client_order_id is None
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_market_buy_without_quote_quantity_denied(self, mocker):
         """
         Market BUY orders must be quote-denominated; verify we emit OrderDenied instead
@@ -947,7 +950,7 @@ class TestPolymarketExecutionClient:
         assert denied_kwargs["client_order_id"] == order.client_order_id
         assert "quote-denominated quantities" in denied_kwargs["reason"]
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_market_sell_with_quote_quantity_denied(self, mocker):
         """
         Market SELL orders must specify base quantity; quote-denominated orders are
@@ -1024,7 +1027,7 @@ class TestPolymarketExecutionClient:
         # Assert - no exception raised, warning logged
         # Test passes if we reach this point without exception
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_market_order_success(self, mocker):
         """
         Test successful market order submission using new MarketOrderArgs.
@@ -1074,7 +1077,7 @@ class TestPolymarketExecutionClient:
         cached_client_order_id = self.cache.client_order_id(venue_order_id)
         assert cached_client_order_id == market_order.client_order_id
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_market_order_with_fok(self, mocker):
         """
         Test market order submission with FOK time in force.
@@ -1117,7 +1120,7 @@ class TestPolymarketExecutionClient:
         assert call_args.price == 0
         assert call_args.order_type == convert_tif_to_polymarket_order_type(TimeInForce.FOK)
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_limit_order_still_works(self, mocker):
         """
         Test that limit orders still work with the refactored submission logic.
@@ -1161,7 +1164,7 @@ class TestPolymarketExecutionClient:
         assert call_args.side == "BUY"
         assert call_args.price == 0.50  # Limit order should have specific price
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_order_invalid_time_in_force(self):
         """
         Test that orders with invalid time in force are rejected.
@@ -1191,7 +1194,7 @@ class TestPolymarketExecutionClient:
         # Assert - order should be rejected (no exception, just logged error)
         # Test passes if we reach this point without exception
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_submit_order_invalid_order_type(self):
         """
         Test that orders with invalid order types are rejected.
@@ -1245,7 +1248,7 @@ class TestPolymarketExecutionClient:
         assert market_order.order_type == OrderType.MARKET
         assert limit_order.order_type == OrderType.LIMIT
 
-    @pytest.mark.asyncio()
+    @pytest.mark.asyncio
     async def test_maker_fill_preserves_original_order_side(self, mocker):
         """
         Regression test for issue #3126: Maker fill order side inversion when Yes/No
@@ -1552,3 +1555,33 @@ class TestPolymarketExecutionClient:
 
             order = self.cache.order(client_order_id)
             assert len(order.events) == initial_event_count, "No duplicate events from replayed message"
+
+    @pytest.mark.asyncio
+    async def test_generate_fill_reports_with_start_end_datetime(self, mocker):
+        # Arrange
+        mock_get_trades = mocker.patch.object(self.http_client, "get_trades")
+        mock_get_trades.return_value = []
+
+        start_dt = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
+        end_dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+
+        command = GenerateFillReports(
+            instrument_id=None,
+            venue_order_id=None,
+            start=start_dt,
+            end=end_dt,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        await self.exec_client.generate_fill_reports(command)
+
+        # Assert
+        mock_get_trades.assert_called_once()
+        call_kwargs = mock_get_trades.call_args.kwargs
+        params = call_kwargs["params"]
+
+        # Verify datetime was correctly converted to integer seconds
+        assert params.after == int(start_dt.timestamp())
+        assert params.before == int(end_dt.timestamp())

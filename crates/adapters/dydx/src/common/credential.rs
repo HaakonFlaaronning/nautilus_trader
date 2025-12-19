@@ -30,6 +30,8 @@ use crate::common::consts::DYDX_BECH32_PREFIX;
 /// dYdX wallet credentials for signing blockchain transactions.
 ///
 /// Uses secp256k1 for signing as per Cosmos SDK specifications.
+/// The underlying `SigningKey` from `cosmrs` (backed by `k256`) implements
+/// `Zeroize`, ensuring private key material is securely cleared from memory on drop.
 pub struct DydxCredential {
     /// The secp256k1 signing key.
     signing_key: SigningKey,
@@ -37,13 +39,6 @@ pub struct DydxCredential {
     pub address: String,
     /// Optional authenticator IDs for permissioned key trading.
     pub authenticator_ids: Vec<u64>,
-}
-
-impl Drop for DydxCredential {
-    fn drop(&mut self) {
-        // Note: SigningKey doesn't implement Zeroize directly
-        // Its memory will be securely cleared by cosmrs on drop
-    }
 }
 
 impl Debug for DydxCredential {
@@ -58,12 +53,6 @@ impl Debug for DydxCredential {
 
 impl DydxCredential {
     /// Creates a new [`DydxCredential`] from a mnemonic phrase.
-    ///
-    /// # Arguments
-    ///
-    /// * `mnemonic` - BIP-39 mnemonic phrase (12 or 24 words)
-    /// * `account_index` - HD wallet account index (typically 0)
-    /// * `authenticator_ids` - Optional authenticator IDs for permissioned keys
     ///
     /// # Errors
     ///
@@ -95,7 +84,7 @@ impl DydxCredential {
         let public_key = signing_key.public_key();
         let account_id = public_key
             .account_id(DYDX_BECH32_PREFIX)
-            .map_err(|e| anyhow::anyhow!("Failed to derive account ID: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to derive account ID: {e}"))?;
         let address = account_id.to_string();
 
         Ok(Self {
@@ -106,11 +95,6 @@ impl DydxCredential {
     }
 
     /// Creates a new [`DydxCredential`] from a raw private key.
-    ///
-    /// # Arguments
-    ///
-    /// * `private_key_hex` - Hexadecimal-encoded secp256k1 private key
-    /// * `authenticator_ids` - Optional authenticator IDs for permissioned keys
     ///
     /// # Errors
     ///
@@ -124,13 +108,13 @@ impl DydxCredential {
             .context("Invalid hex private key")?;
 
         let signing_key = SigningKey::from_slice(&key_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid secp256k1 private key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Invalid secp256k1 private key: {e}"))?;
 
         // Derive bech32 address
         let public_key = signing_key.public_key();
         let account_id = public_key
             .account_id(DYDX_BECH32_PREFIX)
-            .map_err(|e| anyhow::anyhow!("Failed to derive account ID: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to derive account ID: {e}"))?;
         let address = account_id.to_string();
 
         Ok(Self {
@@ -148,7 +132,7 @@ impl DydxCredential {
     pub fn account_id(&self) -> anyhow::Result<AccountId> {
         self.address
             .parse()
-            .map_err(|e| anyhow::anyhow!("Failed to parse account ID: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to parse account ID: {e}"))
     }
 
     /// Signs a transaction SignDoc.
@@ -162,12 +146,12 @@ impl DydxCredential {
         let sign_bytes = sign_doc
             .clone()
             .into_bytes()
-            .map_err(|e| anyhow::anyhow!("Failed to serialize SignDoc: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to serialize SignDoc: {e}"))?;
 
         let signature = self
             .signing_key
             .sign(&sign_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to sign: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to sign: {e}"))?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -182,7 +166,7 @@ impl DydxCredential {
         let signature = self
             .signing_key
             .sign(message)
-            .map_err(|e| anyhow::anyhow!("Failed to sign: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to sign: {e}"))?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -191,10 +175,6 @@ impl DydxCredential {
         self.signing_key.public_key()
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
@@ -263,7 +243,7 @@ mod tests {
         let credential = DydxCredential::from_mnemonic(TEST_MNEMONIC, 0, vec![])
             .expect("Failed to create credential");
 
-        let debug_str = format!("{:?}", credential);
+        let debug_str = format!("{credential:?}");
         // Should contain redacted marker
         assert!(debug_str.contains("<redacted>"));
         // Should contain the struct name

@@ -44,10 +44,19 @@ Cargo's build cache is keyed by the exact combination of features, profiles, and
 |-----------------------------|----------------------------------|-----------|-----------------|-------------|----------------|
 | `cargo-test`                | `ffi,python,high-precision,defi` | `nextest` | ✓ (implicit)    | n/a         | Run tests.     |
 | `cargo-clippy` (pre-commit) | `ffi,python,high-precision,defi` | `nextest` | ✓               | n/a         | Lint all code. |
-| `cargo-doc` (pre-commit)    | `ffi,python,high-precision,defi` | `nextest` | n/a             | ✓           | Lint docs.     |
 
-These targets share the same feature set and profile, allowing cargo to reuse compiled artifacts between linting, testing, and doc checking without rebuilds.
+These targets share the same feature set and profile, allowing cargo to reuse compiled artifacts between linting and testing without rebuilds.
 The `nextest` profile is used to align with the workflow of the majority of core maintainers who use cargo-nextest for running tests.
+
+### Documentation builds
+
+Documentation is built separately using `make docs-rust`, which runs:
+
+```bash
+cargo +nightly doc --all-features --no-deps --workspace
+```
+
+This uses the nightly toolchain and `--all-features` rather than the aligned feature set above, so it does not share build artifacts with testing/linting.
 
 ### Separate target (Python extension building)
 
@@ -97,6 +106,10 @@ All Rust files must include the standardized copyright header:
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 ```
+
+:::info Automated enforcement
+The `check_copyright_year.sh` pre-commit hook verifies copyright headers include the current year.
+:::
 
 ### Code formatting
 
@@ -148,12 +161,20 @@ pub fn process_symbol(symbol: Symbol) -> anyhow::Result<()> {
 }
 ```
 
+:::info Automated enforcement
+The `check_anyhow_usage.sh` pre-commit hook enforces these anyhow conventions automatically.
+:::
+
 ### Logging
 
 - Fully qualify logging macros so the backend is explicit:
   - Use `log::…` (`log::info!`, `log::warn!`, etc.) inside synchronous core crates.
   - Use `tracing::…` (`tracing::debug!`, `tracing::info!`, etc.) for async runtimes, adapters, and peripheral components.
 - Start messages with a capitalised word, prefer complete sentences, and omit terminal periods (e.g. `"Processing batch"`, not `"Processing batch."`).
+
+:::info Automated enforcement
+The `check_logging_macro_usage.sh` pre-commit hook enforces fully qualified logging macros.
+:::
 
 ### Error handling
 
@@ -209,6 +230,10 @@ Use structured error handling patterns consistently:
    // Exception - proper nouns stay capitalized
    connect().context("BitMEX websocket did not become active")?;
    ```
+
+:::info Automated enforcement
+The `check_error_conventions.sh` and `check_anyhow_usage.sh` pre-commit hooks enforce these error handling patterns.
+:::
 
 ### Async patterns
 
@@ -320,17 +345,19 @@ pub const BAR_SPEC_1_MINUTE_LAST: BarSpecification = BarSpecification {
 
 ### Hash collections
 
-Prefer `AHashMap` and `AHashSet` from the `ahash` crate over the standard library's `HashMap` and `HashSet`:
+Use `AHashMap` and `AHashSet` from the `ahash` crate for performance-critical hot paths.
+For non-performance-critical code, standard `HashMap`/`HashSet` are preferred for simplicity:
 
 ```rust
+// For hot paths - using AHashMap/AHashSet
 use ahash::{AHashMap, AHashSet};
 
-// Preferred - using AHashMap/AHashSet
 let mut symbols: AHashSet<Symbol> = AHashSet::new();
 let mut prices: AHashMap<InstrumentId, Price> = AHashMap::new();
 
-// Instead of - standard library HashMap/HashSet
+// For non-hot paths - standard library HashMap/HashSet
 use std::collections::{HashMap, HashSet};
+
 let mut symbols: HashSet<Symbol> = HashSet::new();
 let mut prices: HashMap<InstrumentId, Price> = HashMap::new();
 ```
@@ -343,8 +370,10 @@ let mut prices: HashMap<InstrumentId, Price> = HashMap::new();
 
 **When to use standard `HashMap`/`HashSet`:**
 
+- **Non-performance-critical code**: For simple cases where performance is not critical (e.g., factory registries, configuration maps, test fixtures), standard `HashMap`/`HashSet` are acceptable and even preferred for simplicity.
 - **Cryptographic security required**: Use standard `HashMap` when hash flooding attacks are a concern (e.g., handling untrusted user input in network protocols).
-- **Network clients**: Currently prefer standard `HashMap` for network-facing components where security considerations outweigh performance benefits.
+- **Network clients**: Prefer standard `HashMap` for network-facing components where security considerations outweigh performance benefits.
+- **External library boundaries**: Use standard `HashMap` when interfacing with external libraries that expect it (e.g., Arrow serialization metadata).
 
 ### Thread-safe hash map patterns
 
@@ -438,6 +467,8 @@ pub use crate::identifiers::{
 ```
 
 ### Documentation standards
+
+Use third-person declarative voice for all doc comments (e.g., "Returns the account ID" not "Return the account ID").
 
 #### Module-Level documentation
 
@@ -580,7 +611,7 @@ impl Send for MessageBus {
 
 ## Python bindings
 
-Python bindings are provided via Cython and [PyO3](https://pyo3.rs), allowing users to import NautilusTrader crates directly in Python without a Rust toolchain.
+Python bindings are provided via [PyO3](https://pyo3.rs), allowing users to import NautilusTrader crates directly in Python without a Rust toolchain.
 
 ### PyO3 naming conventions
 
@@ -598,34 +629,19 @@ pub fn py_do_something() -> PyResult<()> {
 }
 ```
 
+:::info Automated enforcement
+The `check_pyo3_conventions.sh` pre-commit hook enforces the `py_` prefix for PyO3 functions.
+:::
+
 ### Testing conventions
 
 - Use `mod tests` as the standard test module name unless you need to specifically compartmentalize.
 - Use `#[rstest]` attributes consistently, this standardization reduces cognitive overhead.
 - Do *not* use Arrange, Act, Assert separator comments in Rust tests.
 
-#### Test organization
-
-Use consistent test module structure with section separators:
-
-```rust
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-    use super::*;
-    use crate::identifiers::{Symbol, stubs::*};
-
-    #[rstest]
-    fn test_string_reprs(symbol_eth_perp: Symbol) {
-        assert_eq!(symbol_eth_perp.as_str(), "ETH-PERP");
-        assert_eq!(format!("{symbol_eth_perp}"), "ETH-PERP");
-    }
-}
-```
+:::info Automated enforcement
+The `check_testing_conventions.sh` pre-commit hook enforces the use of `#[rstest]` over `#[test]`.
+:::
 
 #### Parameterized testing
 
@@ -780,7 +796,7 @@ of interoperating between Cython and Rust. The ability to step outside the bound
 implement many of the most fundamental features of the Rust language itself, just as C and C++ are used to implement
 their own standard libraries.
 
-Great care will be taken with the use of Rusts `unsafe` facility - which just enables a small set of additional language features, thereby changing
+Great care will be taken with the use of Rusts `unsafe` facility - which enables a small set of additional language features, thereby changing
 the contract between the interface and caller, shifting some responsibility for guaranteeing correctness
 from the Rust compiler, and onto us. The goal is to realize the advantages of the `unsafe` facility, whilst avoiding *any* undefined behavior.
 The definition for what the Rust language designers consider undefined behavior can be found in the [language reference](https://doc.rust-lang.org/stable/reference/behavior-considered-undefined.html).
@@ -789,25 +805,51 @@ The definition for what the Rust language designers consider undefined behavior 
 
 To maintain correctness, any use of `unsafe` Rust must follow our policy:
 
-- If a function is `unsafe` to call, there *must* be a `Safety` section in the documentation explaining why the function is `unsafe`.
-and covering the invariants which the function expects the callers to uphold, and how to meet their obligations in that contract.
+- If a function is `unsafe` to call, there *must* be a `Safety` section in the documentation explaining why the function is `unsafe`,
+  covering the invariants which the function expects the callers to uphold, and how to meet their obligations in that contract.
 - Document why each function is `unsafe` in its doc comment's Safety section, and cover all `unsafe` blocks with unit tests.
-- Always include a `SAFETY:` comment explaining why the unsafe operation is valid:
-
-```rust
-// SAFETY: Message bus is not meant to be passed between threads
-#[allow(unsafe_code)]
-
-unsafe impl Send for MessageBus {}
-```
-
+- Always include a `SAFETY:` comment explaining why the unsafe operation is valid.
 - **Crate-level lint** – every crate that exposes FFI symbols enables
   `#![deny(unsafe_op_in_unsafe_fn)]`. Even inside an `unsafe fn`, each pointer dereference or
   other dangerous operation must be wrapped in its own `unsafe { … }` block.
-
 - **CVec contract** – for raw vectors that cross the FFI boundary read the
   [FFI Memory Contract](ffi.md). Foreign code becomes the owner of the allocation and **must**
   call the matching `vec_drop_*` function exactly once.
+
+### Categories of unsafe code
+
+The codebase uses unsafe Rust in these categories:
+
+1. **FFI boundaries** – Raw pointer operations for C interop. See [FFI documentation](ffi.md).
+2. **Interior mutability** – `UnsafeCell` for thread-local registries with controlled access patterns.
+3. **Unsafe Send/Sync** – Types that are not inherently thread-safe but satisfy trait bounds
+   through runtime invariants (e.g., single-threaded access guaranteed by architecture).
+
+### Unsafe Send/Sync requirements
+
+When implementing `Send` or `Sync` unsafely:
+
+1. Document exactly which fields violate the trait requirements.
+2. Explain the runtime mechanism that ensures safety (e.g., single-threaded event loop).
+3. Include a `WARNING` stating that violating the invariant is undefined behavior.
+4. Prefer runtime enforcement (assertions, `Result` returns) over documentation-only guarantees.
+
+```rust
+// SAFETY: Contains Rc<RefCell<...>> which is not thread-safe.
+// Single-threaded access guaranteed by the backtest engine architecture.
+// WARNING: Actually sending across threads is undefined behavior.
+#[allow(unsafe_code)]
+unsafe impl Send for BacktestDataClient {}
+```
+
+### Defense in depth
+
+Where unsafe code relies on invariants, add defense mechanisms:
+
+- **Type verification**: Check types at runtime before casting (e.g., `TypeId` comparison).
+- **Debug assertions**: Catch memory corruption early in debug builds.
+- **RAII guards**: Ensure cleanup on both normal return and panic paths.
+- **Runtime checks**: Fail fast when invariants are violated rather than proceeding unsafely.
 
 ## Tooling configuration
 
@@ -851,27 +893,20 @@ This feature is opt-in to avoid requiring the Cap'n Proto compiler for standard 
 
 ### Installing Cap'n Proto
 
-Install the Cap'n Proto compiler before working with schemas:
+Install the Cap'n Proto compiler before working with schemas. The required version is
+specified in the `capnp-version` file in the repository root.
 
-**macOS:**
+See the [Environment Setup](environment_setup.md#capn-proto) guide for detailed installation
+instructions for each platform.
 
-```bash
-brew install capnp
-```
-
-**Linux (Debian/Ubuntu):**
-
-```bash
-sudo apt-get install capnproto
-```
-
-**Windows:**
-See the [Cap'n Proto installation guide](https://capnproto.org/install.html).
+:::warning
+Ubuntu's default `capnproto` package is too old. Linux users must install from source.
+:::
 
 Verify installation:
 
 ```bash
-capnp --version  # Should show version 1.0.0 or later
+capnp --version  # Should match the version in capnp-version
 ```
 
 ### Schema development workflow

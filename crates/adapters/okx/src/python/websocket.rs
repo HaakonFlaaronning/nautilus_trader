@@ -160,6 +160,13 @@ impl OKXWebSocketClient {
         self.api_key()
     }
 
+    #[getter]
+    #[pyo3(name = "api_key_masked")]
+    #[must_use]
+    pub fn py_api_key_masked(&self) -> Option<String> {
+        self.api_key_masked()
+    }
+
     #[pyo3(name = "is_active")]
     fn py_is_active(&mut self) -> bool {
         self.is_active()
@@ -251,6 +258,15 @@ impl OKXWebSocketClient {
                                 call_python_with_data(&callback, |py| data.into_py_any(py));
                             }
                         }
+                        NautilusWsMessage::OrderAccepted(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py));
+                        }
+                        NautilusWsMessage::OrderCanceled(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py));
+                        }
+                        NautilusWsMessage::OrderExpired(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py));
+                        }
                         NautilusWsMessage::OrderRejected(msg) => {
                             call_python_with_data(&callback, |py| msg.into_py_any(py));
                         }
@@ -258,6 +274,12 @@ impl OKXWebSocketClient {
                             call_python_with_data(&callback, |py| msg.into_py_any(py));
                         }
                         NautilusWsMessage::OrderModifyRejected(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py));
+                        }
+                        NautilusWsMessage::OrderTriggered(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py));
+                        }
+                        NautilusWsMessage::OrderUpdated(msg) => {
                             call_python_with_data(&callback, |py| msg.into_py_any(py));
                         }
                         NautilusWsMessage::ExecutionReports(msg) => {

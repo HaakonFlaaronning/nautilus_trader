@@ -588,6 +588,7 @@ pub fn account_type_to_capnp(value: AccountType) -> enums_capnp::AccountType {
         AccountType::Cash => enums_capnp::AccountType::Cash,
         AccountType::Margin => enums_capnp::AccountType::Margin,
         AccountType::Betting => enums_capnp::AccountType::Betting,
+        AccountType::Wallet => enums_capnp::AccountType::Wallet,
     }
 }
 
@@ -597,6 +598,7 @@ pub fn account_type_from_capnp(value: enums_capnp::AccountType) -> AccountType {
         enums_capnp::AccountType::Cash => AccountType::Cash,
         enums_capnp::AccountType::Margin => AccountType::Margin,
         enums_capnp::AccountType::Betting => AccountType::Betting,
+        enums_capnp::AccountType::Wallet => AccountType::Wallet,
     }
 }
 
@@ -1192,10 +1194,10 @@ impl<'a> ToCapnp<'a> for Currency {
     type Builder = types_capnp::currency::Builder<'a>;
 
     fn to_capnp(&self, mut builder: Self::Builder) {
-        builder.set_code(&self.code);
+        builder.set_code(self.code);
         builder.set_precision(self.precision);
         builder.set_iso4217(self.iso4217);
-        builder.set_name(&self.name);
+        builder.set_name(self.name);
         builder.set_currency_type(currency_type_to_capnp(self.currency_type));
     }
 }
@@ -2091,7 +2093,7 @@ impl<'a> FromCapnp<'a> for OrderBookDeltas {
 
         let deltas_reader = reader.get_deltas()?;
         let mut deltas = Vec::with_capacity(deltas_reader.len() as usize);
-        for delta_reader in deltas_reader.iter() {
+        for delta_reader in deltas_reader {
             let delta = OrderBookDelta::from_capnp(delta_reader)?;
             deltas.push(delta);
         }
@@ -3835,7 +3837,7 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
         let linked_order_ids = if reader.has_linked_order_ids() {
             let linked_order_ids_reader = reader.get_linked_order_ids()?;
             let mut linked_order_ids = Vec::new();
-            for order_id_reader in linked_order_ids_reader.iter() {
+            for order_id_reader in linked_order_ids_reader {
                 linked_order_ids.push(ClientOrderId::from_capnp(order_id_reader)?);
             }
             Some(linked_order_ids)
@@ -3861,7 +3863,7 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
             let params_reader = reader.get_exec_algorithm_params()?;
             let entries_reader = params_reader.get_entries()?;
             let mut params = IndexMap::new();
-            for entry_reader in entries_reader.iter() {
+            for entry_reader in entries_reader {
                 let key = Ustr::from(entry_reader.get_key()?.to_str()?);
                 let value = Ustr::from(entry_reader.get_value()?.to_str()?);
                 params.insert(key, value);
@@ -3881,7 +3883,7 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
         let tags = if reader.has_tags() {
             let tags_reader = reader.get_tags()?;
             let mut tags = Vec::new();
-            for tag in tags_reader.iter() {
+            for tag in tags_reader {
                 tags.push(Ustr::from(tag?.to_str()?));
             }
             Some(tags)
@@ -4542,7 +4544,7 @@ impl<'a> FromCapnp<'a> for PositionAdjusted {
 mod tests {
     use capnp::message::Builder;
     use nautilus_core::UnixNanos;
-    use nautilus_model::{data::stubs::*, events::order::stubs::*, identifiers::stubs::*};
+    use nautilus_model::{data::stubs::*, events::order::stubs::*};
     use rstest::rstest;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -4694,9 +4696,9 @@ mod tests {
 
     #[rstest]
     fn test_account_balance_roundtrip() {
-        let total = Money::from_raw(1000_00, Currency::USD());
-        let locked = Money::from_raw(100_00, Currency::USD());
-        let free = Money::from_raw(900_00, Currency::USD());
+        let total = Money::new(100.0, Currency::USD());
+        let locked = Money::new(10.0, Currency::USD());
+        let free = Money::new(90.0, Currency::USD());
         let balance = AccountBalance::new(total, locked, free);
         let bytes = serialize_account_balance(&balance).unwrap();
         let decoded = deserialize_account_balance(&bytes).unwrap();
@@ -4705,8 +4707,8 @@ mod tests {
 
     #[rstest]
     fn test_margin_balance_roundtrip() {
-        let initial = Money::from_raw(5000_00, Currency::USD());
-        let maintenance = Money::from_raw(2500_00, Currency::USD());
+        let initial = Money::new(500.0, Currency::USD());
+        let maintenance = Money::new(250.0, Currency::USD());
         let instrument_id = InstrumentId::from("BTC-USD-PERP.BINANCE");
         let balance = MarginBalance::new(initial, maintenance, instrument_id);
         let bytes = serialize_margin_balance(&balance).unwrap();

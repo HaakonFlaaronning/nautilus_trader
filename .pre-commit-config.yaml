@@ -33,7 +33,7 @@ repos:
     rev: v3.12.0-2
     hooks:
       - id: shfmt
-        args: ["-i", "2", "-ci", "-sr", "-w"]
+        args: ["-i", "2", "-ci", "-sr", "-ln", "bash", "-w"]
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.11.0.1
@@ -59,7 +59,7 @@ repos:
         description: Lint Dockerfiles for best practices and errors
 
   - repo: https://github.com/crate-ci/typos
-    rev: v1.39.0 # v1.39.0 (reverts to v1 on updates)
+    rev: v1.39.0 # v1.39.0 (pinned for security; autoupdate bumps to moving v1)
     hooks:
       - id: typos
         description: Checks for common typos
@@ -74,7 +74,7 @@ repos:
         types_or: [rust, python, cython, toml, yaml, rst, markdown]
 
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.29.0
+    rev: v8.30.0
     hooks:
       - id: gitleaks
         name: gitleaks (secrets scan)
@@ -82,7 +82,7 @@ repos:
         args: ["--staged", "--redact"]
 
   - repo: https://github.com/google/osv-scanner
-    rev: v2.2.4
+    rev: v2.3.1
     hooks:
       - id: osv-scanner
         name: osv-scanner (dependency vulnerabilities)
@@ -93,19 +93,20 @@ repos:
   #  GitHub Actions linting (complementary tools covering different aspects)
   ##############################################################################
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.8
+    rev: v1.7.9
     hooks:
       - id: actionlint
         name: actionlint (syntax/structure)
         description: Checks GitHub Actions workflow syntax and structural correctness
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.16.3
+    rev: v1.18.0
     hooks:
       - id: zizmor
         name: zizmor (security)
         description: Scans GitHub Actions workflows for security misconfigurations
-        args: ["--no-online-audits", "--min-severity", "medium"]
+        args: ["--no-online-audits", "--min-severity", "medium", ".github/"]
+        pass_filenames: false
 
   ##############################################################################
   #  Custom hooks
@@ -163,11 +164,21 @@ repos:
   #  Rust formatting and linting
   ##############################################################################
   - repo: https://github.com/EmbarkStudios/cargo-deny
-    rev: 0.18.5
+    rev: 0.18.9
     hooks:
       - id: cargo-deny
         name: cargo deny (dependency vulnerabilities)
         args: ["--all-features", "check"]
+
+  - repo: local
+    hooks:
+      - id: cargo-vet
+        name: cargo vet (supply chain audit)
+        description: Run cargo-vet supply chain audit if installed
+        entry: .pre-commit-hooks/cargo_vet.sh
+        language: script
+        files: '^Cargo\.(toml|lock)$|^supply-chain/'
+        pass_filenames: false
 
   - repo: local
     hooks:
@@ -187,12 +198,36 @@ repos:
         files: '\.rs$'
         pass_filenames: false
 
+      - id: check-tokio-usage
+        name: check tokio usage
+        description: Enforces tokio usage conventions
+        entry: .pre-commit-hooks/check_tokio_usage.sh
+        language: script
+        files: '\.rs$|Cargo\.toml$'
+        pass_filenames: false
+
+      - id: check-pyo3-conventions
+        name: check pyo3 conventions
+        description: Enforces PyO3 naming conventions
+        entry: .pre-commit-hooks/check_pyo3_conventions.sh
+        language: script
+        files: '\.rs$'
+        pass_filenames: false
+
       - id: check-testing-conventions
         name: check testing conventions
         description: Enforces testing standardizations and conventions
         entry: .pre-commit-hooks/check_testing_conventions.sh
         language: script
         types_or: [rust]
+        pass_filenames: false
+
+      - id: check-nautilus-conventions
+        name: check nautilus conventions
+        description: Enforces Nautilus type usage conventions
+        entry: .pre-commit-hooks/check_nautilus_conventions.sh
+        language: script
+        files: '\.rs$'
         pass_filenames: false
 
       - id: fmt
@@ -242,7 +277,7 @@ repos:
   #  Python/Cython formatting and linting
   ##############################################################################
   - repo: https://github.com/asottile/pyupgrade
-    rev: v3.21.1
+    rev: v3.21.2
     hooks:
       - id: pyupgrade
         args: ["--py312-plus"]
@@ -255,9 +290,10 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.5
+    rev: v0.14.10
     hooks:
       - id: ruff
+        name: ruff
         args: ["--fix"]
 
   - repo: https://github.com/pycqa/isort
@@ -273,7 +309,7 @@ repos:
     rev: v1.7.7
     hooks:
       - id: docformatter
-        language_version: python3.13 # Pin to 3.13 due to untokenize incompatibility with 3.14
+        language_version: python3.13 # Pin to 3.13 due to incompatibility with 3.14
         additional_dependencies: [tomli]
         args: [
           "--wrap-summaries", "88",
@@ -286,9 +322,10 @@ repos:
         ]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.18.2
+    rev: v1.19.1
     hooks:
       - id: mypy
+        language_version: python3.13 # Pin to 3.13 due to incompatibility with 3.14
         exclude: (^python/|^nautilus_trader/.*\.pyi$)
         args: [
           "--config", "pyproject.toml",
@@ -304,13 +341,13 @@ repos:
         ]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.9.9 # Must match uv-version file
+    rev: 0.9.18 # Must match uv-version file
     hooks:
       - id: uv-lock
         files: ^python/uv\.lock$
 
   - repo: https://github.com/kynan/nbstripout
-    rev: 0.8.1
+    rev: 0.8.2
     hooks:
       - id: nbstripout
 
@@ -318,7 +355,7 @@ repos:
   #  Markdown formatting and linting
   ##############################################################################
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.19.0
+    rev: v0.20.0
     hooks:
       - id: markdownlint-cli2
         name: markdownlint

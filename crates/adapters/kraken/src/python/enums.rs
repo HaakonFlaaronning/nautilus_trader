@@ -13,4 +13,38 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Enums are exposed directly via pyclass attributes in the common module.
+//! Python-idiomatic enum aliases (SCREAMING_SNAKE_CASE).
+
+use pyo3::prelude::*;
+
+use crate::common::enums::{KrakenEnvironment, KrakenProductType};
+
+#[pymethods]
+impl KrakenEnvironment {
+    #[classattr]
+    #[pyo3(name = "MAINNET")]
+    fn py_mainnet() -> Self {
+        Self::Mainnet
+    }
+
+    #[classattr]
+    #[pyo3(name = "DEMO")]
+    fn py_demo() -> Self {
+        Self::Demo
+    }
+}
+
+#[pymethods]
+impl KrakenProductType {
+    #[classattr]
+    #[pyo3(name = "SPOT")]
+    fn py_spot() -> Self {
+        Self::Spot
+    }
+
+    #[classattr]
+    #[pyo3(name = "FUTURES")]
+    fn py_futures() -> Self {
+        Self::Futures
+    }
+}

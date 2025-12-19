@@ -63,6 +63,7 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.core.datetime import millis_to_nanos
 from nautilus_trader.core.datetime import nanos_to_secs
+from nautilus_trader.core.datetime import secs_to_nanos
 from nautilus_trader.core.nautilus_pyo3 import HttpClient
 from nautilus_trader.core.nautilus_pyo3 import HttpResponse
 from nautilus_trader.core.stats import basis_points_as_percentage
@@ -535,14 +536,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 self._log.warning(f"Generated from fill report: {report}")
                 reports.append(report)
 
-        len_reports = len(reports)
-        plural = "" if len_reports == 1 else "s"
-        receipt_log = f"Received {len(reports)} OrderStatusReport{plural}"
-
-        if command.log_receipt_level == LogLevel.INFO:
-            self._log.info(receipt_log)
-        else:
-            self._log.debug(receipt_log)
+        self._log_report_receipt(
+            len(reports),
+            "OrderStatusReport",
+            command.log_receipt_level,
+        )
 
         return reports
 
@@ -618,9 +616,9 @@ class PolymarketExecutionClient(LiveExecutionClient):
             params.asset_id = asset_id
 
         if command.start is not None:
-            params.after = int(nanos_to_secs(command.start))
+            params.after = int(command.start.timestamp())
         if command.end is not None:
-            params.before = int(nanos_to_secs(command.end))
+            params.before = int(command.end.timestamp())
 
         details = []
         if command.instrument_id:
@@ -650,9 +648,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         finally:
             await self._retry_manager_pool.release(retry_manager)
 
-        len_reports = len(reports)
-        plural = "" if len_reports == 1 else "s"
-        self._log.info(f"Received {len(reports)} FillReport{plural}")
+        self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
         return reports
 
@@ -692,9 +688,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             reports.append(report)
 
-        len_reports = len(reports)
-        plural = "" if len_reports == 1 else "s"
-        self._log.info(f"Received {len(reports)} PositionReport{plural}")
+        self._log_report_receipt(
+            len(reports),
+            "PositionReport",
+            command.log_receipt_level,
+        )
 
         return reports
 
@@ -1464,7 +1462,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         commission = float(last_qty * last_px) * basis_points_as_percentage(
             float(msg.get_fee_rate_bps(order_id)),
         )
-        ts_event = millis_to_nanos(int(msg.match_time))
+        ts_event = secs_to_nanos(int(msg.match_time))
 
         self.generate_order_filled(
             strategy_id=strategy_id,

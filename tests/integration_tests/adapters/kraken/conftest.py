@@ -50,17 +50,17 @@ def live_logger():
     return Logger("TEST_LOGGER")
 
 
-@pytest.fixture()
+@pytest.fixture
 def venue() -> Venue:
     return KRAKEN_VENUE
 
 
-@pytest.fixture()
+@pytest.fixture
 def account_id(venue) -> AccountId:
     return AccountId(f"{venue.value}-123")
 
 
-@pytest.fixture()
+@pytest.fixture
 def instrument() -> CurrencyPair:
     return CurrencyPair(
         instrument_id=InstrumentId(Symbol("XBT/USDT"), KRAKEN_VENUE),
@@ -78,7 +78,7 @@ def instrument() -> CurrencyPair:
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def account_state(account_id) -> AccountState:
     return AccountState(
         account_id=account_id,
@@ -100,9 +100,9 @@ def account_state(account_id) -> AccountState:
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_http_client():
-    mock = MagicMock(spec=nautilus_pyo3.KrakenHttpClient)
+    mock = MagicMock(spec=nautilus_pyo3.KrakenSpotHttpClient)
     mock.api_key = "test_api_key"
     mock.api_secret = "test_api_secret"
 
@@ -115,7 +115,7 @@ def mock_http_client():
 
 
 def _create_ws_mock() -> MagicMock:
-    mock = MagicMock(spec=nautilus_pyo3.KrakenWebSocketClient)
+    mock = MagicMock(spec=nautilus_pyo3.KrakenSpotWebSocketClient)
     mock.url = "wss://ws.kraken.com/v2"
     mock.is_closed = MagicMock(return_value=False)
     mock.is_active = AsyncMock(return_value=True)
@@ -134,12 +134,12 @@ def _create_ws_mock() -> MagicMock:
     return mock
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_ws_clients():
     return _create_ws_mock(), _create_ws_mock()
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_instrument_provider(instrument):
     provider = MagicMock(spec=KrakenInstrumentProvider)
     provider.initialize = AsyncMock()
@@ -150,14 +150,167 @@ def mock_instrument_provider(instrument):
     return provider
 
 
-@pytest.fixture()
+@pytest.fixture
 def data_client():
     pass
 
 
-@pytest.fixture()
+@pytest.fixture
 def exec_client():
     pass
+
+
+def _create_mock_account_state():
+    """
+    Create a mock pyo3 account state for testing.
+    """
+    return nautilus_pyo3.AccountState(
+        account_id=nautilus_pyo3.AccountId("KRAKEN-UNIFIED"),
+        account_type=nautilus_pyo3.AccountType.CASH,
+        base_currency=None,
+        balances=[
+            nautilus_pyo3.AccountBalance(
+                total=nautilus_pyo3.Money.from_str("100000 USDT"),
+                locked=nautilus_pyo3.Money.from_str("0 USDT"),
+                free=nautilus_pyo3.Money.from_str("100000 USDT"),
+            ),
+        ],
+        margins=[],
+        is_reported=True,
+        event_id=nautilus_pyo3.UUID4(),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+@pytest.fixture
+def mock_http_client_spot():
+    """
+    Mock for KrakenSpotHttpClient with execution methods.
+    """
+    mock = MagicMock(spec=nautilus_pyo3.KrakenSpotHttpClient)
+    mock.api_key = "test_api_key"
+    mock.api_secret = "test_api_secret"
+    mock.api_key_masked = "test_api_****"
+
+    # Instrument provider methods
+    mock.request_instruments = AsyncMock(return_value=[])
+    mock.cache_instrument = MagicMock()
+    mock.cancel_all_requests = MagicMock()
+    mock.is_initialized = MagicMock(return_value=True)
+
+    # Execution methods
+    mock.submit_order = AsyncMock()
+    mock.cancel_order = AsyncMock()
+    mock.cancel_all_orders = AsyncMock(return_value=0)
+
+    # Reconciliation methods
+    mock.request_account_state = AsyncMock(return_value=_create_mock_account_state())
+    mock.request_order_status_reports = AsyncMock(return_value=[])
+    mock.request_fill_reports = AsyncMock(return_value=[])
+    mock.request_position_status_reports = AsyncMock(return_value=[])
+
+    # Spot position reports config
+    mock.set_use_spot_position_reports = MagicMock()
+    mock.set_spot_positions_quote_currency = MagicMock()
+
+    return mock
+
+
+def _create_mock_account_state_futures():
+    """
+    Create a mock pyo3 account state for futures testing.
+    """
+    return nautilus_pyo3.AccountState(
+        account_id=nautilus_pyo3.AccountId("KRAKEN-UNIFIED"),
+        account_type=nautilus_pyo3.AccountType.MARGIN,
+        base_currency=None,
+        balances=[
+            nautilus_pyo3.AccountBalance(
+                total=nautilus_pyo3.Money.from_str("100000 USD"),
+                locked=nautilus_pyo3.Money.from_str("0 USD"),
+                free=nautilus_pyo3.Money.from_str("100000 USD"),
+            ),
+        ],
+        margins=[],
+        is_reported=True,
+        event_id=nautilus_pyo3.UUID4(),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+@pytest.fixture
+def mock_http_client_futures():
+    """
+    Mock for KrakenFuturesHttpClient with execution methods.
+    """
+    mock = MagicMock(spec=nautilus_pyo3.KrakenFuturesHttpClient)
+    mock.api_key = "test_api_key"
+    mock.api_secret = "test_api_secret"
+    mock.api_key_masked = "test_api_****"
+
+    # Instrument provider methods
+    mock.request_instruments = AsyncMock(return_value=[])
+    mock.cache_instrument = MagicMock()
+    mock.cancel_all_requests = MagicMock()
+    mock.is_initialized = MagicMock(return_value=True)
+
+    # Execution methods
+    mock.submit_order = AsyncMock()
+    mock.cancel_order = AsyncMock()
+    mock.cancel_all_orders = AsyncMock(return_value=0)
+
+    # Reconciliation methods
+    mock.request_account_state = AsyncMock(return_value=_create_mock_account_state_futures())
+    mock.request_order_status_reports = AsyncMock(return_value=[])
+    mock.request_fill_reports = AsyncMock(return_value=[])
+    mock.request_position_status_reports = AsyncMock(return_value=[])
+
+    return mock
+
+
+def _create_exec_ws_mock_spot() -> MagicMock:
+    """
+    Create a mock for KrakenSpotWebSocketClient with execution methods.
+    """
+    mock = MagicMock(spec=nautilus_pyo3.KrakenSpotWebSocketClient)
+    mock.url = "wss://ws-auth.kraken.com/v2"
+    mock.is_closed = MagicMock(return_value=False)
+    mock.is_active = AsyncMock(return_value=True)
+    mock.connect = AsyncMock()
+    mock.wait_until_active = AsyncMock()
+    mock.close = AsyncMock()
+
+    # Execution-specific methods
+    mock.authenticate = AsyncMock()
+    mock.subscribe_executions = AsyncMock()
+    mock.set_account_id = MagicMock()
+    mock.cache_client_order = MagicMock()
+    mock.cache_instrument = MagicMock()
+
+    return mock
+
+
+def _create_exec_ws_mock_futures() -> MagicMock:
+    """
+    Create a mock for KrakenFuturesWebSocketClient with execution methods.
+    """
+    mock = MagicMock(spec=nautilus_pyo3.KrakenFuturesWebSocketClient)
+    mock.url = "wss://futures.kraken.com/ws/v1"
+    mock.is_closed = MagicMock(return_value=False)
+    mock.is_active = AsyncMock(return_value=True)
+    mock.connect = AsyncMock()
+    mock.wait_until_active = AsyncMock()
+    mock.close = AsyncMock()
+
+    # Execution-specific methods
+    mock.authenticate = AsyncMock()
+    mock.subscribe_executions = AsyncMock()
+    mock.set_account_id = MagicMock()
+    mock.cache_instrument = MagicMock()
+
+    return mock
 
 
 def create_kraken_spot_instrument(base_currency, quote_currency):

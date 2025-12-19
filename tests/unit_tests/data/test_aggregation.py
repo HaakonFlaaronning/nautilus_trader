@@ -29,9 +29,15 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.data.aggregation import BarBuilder
 from nautilus_trader.data.aggregation import RenkoBarAggregator
 from nautilus_trader.data.aggregation import TickBarAggregator
+from nautilus_trader.data.aggregation import TickImbalanceBarAggregator
+from nautilus_trader.data.aggregation import TickRunsBarAggregator
 from nautilus_trader.data.aggregation import TimeBarAggregator
 from nautilus_trader.data.aggregation import ValueBarAggregator
+from nautilus_trader.data.aggregation import ValueImbalanceBarAggregator
+from nautilus_trader.data.aggregation import ValueRunsBarAggregator
 from nautilus_trader.data.aggregation import VolumeBarAggregator
+from nautilus_trader.data.aggregation import VolumeImbalanceBarAggregator
+from nautilus_trader.data.aggregation import VolumeRunsBarAggregator
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarSpecification
 from nautilus_trader.model.data import BarType
@@ -47,7 +53,9 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.identifiers import new_generic_spread_id
 from nautilus_trader.model.instruments.futures_contract import FuturesContract
+from nautilus_trader.model.instruments.futures_spread import FuturesSpread
 from nautilus_trader.model.instruments.option_contract import OptionContract
 from nautilus_trader.model.instruments.option_spread import OptionSpread
 from nautilus_trader.model.objects import Currency
@@ -708,6 +716,440 @@ class TestTickBarAggregator:
         assert last_bar.volume == Quantity.from_str("45")
 
 
+class TestTickImbalanceBarAggregator:
+    def test_emits_when_imbalance_reaches_threshold(self):
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+        ]
+
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(2)
+        assert handler[0].bar_type == bar_type
+
+    def test_handles_negative_imbalance_with_sellers(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(3, BarAggregation.TICK_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00001,
+                size=1,
+                aggressor_side=AggressorSide.SELLER,
+                trade_id="imbalance-1",
+                ts_event=0,
+                ts_init=0,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00000,
+                size=1,
+                aggressor_side=AggressorSide.SELLER,
+                trade_id="imbalance-2",
+                ts_event=1,
+                ts_init=1,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=0.99999,
+                size=1,
+                aggressor_side=AggressorSide.SELLER,
+                trade_id="imbalance-3",
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(3)
+
+    def test_mixed_buy_sell_trades_cancel_out(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(3, BarAggregation.TICK_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00001,
+                size=1,
+                aggressor_side=AggressorSide.BUYER,
+                trade_id="imbalance-1",
+                ts_event=0,
+                ts_init=0,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00000,
+                size=1,
+                aggressor_side=AggressorSide.SELLER,
+                trade_id="imbalance-2",
+                ts_event=1,
+                ts_init=1,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00001,
+                size=1,
+                aggressor_side=AggressorSide.BUYER,
+                trade_id="imbalance-3",
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 0
+
+    def test_no_aggressor_trades_ignored_for_imbalance(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00001,
+                size=1,
+                aggressor_side=AggressorSide.BUYER,
+                trade_id="imbalance-1",
+                ts_event=0,
+                ts_init=0,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00002,
+                size=1,
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id="imbalance-2",
+                ts_event=1,
+                ts_init=1,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00003,
+                size=1,
+                aggressor_side=AggressorSide.BUYER,
+                trade_id="imbalance-3",
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(3)
+
+    def test_imbalance_resets_after_bar_emission(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00001,
+                size=1,
+                aggressor_side=AggressorSide.BUYER,
+                trade_id="imbalance-1",
+                ts_event=0,
+                ts_init=0,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00002,
+                size=1,
+                aggressor_side=AggressorSide.BUYER,
+                trade_id="imbalance-2",
+                ts_event=1,
+                ts_init=1,
+            ),
+            TestDataStubs.trade_tick(
+                AUDUSD_SIM,
+                price=1.00003,
+                size=1,
+                aggressor_side=AggressorSide.SELLER,
+                trade_id="imbalance-3",
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(2)
+
+
+class TestTickRunsBarAggregator:
+    def test_emits_after_consecutive_same_side_trades(self):
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00000"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+        ]
+
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(2)
+        assert handler[0].bar_type == bar_type
+
+    def test_side_change_resets_builder_and_run(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00000"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("0.99999"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(2)
+        assert handler[0].open == Price.from_str("1.00000")
+
+    def test_no_aggressor_trades_update_builder_without_affecting_run(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00005"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id=TradeId("runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(3)
+        assert handler[0].high == Price.from_str("1.00005")
+
+    def test_multiple_consecutive_runs(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(2, BarAggregation.TICK_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = TickRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00000"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("0.99999"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("runs-4"),
+                ts_event=3,
+                ts_init=3,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+        assert handler[0].volume == Quantity.from_int(2)
+        assert handler[1].volume == Quantity.from_int(2)
+
+
 class TestVolumeBarAggregator:
     def test_handle_quote_tick_when_volume_below_threshold_updates(self):
         # Arrange
@@ -1248,6 +1690,344 @@ class TestVolumeBarAggregator:
         assert last_bar.volume == Quantity.from_str("30")
 
 
+class TestVolumeImbalanceBarAggregator:
+    def test_emits_when_volume_imbalance_reaches_threshold(self):
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+        ]
+
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[0].bar_type == bar_type
+
+    def test_large_trade_spans_multiple_bars(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("1.00001"),
+            size=Quantity.from_int(25),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("vol-imbalance-large"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[1].volume == Quantity.from_int(10)
+
+    def test_no_aggressor_trades_do_not_affect_imbalance(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(3),
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id=TradeId("vol-imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00003"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-imbalance-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(13)
+
+    def test_mixed_buy_sell_volume_affects_imbalance(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(8),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00000"),
+                size=Quantity.from_int(3),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("vol-imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-imbalance-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(16)
+
+
+class TestVolumeRunsBarAggregator:
+    def test_emits_after_consecutive_same_side_volume(self):
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(4),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("vol-runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00000"),
+                size=Quantity.from_int(6),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("vol-runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+        ]
+
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[0].bar_type == bar_type
+
+    def test_side_change_resets_builder_and_run_volume(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(7),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("vol-runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("0.99999"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("vol-runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[0].open == Price.from_str("1.00000")
+
+    def test_large_trade_spans_multiple_bars(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("1.00001"),
+            size=Quantity.from_int(25),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("vol-runs-large"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[1].volume == Quantity.from_int(10)
+
+    def test_no_aggressor_trades_update_builder_without_affecting_run(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(10, BarAggregation.VOLUME_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00005"),
+                size=Quantity.from_int(2),
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id=TradeId("vol-runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00002"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("vol-runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(12)
+        assert handler[0].high == Price.from_str("1.00005")
+
+
 class TestTestValueBarAggregator:
     def test_handle_quote_tick_when_value_below_threshold_updates(self):
         # Arrange
@@ -1637,6 +2417,337 @@ class TestTestValueBarAggregator:
         assert last_bar.low == Price.from_str("99.00")
         assert last_bar.close == Price.from_str("102.50")
         assert last_bar.volume == Quantity.from_str("30")
+
+
+class TestValueImbalanceBarAggregator:
+    def test_emits_when_value_imbalance_reaches_threshold(self):
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+        ]
+
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[0].bar_type == bar_type
+
+    def test_large_trade_spans_multiple_bars(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("10.00000"),
+            size=Quantity.from_int(25),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("value-imbalance-large"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+
+    def test_opposing_side_neutralizes_imbalance(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(8),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(3),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("value-imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-imbalance-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+
+    def test_no_aggressor_trades_do_not_affect_imbalance(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-imbalance-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(3),
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id=TradeId("value-imbalance-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-imbalance-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+
+
+class TestValueRunsBarAggregator:
+    def test_emits_after_consecutive_notional_runs(self):
+        handler = []
+        bar_spec = BarSpecification(50, BarAggregation.VALUE_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("5.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("value-runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("5.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("value-runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+        ]
+
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[0].bar_type == bar_type
+
+    def test_side_change_resets_builder_and_run_value(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(50, BarAggregation.VALUE_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(4),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("5.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("value-runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("5.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("value-runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(10)
+        assert handler[0].open == Price.from_str("5.00000")
+
+    def test_large_trade_spans_multiple_bars(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(50, BarAggregation.VALUE_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("5.00000"),
+            size=Quantity.from_int(25),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("value-runs-large"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+
+    def test_no_aggressor_trades_update_builder_without_affecting_run(self):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(50, BarAggregation.VALUE_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        ticks = [
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("5.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-runs-1"),
+                ts_event=0,
+                ts_init=0,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("10.00000"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id=TradeId("value-runs-2"),
+                ts_event=1,
+                ts_init=1,
+            ),
+            TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("5.00000"),
+                size=Quantity.from_int(5),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId("value-runs-3"),
+                ts_event=2,
+                ts_init=2,
+            ),
+        ]
+
+        # Act
+        # Act
+        for tick in ticks:
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].high == Price.from_str("10.00000")
 
 
 class TestRenkoBarAggregator:
@@ -3103,7 +4214,7 @@ class TestTimeBarAggregator:
         )  # <-- bar close
 
     @pytest.mark.parametrize(
-        "timestamp_on_close, interval_type, ts_event1, ts_event2",
+        ("timestamp_on_close", "interval_type", "ts_event1", "ts_event2"),
         [
             (False, "left-open", 0, 60_000_000_000),
             (False, "right-open", 0, 60_000_000_000),
@@ -3268,7 +4379,7 @@ class TestSpreadQuoteAggregator:
         self.cache.add_trade_tick(underlying_trade)
 
         # Create spread instrument ID
-        self.spread_instrument_id = InstrumentId.new_spread(
+        self.spread_instrument_id = new_generic_spread_id(
             [
                 (self.option1.id, 1),
                 (self.option2.id, -1),
@@ -3727,7 +4838,7 @@ class TestSpreadQuoteAggregator:
         Test spread quote generation with different ratios (e.g., 1x2 ratio spread).
         """
         # Arrange - Create a 1x2 ratio spread
-        ratio_spread_id = InstrumentId.new_spread(
+        ratio_spread_id = new_generic_spread_id(
             [
                 (self.option1.id, 1),  # Long 1 of option1
                 (self.option2.id, -2),  # Short 2 of option2
@@ -3915,6 +5026,289 @@ class TestSpreadQuoteAggregator:
 
         # Assert
         assert len(self.handler) >= 0  # Just check it doesn't crash
+
+    def test_spread_aggregator_with_explicit_spread_legs(self):
+        """
+        Test that SpreadQuoteAggregator accepts explicit spread_legs parameter.
+        """
+        # Arrange - Create explicit spread legs list
+        spread_legs = [(self.option1.id, 1), (self.option2.id, -1)]
+
+        # Act
+        aggregator = SpreadQuoteAggregator(
+            spread_instrument_id=self.spread_instrument_id,
+            handler=self.handler.append,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            spread_legs=spread_legs,
+        )
+
+        # Assert
+        assert len(aggregator._components) == 2
+        assert aggregator._components == spread_legs
+        assert aggregator._components[0] == (self.option1.id, 1)
+        assert aggregator._components[1] == (self.option2.id, -1)
+
+    def test_futures_spread_quote_generation(self):
+        """
+        Test spread quote generation for futures spreads (different pricing logic).
+        """
+        # Arrange - Create futures spread
+        future1 = TestInstrumentProvider.es_future(expiry_year=2024, expiry_month=6)
+        future2 = TestInstrumentProvider.es_future(expiry_year=2024, expiry_month=9)
+        self.cache.add_instrument(future1)
+        self.cache.add_instrument(future2)
+
+        futures_spread_id = new_generic_spread_id(
+            [
+                (future1.id, -1),  # Short front month
+                (future2.id, 1),   # Long back month
+            ],
+        )
+
+        # Create FuturesSpread instrument
+        futures_spread = FuturesSpread(
+            instrument_id=futures_spread_id,
+            raw_symbol=futures_spread_id.symbol,
+            asset_class=AssetClass.INDEX,
+            currency=Currency.from_str("USD"),
+            price_precision=2,
+            price_increment=Price.from_str("0.25"),
+            multiplier=Quantity.from_int(1),
+            lot_size=Quantity.from_int(1),
+            underlying="ES",
+            strategy_type="SPREAD",
+            activation_ns=0,
+            expiration_ns=min(future1.expiration_ns, future2.expiration_ns),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_instrument(futures_spread)
+
+        handler = []
+
+        SpreadQuoteAggregator(
+            spread_instrument_id=futures_spread_id,
+            handler=handler.append,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            update_interval_seconds=1,
+        )
+
+        # Add quotes for both futures
+        future1_quote = QuoteTick(
+            instrument_id=future1.id,
+            bid_price=Price.from_str("5240.00"),
+            ask_price=Price.from_str("5240.25"),
+            bid_size=Quantity.from_int(100),
+            ask_size=Quantity.from_int(50),
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        future2_quote = QuoteTick(
+            instrument_id=future2.id,
+            bid_price=Price.from_str("5250.00"),
+            ask_price=Price.from_str("5250.25"),
+            bid_size=Quantity.from_int(80),
+            ask_size=Quantity.from_int(60),
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        self.cache.add_quote_tick(future1_quote)
+        self.cache.add_quote_tick(future2_quote)
+
+        # Act - advance time to trigger quote generation
+        events = self.clock.advance_time(2_000_000_000)
+        for event in events:
+            event.handle()
+
+        # Assert - verify futures spread quote was generated
+        assert len(handler) >= 1
+        spread_quote = handler[0]
+
+        assert spread_quote.instrument_id == futures_spread_id
+        assert spread_quote.bid_price is not None
+        assert spread_quote.ask_price is not None
+
+        # For futures spread: -1 * future1 + 1 * future2
+        # Bid: -1 * future1_ask + 1 * future2_bid = -5240.25 + 5250.00 = 9.75
+        # Ask: -1 * future1_bid + 1 * future2_ask = -5240.00 + 5250.25 = 10.25
+        # Note: For negative ratios, we swap bid/ask
+        assert 9.0 <= spread_quote.bid_price.as_double() <= 11.0
+        assert 10.0 <= spread_quote.ask_price.as_double() <= 11.0
+        assert spread_quote.bid_price < spread_quote.ask_price
+
+        # Verify bid/ask sizes are calculated correctly for futures spreads
+        assert spread_quote.bid_size.as_double() > 0
+        assert spread_quote.ask_size.as_double() > 0
+
+    def test_futures_spread_skips_greeks_calculation(self):
+        """
+        Test that futures spreads skip greeks calculation (not required for futures).
+        """
+        # Arrange - Create futures spread
+        future1 = TestInstrumentProvider.es_future(expiry_year=2024, expiry_month=6)
+        future2 = TestInstrumentProvider.es_future(expiry_year=2024, expiry_month=9)
+        self.cache.add_instrument(future1)
+        self.cache.add_instrument(future2)
+
+        futures_spread_id = new_generic_spread_id(
+            [
+                (future1.id, -1),
+                (future2.id, 1),
+            ],
+        )
+
+        futures_spread = FuturesSpread(
+            instrument_id=futures_spread_id,
+            raw_symbol=futures_spread_id.symbol,
+            asset_class=AssetClass.INDEX,
+            currency=Currency.from_str("USD"),
+            price_precision=2,
+            price_increment=Price.from_str("0.25"),
+            multiplier=Quantity.from_int(1),
+            lot_size=Quantity.from_int(1),
+            underlying="ES",
+            strategy_type="SPREAD",
+            activation_ns=0,
+            expiration_ns=min(future1.expiration_ns, future2.expiration_ns),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_instrument(futures_spread)
+
+        handler = []
+
+        aggregator = SpreadQuoteAggregator(
+            spread_instrument_id=futures_spread_id,
+            handler=handler.append,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            update_interval_seconds=1,
+        )
+
+        # Assert - futures spreads should skip greeks
+        assert aggregator._is_futures_spread is True
+
+        # Add quotes (no greeks needed)
+        future1_quote = QuoteTick(
+            instrument_id=future1.id,
+            bid_price=Price.from_str("5240.00"),
+            ask_price=Price.from_str("5240.25"),
+            bid_size=Quantity.from_int(100),
+            ask_size=Quantity.from_int(50),
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        future2_quote = QuoteTick(
+            instrument_id=future2.id,
+            bid_price=Price.from_str("5250.00"),
+            ask_price=Price.from_str("5250.25"),
+            bid_size=Quantity.from_int(80),
+            ask_size=Quantity.from_int(60),
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        self.cache.add_quote_tick(future1_quote)
+        self.cache.add_quote_tick(future2_quote)
+
+        # Act - should generate quote without greeks
+        events = self.clock.advance_time(2_000_000_000)
+        for event in events:
+            event.handle()
+
+        # Assert - quote should be generated even without greeks
+        assert len(handler) >= 1
+        spread_quote = handler[0]
+        assert spread_quote.instrument_id == futures_spread_id
+        assert spread_quote.bid_price is not None
+        assert spread_quote.ask_price is not None
+
+    def test_spread_quote_bid_ask_size_calculation_with_negative_ratios(self):
+        """
+        Test that bid/ask sizes are calculated correctly for spreads with negative
+        ratios.
+        """
+        # Arrange - Create spread with negative ratio on first leg
+        spread_id = new_generic_spread_id(
+            [
+                (self.option1.id, -2),  # Negative ratio
+                (self.option2.id, 1),
+            ],
+        )
+
+        spread = OptionSpread(
+            instrument_id=spread_id,
+            raw_symbol=spread_id.symbol,
+            asset_class=self.option1.asset_class,
+            currency=self.option1.quote_currency,
+            price_precision=self.option1.price_precision,
+            price_increment=self.option1.price_increment,
+            multiplier=self.option1.multiplier,
+            lot_size=self.option1.lot_size,
+            underlying="ES",
+            strategy_type="SPREAD",
+            activation_ns=0,
+            expiration_ns=0,
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_instrument(spread)
+
+        handler = []
+
+        SpreadQuoteAggregator(
+            spread_instrument_id=spread_id,
+            handler=handler.append,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            update_interval_seconds=1,
+        )
+
+        # Add quotes with different sizes
+        option1_quote = QuoteTick(
+            instrument_id=self.option1.id,
+            bid_price=Price.from_str("97.00"),
+            ask_price=Price.from_str("98.00"),
+            bid_size=Quantity.from_int(100),  # Large bid size
+            ask_size=Quantity.from_int(50),   # Smaller ask size
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        option2_quote = QuoteTick(
+            instrument_id=self.option2.id,
+            bid_price=Price.from_str("108.00"),
+            ask_price=Price.from_str("109.00"),
+            bid_size=Quantity.from_int(80),
+            ask_size=Quantity.from_int(60),
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        self.cache.add_quote_tick(option1_quote)
+        self.cache.add_quote_tick(option2_quote)
+
+        # Act
+        events = self.clock.advance_time(2_000_000_000)
+        for event in events:
+            event.handle()
+
+        # Assert - verify sizes are calculated correctly
+        assert len(handler) >= 1
+        spread_quote = handler[0]
+        assert spread_quote.bid_size.as_double() > 0
+        assert spread_quote.ask_size.as_double() > 0
+        # For negative ratios, bid/ask sizes should account for the swap
+        # The calculation should use minimum of appropriate sizes considering ratio signs
 
 
 class TestTimeBarAggregatorHistoricalMode:

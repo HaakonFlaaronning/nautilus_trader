@@ -64,7 +64,7 @@ impl Cloid {
         let mut result = String::with_capacity(34);
         result.push_str("0x");
         for byte in &self.0 {
-            result.push_str(&format!("{:02x}", byte));
+            result.push_str(&format!("{byte:02x}"));
         }
         result
     }
@@ -778,10 +778,6 @@ pub struct HyperliquidOcoOrderRequest {
     #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
     pub reduce_only: Option<bool>,
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {

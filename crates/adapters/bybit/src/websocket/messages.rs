@@ -167,13 +167,13 @@ impl BybitWebSocketError {
             let mut parts = vec![];
 
             if let Some(op) = &response.op {
-                parts.push(format!("op={}", op));
+                parts.push(format!("op={op}"));
             }
             if let Some(topic) = &response.topic {
-                parts.push(format!("topic={}", topic));
+                parts.push(format!("topic={topic}"));
             }
             if let Some(success) = response.success {
-                parts.push(format!("success={}", success));
+                parts.push(format!("success={success}"));
             }
 
             if parts.is_empty() {
@@ -220,15 +220,25 @@ pub struct BybitWsRequest<T> {
 pub struct BybitWsHeader {
     /// Timestamp in milliseconds.
     pub x_bapi_timestamp: String,
+    /// Optional referer ID.
+    #[serde(rename = "Referer", skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
 }
 
 impl BybitWsHeader {
     /// Creates a new header with the current timestamp.
     #[must_use]
     pub fn now() -> Self {
+        Self::with_referer(None)
+    }
+
+    /// Creates a new header with the current timestamp and optional referer.
+    #[must_use]
+    pub fn with_referer(referer: Option<String>) -> Self {
         use nautilus_core::time::get_atomic_clock_realtime;
         Self {
             x_bapi_timestamp: get_atomic_clock_realtime().get_time_ms().to_string(),
+            referer,
         }
     }
 }
@@ -933,10 +943,6 @@ pub struct BybitWsAccountPositionMsg {
     pub creation_time: i64,
     pub data: Vec<BybitWsAccountPosition>,
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {

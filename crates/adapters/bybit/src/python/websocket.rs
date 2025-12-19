@@ -27,11 +27,8 @@ use nautilus_model::{
 use pyo3::{IntoPyObjectExt, prelude::*};
 
 use crate::{
-    common::{
-        credential::Credential,
-        enums::{BybitEnvironment, BybitProductType},
-    },
-    python::params::{BybitWsAmendOrderParams, BybitWsPlaceOrderParams},
+    common::enums::{BybitEnvironment, BybitProductType},
+    python::params::{BybitWsAmendOrderParams, BybitWsCancelOrderParams, BybitWsPlaceOrderParams},
     websocket::{
         client::BybitWebSocketClient,
         messages::{BybitWebSocketError, NautilusWsMessage},
@@ -97,25 +94,7 @@ impl BybitWebSocketClient {
         url: Option<String>,
         heartbeat: Option<u64>,
     ) -> Self {
-        // If both api_key and api_secret are None, try to load from environment
-        let (final_api_key, final_api_secret) = if api_key.is_none() && api_secret.is_none() {
-            let (key_var, secret_var) = match environment {
-                BybitEnvironment::Testnet => ("BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_SECRET"),
-                _ => ("BYBIT_API_KEY", "BYBIT_API_SECRET"),
-            };
-            let env_key = std::env::var(key_var).ok().unwrap_or_default();
-            let env_secret = std::env::var(secret_var).ok().unwrap_or_default();
-            (env_key, env_secret)
-        } else {
-            (api_key.unwrap_or_default(), api_secret.unwrap_or_default())
-        };
-
-        tracing::debug!(
-            "Creating private WebSocket client with API key: {}",
-            &final_api_key[..final_api_key.len().min(10)]
-        );
-        let credential = Credential::new(final_api_key, final_api_secret);
-        Self::new_private(environment, credential, url, heartbeat)
+        Self::new_private(environment, api_key, api_secret, url, heartbeat)
     }
 
     #[staticmethod]
@@ -128,21 +107,14 @@ impl BybitWebSocketClient {
         url: Option<String>,
         heartbeat: Option<u64>,
     ) -> Self {
-        // If both api_key and api_secret are None, try to load from environment
-        let (final_api_key, final_api_secret) = if api_key.is_none() && api_secret.is_none() {
-            let (key_var, secret_var) = match environment {
-                BybitEnvironment::Testnet => ("BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_SECRET"),
-                _ => ("BYBIT_API_KEY", "BYBIT_API_SECRET"),
-            };
-            let env_key = std::env::var(key_var).ok().unwrap_or_default();
-            let env_secret = std::env::var(secret_var).ok().unwrap_or_default();
-            (env_key, env_secret)
-        } else {
-            (api_key.unwrap_or_default(), api_secret.unwrap_or_default())
-        };
+        Self::new_trade(environment, api_key, api_secret, url, heartbeat)
+    }
 
-        let credential = Credential::new(final_api_key, final_api_secret);
-        Self::new_trade(environment, credential, url, heartbeat)
+    #[getter]
+    #[pyo3(name = "api_key_masked")]
+    #[must_use]
+    pub fn py_api_key_masked(&self) -> Option<String> {
+        self.credential().map(|c| c.api_key_masked())
     }
 
     #[pyo3(name = "is_active")]
@@ -160,12 +132,6 @@ impl BybitWebSocketClient {
         self.subscription_count()
     }
 
-    #[pyo3(name = "masked_api_key")]
-    #[must_use]
-    pub fn py_masked_api_key(&self) -> Option<String> {
-        self.credential().map(|c| c.masked_api_key())
-    }
-
     #[pyo3(name = "cache_instrument")]
     fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         self.cache_instrument(pyobject_to_instrument_any(py, instrument)?);
@@ -175,6 +141,11 @@ impl BybitWebSocketClient {
     #[pyo3(name = "set_account_id")]
     fn py_set_account_id(&mut self, account_id: AccountId) {
         self.set_account_id(account_id);
+    }
+
+    #[pyo3(name = "set_mm_level")]
+    fn py_set_mm_level(&self, mm_level: u8) {
+        self.set_mm_level(mm_level);
     }
 
     #[pyo3(name = "connect")]
@@ -773,39 +744,27 @@ impl BybitWebSocketClient {
     }
 
     #[pyo3(name = "batch_cancel_orders")]
-    #[pyo3(signature = (
-        product_type,
-        trader_id,
-        strategy_id,
-        instrument_ids,
-        venue_order_ids,
-        client_order_ids,
-    ))]
-    #[allow(clippy::too_many_arguments)]
     fn py_batch_cancel_orders<'py>(
         &self,
         py: Python<'py>,
-        product_type: BybitProductType,
         trader_id: TraderId,
         strategy_id: StrategyId,
-        instrument_ids: Vec<InstrumentId>,
-        venue_order_ids: Vec<Option<VenueOrderId>>,
-        client_order_ids: Vec<Option<ClientOrderId>>,
+        orders: Vec<BybitWsCancelOrderParams>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let order_params: Vec<_> = orders
+                .into_iter()
+                .map(|p| p.try_into())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(to_pyruntime_err)?;
+
             client
-                .batch_cancel_orders_by_id(
-                    product_type,
-                    trader_id,
-                    strategy_id,
-                    instrument_ids,
-                    venue_order_ids,
-                    client_order_ids,
-                )
+                .batch_cancel_orders(trader_id, strategy_id, order_params)
                 .await
                 .map_err(to_pyruntime_err)?;
+
             Ok(())
         })
     }
@@ -830,6 +789,20 @@ impl BybitWebSocketClient {
                 quantity,
                 price,
             )
+            .map_err(to_pyruntime_err)?;
+        Ok(params.into())
+    }
+
+    #[pyo3(name = "build_cancel_order_params")]
+    fn py_build_cancel_order_params(
+        &self,
+        product_type: BybitProductType,
+        instrument_id: InstrumentId,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> PyResult<crate::python::params::BybitWsCancelOrderParams> {
+        let params = self
+            .build_cancel_order_params(product_type, instrument_id, venue_order_id, client_order_id)
             .map_err(to_pyruntime_err)?;
         Ok(params.into())
     }
