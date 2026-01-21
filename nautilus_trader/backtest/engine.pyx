@@ -5465,7 +5465,11 @@ cdef class OrderMatchingEngine:
             not self._fill_at_market
             and self._book.book_type == BookType.L1_MBP
             and fills
-            and (order.order_type == OrderType.STOP_MARKET or order.order_type == OrderType.TRAILING_STOP_MARKET)
+            and (
+                order.order_type == OrderType.STOP_MARKET
+                or order.order_type == OrderType.TRAILING_STOP_MARKET
+                or order.order_type == OrderType.MARKET_IF_TOUCHED
+            )
         ):
             triggered_price = order.get_triggered_price_c()
             if triggered_price is not None:
