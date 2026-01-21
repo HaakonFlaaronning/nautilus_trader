@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -45,6 +45,7 @@ BINANCE_RETRY_ERRORS: set[BinanceErrorCode] = {
 BINANCE_RETRY_WARNINGS: set[BinanceErrorCode] = {
     BinanceErrorCode.FOK_ORDER_REJECT,
     BinanceErrorCode.GTX_ORDER_REJECT,
+    BinanceErrorCode.ORDER_WOULD_IMMEDIATELY_TRIGGER,
 }
 
 # Valid `priceMatch` argument values for Binance Futures order placement.

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -339,18 +339,26 @@ class ParquetDataCatalog(BaseDataCatalog):
         end = end if end else data[-1].ts_init
         filename = _timestamps_to_filename(start, end)
         parquet_file = f"{directory}/{filename}"
+
+        if self.fs.exists(parquet_file):
+            print(f"File {parquet_file} already exists, skipping write")
+            return
+
+        if not skip_disjoint_check:
+            current_intervals = self._get_directory_intervals(directory)
+            new_intervals = [*current_intervals, (start, end)]
+            if not _are_intervals_disjoint(new_intervals):
+                raise ValueError(
+                    f"Writing file {filename} with interval ({start}, {end}) would create "
+                    f"non-disjoint intervals. Existing intervals: {current_intervals}",
+                )
+
         pq.write_table(
             table,
             where=parquet_file,
             filesystem=self.fs,
             row_group_size=self.max_rows_per_group,
         )
-
-        if not skip_disjoint_check:
-            intervals = self._get_directory_intervals(directory)
-            assert _are_intervals_disjoint(
-                intervals,
-            ), "Intervals are not disjoint after writing a new file"
 
     def _objects_to_table(self, data: list[Data], data_cls: type) -> pa.Table:
         PyCondition.not_empty(data, "data")
@@ -1795,10 +1803,10 @@ class ParquetDataCatalog(BaseDataCatalog):
         )
 
         # Ensure directory URI ends with / to be treated as a directory by some backends
-        # although DataFusion usually handles it.
         file_uri = self._build_file_uri(directory)
+        if not file_uri.endswith("/"):
+            file_uri = file_uri + "/"
         session.add_file(data_type, table, file_uri, query)
-
 
     def _build_file_uri(self, file: str) -> str:
         """
@@ -1931,7 +1939,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         identifiers: list[str] | None = None,
         start: TimestampLike | None = None,
         end: TimestampLike | None = None,
-        filter_expr: str | None = None,
+        filter_expr: pds.Expression | None = None,
         files: list[str] | None = None,
         **kwargs: Any,
     ) -> list[Data]:
@@ -1963,6 +1971,43 @@ class ParquetDataCatalog(BaseDataCatalog):
             return []
 
         return self._handle_table_nautilus(table, data_cls=data_cls)
+
+    def _query_files(
+        self,
+        data_cls: type,
+        identifiers: list[str] | None = None,
+        start: TimestampLike | None = None,
+        end: TimestampLike | None = None,
+        files: list[str] | None = None,
+    ) -> list[str]:
+        """
+        Query files based on data class, identifiers, and time range.
+
+        This function either retrieves files for a data class or uses a provided list,
+        then filters them based on identifiers and time range.
+
+        Parameters
+        ----------
+        data_cls : type
+            The data class type to query for (e.g., Bar, TradeTick).
+        identifiers : list[str] | None, optional
+            List of identifiers to match against file paths. If None, no identifier filtering is applied.
+        start : TimestampLike | None, optional
+            Start timestamp for filtering. If None, no start time constraint is applied.
+        end : TimestampLike | None, optional
+            End timestamp for filtering. If None, no end time constraint is applied.
+        files : list[str] | None, optional
+            Predefined list of files to filter. If None, files are retrieved using get_file_list_from_data_cls.
+
+        Returns
+        -------
+        list[str]
+            List of file paths that match the query criteria.
+
+        """
+        file_paths = files if files is not None else self.get_file_list_from_data_cls(data_cls)
+
+        return self.filter_files(data_cls, file_paths, identifiers, start, end)
 
     def filter_files(
         self,
@@ -2009,24 +2054,22 @@ class ParquetDataCatalog(BaseDataCatalog):
                 identifiers = [identifiers]
 
             safe_identifiers = [urisafe_identifier(identifier) for identifier in identifiers]
-            file_instruments = [file_path.split("/")[-2] for file_path in file_paths]
+            file_safe_identifiers = [file_path.split("/")[-2] for file_path in file_paths]
+
             # Exact match by default for instrument_ids or bar_types
             exact_match_file_paths = [
-                file_paths[index]
-                for index,file_instrument in enumerate(file_instruments)
-                if any(
-                    safe_identifier == file_instrument
-                    for safe_identifier in safe_identifiers
-                )
+                file_paths[i]
+                for i, file_instrument in enumerate(file_safe_identifiers)
+                if any(safe_identifier == file_instrument for safe_identifier in safe_identifiers)
             ]
 
             if not exact_match_file_paths and data_cls in [Bar, *Bar.__subclasses__()]:
                 # Partial match of instrument_ids in bar_types for bars
                 file_paths = [
-                    file_paths[index]
-                    for index,file_instrument in enumerate(file_instruments)
+                    file_paths[i]
+                    for i, file_safe_identifier in enumerate(file_safe_identifiers)
                     if any(
-                        file_instrument.startswith(f"{safe_identifier}-")
+                        file_safe_identifier.startswith(f"{safe_identifier}-")
                         for safe_identifier in safe_identifiers
                     )
                 ]
@@ -2072,44 +2115,8 @@ class ParquetDataCatalog(BaseDataCatalog):
         base_path = self.path.rstrip("/")
         glob_path = f"{base_path}/data/{file_prefix}/**/*.parquet"
         file_paths: list[str] = self.fs.glob(glob_path)
+
         return file_paths
-
-    def _query_files(
-        self,
-        data_cls: type,
-        identifiers: list[str] | None = None,
-        start: TimestampLike | None = None,
-        end: TimestampLike | None = None,
-        files: list[str] | None = None,
-    ) -> list[str]:
-        """
-        Query files based on data class, identifiers, and time range.
-
-        This function either retrieves files for a data class or uses a provided list,
-        then filters them based on identifiers and time range.
-
-        Parameters
-        ----------
-        data_cls : type
-            The data class type to query for (e.g., Bar, TradeTick).
-        identifiers : list[str] | None, optional
-            List of identifiers to match against file paths. If None, no identifier filtering is applied.
-        start : TimestampLike | None, optional
-            Start timestamp for filtering. If None, no start time constraint is applied.
-        end : TimestampLike | None, optional
-            End timestamp for filtering. If None, no end time constraint is applied.
-        files : list[str] | None, optional
-            Predefined list of files to filter. If None, files are retrieved using get_file_list_from_data_cls.
-
-        Returns
-        -------
-        list[str]
-            List of file paths that match the query criteria.
-
-        """
-        file_paths = files if files is not None else self.get_file_list_from_data_cls(data_cls)
-
-        return self.filter_files(data_cls, file_paths, identifiers, start, end)
 
     def query_first_timestamp(
         self,
@@ -2385,6 +2392,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         other_catalog: ParquetDataCatalog | None = None,
         subdirectory: str = "backtest",
         identifiers: list[str] | None = None,
+        use_ts_event_for_ts_init: bool = False,
     ) -> None:
         """
         Convert stream data from feather files to parquet files.
@@ -2405,6 +2413,8 @@ class ParquetDataCatalog(BaseDataCatalog):
             The subdirectory containing the feather files. Either "backtest" or "live".
         identifiers : list[str], optional
             Filter to only include data containing these identifiers in their instrument_ids or bar_types.
+        use_ts_event_for_ts_init : bool, default False
+            If True, replaces the `ts_init` column with `ts_event` column values before deserializing.
 
         """
         used_catalog = self if other_catalog is None else other_catalog
@@ -2423,6 +2433,7 @@ class ParquetDataCatalog(BaseDataCatalog):
                 feather_table,
                 data_cls,
                 convert_bar_type_to_external=True,
+                use_ts_event_for_ts_init=use_ts_event_for_ts_init,
             )
             used_catalog.write_data(file_data)
 
@@ -2445,9 +2456,31 @@ class ParquetDataCatalog(BaseDataCatalog):
         table: pa.Table | pd.DataFrame,
         data_cls: type,
         convert_bar_type_to_external: bool = False,
+        use_ts_event_for_ts_init: bool = False,
     ) -> list[Data]:
         if isinstance(table, pd.DataFrame):
             table = pa.Table.from_pandas(table)
+
+        # Replace ts_init column with ts_event if requested
+        if use_ts_event_for_ts_init:
+            schema = table.schema
+            column_names = schema.names
+
+            if "ts_event" not in column_names or "ts_init" not in column_names:
+                raise ValueError(
+                    "Both 'ts_event' and 'ts_init' columns must exist in the table "
+                    "to use 'use_ts_event_for_ts_init' option",
+                )
+
+            ts_event_idx = column_names.index("ts_event")
+            ts_init_idx = column_names.index("ts_init")
+
+            # Create new arrays with ts_init replaced by ts_event
+            new_arrays = list(table.columns)
+            new_arrays[ts_init_idx] = new_arrays[ts_event_idx]
+
+            # Create new table with updated arrays
+            table = pa.Table.from_arrays(new_arrays, schema=schema)
 
         # Convert metadata from INTERNAL to EXTERNAL if requested
         if convert_bar_type_to_external and table.schema.metadata:

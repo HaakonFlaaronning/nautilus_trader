@@ -19,6 +19,10 @@ while zero-cost abstractions and the absence of a garbage collector deliver C-li
 - Use workspace inheritance for shared dependencies (for example `serde = { workspace = true }`).
 - Only pin versions directly for crate-specific dependencies that are not part of the workspace.
 - Group workspace-provided dependencies before crate-only dependencies so the inheritance is easy to audit.
+- Keep related dependencies aligned: `capnp`/`capnpc` (exact), `arrow`/`parquet` (major.minor),
+  `datafusion`/`object_store`, and `dydx-proto`/`prost`/`tonic`. Pre-commit enforces this.
+- Adapter-only dependencies belong in the "Adapter dependencies" section of the workspace
+  `Cargo.toml`. Pre-commit prevents core crates from using them.
 
 ## Feature flag conventions
 
@@ -92,7 +96,7 @@ All Rust files must include the standardized copyright header:
 
 ```rust
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -168,8 +172,7 @@ The `check_anyhow_usage.sh` pre-commit hook enforces these anyhow conventions au
 ### Logging
 
 - Fully qualify logging macros so the backend is explicit:
-  - Use `log::…` (`log::info!`, `log::warn!`, etc.) inside synchronous core crates.
-  - Use `tracing::…` (`tracing::debug!`, `tracing::info!`, etc.) for async runtimes, adapters, and peripheral components.
+  - Use `log::…` (`log::debug!`, `log::info!`, `log::warn!`, etc.) for all Rust components.
 - Start messages with a capitalised word, prefer complete sentences, and omit terminal periods (e.g. `"Processing batch"`, not `"Processing batch."`).
 
 :::info Automated enforcement
@@ -240,11 +243,55 @@ The `check_error_conventions.sh` and `check_anyhow_usage.sh` pre-commit hooks en
 Use consistent async/await patterns:
 
 1. **Async function naming**: No special suffix is required; prefer natural names.
-2. **Tokio usage**: Use `tokio::spawn` for fire-and-forget work, and document when that background task is expected to finish.
+2. **Tokio usage**: Fully qualify tokio types (e.g., `tokio::time::timeout`). See [Adapter runtime patterns](#adapter-runtime-patterns) for spawn rules.
 3. **Error handling**: Return `anyhow::Result` from async functions to match the synchronous conventions.
 4. **Cancellation safety**: Call out whether the function is cancellation-safe and what invariants still hold when it is cancelled.
 5. **Stream handling**: Use `tokio_stream` (or `futures::Stream`) for async iterators to make back-pressure explicit.
 6. **Timeout patterns**: Wrap network or long-running awaits with timeouts (`tokio::time::timeout`) and propagate or handle the timeout error.
+
+### Adapter runtime patterns
+
+Adapter crates (under `crates/adapters/`) require special handling for spawning async tasks due to Python FFI compatibility:
+
+1. **Use `get_runtime().spawn()` instead of `tokio::spawn()`**: When called from Python threads (which have no Tokio context), `tokio::spawn()` panics because it relies on thread-local storage. The global runtime pattern provides an explicit reference accessible from any thread.
+
+   ```rust
+   use nautilus_common::live::get_runtime;
+
+   // Correct - works from Python threads
+   get_runtime().spawn(async move {
+       // async work
+   });
+
+   // Incorrect - panics from Python threads
+   tokio::spawn(async move {
+       // async work
+   });
+   ```
+
+2. **Use the shorter import path**: Import `get_runtime` from the `live` module re-export, not the full path:
+
+   ```rust
+   // Preferred - shorter path via re-export
+   use nautilus_common::live::get_runtime;
+
+   // Avoid - unnecessarily verbose
+   use nautilus_common::live::runtime::get_runtime;
+   ```
+
+3. **Use `get_runtime().block_on()` for sync-to-async bridges**: When synchronous code needs to call async functions in adapters:
+
+   ```rust
+   fn sync_method(&self) -> anyhow::Result<()> {
+       get_runtime().block_on(self.async_implementation())
+   }
+   ```
+
+4. **Tests are exempt**: Test code using `#[tokio::test]` creates its own runtime context, so `tokio::spawn()` works correctly. The enforcement hook skips test files and test modules.
+
+:::info Automated enforcement
+The `check_tokio_usage.sh` pre-commit hook enforces these adapter runtime patterns automatically.
+:::
 
 ### Attribute patterns
 
@@ -470,6 +517,18 @@ pub use crate::identifiers::{
 
 Use third-person declarative voice for all doc comments (e.g., "Returns the account ID" not "Return the account ID").
 
+#### Section header casing
+
+Rustdoc section headers use Title Case, matching the Rust standard library convention:
+
+- `# Examples`
+- `# Errors`
+- `# Panics`
+- `# Safety`
+- `# Notes`
+- `# Thread Safety`
+- `# Feature Flags`
+
 #### Module-Level documentation
 
 All modules must have module-level documentation starting with a brief description:
@@ -666,6 +725,27 @@ Use descriptive test names that explain the scenario:
 fn test_sma_with_no_inputs()
 fn test_sma_with_single_input()
 fn test_symbol_is_composite()
+```
+
+### Box-style banner comments
+
+Do not use box-style banner or separator comments. If code requires visual
+separation, consider splitting it into separate modules or files. Instead use:
+
+- Clear function names that convey purpose.
+- Module structure for logical groupings (`mod tests { mod fixtures { } }`).
+- Impl blocks to group related methods.
+- Doc comments (`///`) for semantic documentation.
+- IDE navigation and code folding.
+
+Patterns to avoid:
+
+```rust
+// ============================================================================
+// Some Section
+// ============================================================================
+
+// ========== Test Fixtures ==========
 ```
 
 ## Rust-Python memory management
@@ -966,11 +1046,11 @@ make check-capnp-schemas
 
 This target:
 
-1. Regenerates all schema files.
-2. Verifies no uncommitted changes exist.
-3. Fails if schemas are out of sync.
+1. Skips with a warning if `capnp` is not installed (acceptable for local development).
+2. Fails if regeneration errors occur (e.g., version mismatch).
+3. Regenerates schemas and fails if generated files differ from committed versions.
 
-CI runs this check automatically to catch drift.
+CI runs this check automatically to catch drift (capnp is always installed in CI).
 
 ### Testing with capnp feature
 

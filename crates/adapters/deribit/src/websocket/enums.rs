@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,6 +15,8 @@
 
 //! Enumerations for Deribit WebSocket channels and operations.
 
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
@@ -22,16 +24,36 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 ///
 /// Controls how frequently updates are sent for subscribed channels.
 /// Raw updates require authentication while aggregated updates are public.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+)]
 pub enum DeribitUpdateInterval {
     /// Raw updates - immediate delivery of each event.
     /// Requires authentication.
+    #[strum(serialize = "raw", serialize = "Raw")]
     Raw,
     /// Aggregated updates every 100 milliseconds (default).
     #[default]
+    #[strum(serialize = "100ms", serialize = "Ms100")]
     Ms100,
     /// Aggregated updates every 2 ticks.
+    #[strum(serialize = "agg2", serialize = "Agg2")]
     Agg2,
 }
 
@@ -53,7 +75,7 @@ impl DeribitUpdateInterval {
     }
 }
 
-impl std::fmt::Display for DeribitUpdateInterval {
+impl Display for DeribitUpdateInterval {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -64,6 +86,7 @@ impl std::fmt::Display for DeribitUpdateInterval {
 /// Channels follow the format: `{channel_type}.{instrument_or_currency}.{interval}`
 #[derive(
     Clone,
+    Copy,
     Debug,
     Display,
     PartialEq,
@@ -74,6 +97,10 @@ impl std::fmt::Display for DeribitUpdateInterval {
     EnumString,
     Serialize,
     Deserialize,
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
 )]
 pub enum DeribitWsChannel {
     // Public Market Data Channels
@@ -103,6 +130,9 @@ pub enum DeribitWsChannel {
     Announcements,
     /// Chart trades: `chart.trades.{instrument}.{resolution}`
     ChartTrades,
+    /// Instrument state changes: `instrument.state.{kind}.{currency}`
+    /// Used for instrument lifecycle notifications (created, started, settled, closed, terminated)
+    InstrumentState,
 
     // Private User Channels (for future execution support)
     /// User orders: `user.orders.{instrument}.{interval}`
@@ -126,6 +156,10 @@ impl DeribitWsChannel {
     ///
     /// * `instrument_or_currency` - The instrument name (e.g., "BTC-PERPETUAL") or currency (e.g., "BTC")
     /// * `interval` - Optional update interval. Defaults to `Ms100` (100ms) if not specified.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on `InstrumentState` variant. Use `format_instrument_state_channel()` instead.
     ///
     /// # Note
     ///
@@ -158,7 +192,26 @@ impl DeribitWsChannel {
             Self::UserPortfolio => format!("user.portfolio.{instrument_or_currency}"),
             Self::UserChanges => format!("user.changes.{instrument_or_currency}.{interval_str}"),
             Self::UserAccessLog => "user.access_log".to_string(),
+            Self::InstrumentState => {
+                // InstrumentState requires kind and currency, use format_instrument_state_channel() instead
+                panic!(
+                    "InstrumentState channel requires kind and currency parameters, use format_instrument_state_channel() instead"
+                )
+            }
         }
+    }
+
+    /// Formats the instrument state channel for subscription.
+    ///
+    /// Returns the full channel string: `instrument.state.{kind}.{currency}`
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - Instrument kind: "future", "option", "spot", "future_combo", "option_combo", or "any"
+    /// * `currency` - Currency: "BTC", "ETH", "USDC", "USDT", "EURR", or "any"
+    #[must_use]
+    pub fn format_instrument_state_channel(kind: &str, currency: &str) -> String {
+        format!("instrument.state.{kind}.{currency}")
     }
 
     /// Parses a channel string to extract the channel type.
@@ -202,6 +255,8 @@ impl DeribitWsChannel {
             Some(Self::UserChanges)
         } else if channel == "user.access_log" {
             Some(Self::UserAccessLog)
+        } else if channel.starts_with("instrument.state.") {
+            Some(Self::InstrumentState)
         } else {
             None
         }

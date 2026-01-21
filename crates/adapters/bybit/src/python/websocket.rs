@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -16,7 +16,8 @@
 //! Python bindings for the Bybit WebSocket client.
 
 use futures_util::StreamExt;
-use nautilus_core::python::to_pyruntime_err;
+use nautilus_common::live::get_runtime;
+use nautilus_core::python::{call_python, to_pyruntime_err};
 use nautilus_model::{
     data::{Data, OrderBookDeltas_API},
     enums::{OrderSide, OrderType, TimeInForce},
@@ -148,6 +149,11 @@ impl BybitWebSocketClient {
         self.set_mm_level(mm_level);
     }
 
+    #[pyo3(name = "set_bars_timestamp_on_close")]
+    fn py_set_bars_timestamp_on_close(&mut self, value: bool) {
+        self.set_bars_timestamp_on_close(value);
+    }
+
     #[pyo3(name = "connect")]
     fn py_connect<'py>(
         &mut self,
@@ -161,7 +167,7 @@ impl BybitWebSocketClient {
 
             let stream = client.stream();
 
-            tokio::spawn(async move {
+            get_runtime().spawn(async move {
                 tokio::pin!(stream);
 
                 while let Some(msg) = stream.next().await {
@@ -235,10 +241,10 @@ impl BybitWebSocketClient {
                             });
                         }
                         NautilusWsMessage::Reconnected => {
-                            tracing::info!("WebSocket reconnected");
+                            log::info!("WebSocket reconnected");
                         }
                         NautilusWsMessage::Authenticated => {
-                            tracing::info!("WebSocket authenticated");
+                            log::info!("WebSocket authenticated");
                         }
                     }
                 }
@@ -254,7 +260,7 @@ impl BybitWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.close().await {
-                tracing::error!("Error on close: {e}");
+                log::error!("Error on close: {e}");
             }
             Ok(())
         })
@@ -860,12 +866,6 @@ impl BybitWebSocketClient {
     }
 }
 
-fn call_python(py: Python, callback: &Py<PyAny>, py_obj: Py<PyAny>) {
-    if let Err(e) = callback.call1(py, (py_obj,)) {
-        tracing::error!("Error calling Python callback: {e}");
-    }
-}
-
 fn call_python_with_data<F>(callback: &Py<PyAny>, data_fn: F)
 where
     F: FnOnce(Python<'_>) -> PyResult<Bound<'_, PyAny>> + Send + 'static,
@@ -873,11 +873,11 @@ where
     Python::attach(|py| match data_fn(py) {
         Ok(data) => {
             if let Err(e) = callback.call1(py, (data,)) {
-                tracing::error!("Error calling Python callback: {e}");
+                log::error!("Error calling Python callback: {e}");
             }
         }
         Err(e) => {
-            tracing::error!("Error converting data to Python: {e}");
+            log::error!("Error converting data to Python: {e}");
         }
     });
 }

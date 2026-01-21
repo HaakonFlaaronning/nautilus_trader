@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -50,6 +50,7 @@ from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.common.secure import mask_api_key
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import nanos_to_millis
 from nautilus_trader.core.datetime import secs_to_millis
@@ -197,7 +198,6 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             AccountId(f"{name or config.venue.value}-{self._binance_account_type.value}-master"),
         )
 
-        # Enum parser
         self._enum_parser = enum_parser
 
         # HTTP API
@@ -223,7 +223,6 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             loop=self._loop,
         )
 
-        # Order submission method hashmap
         self._submit_order_method: dict[
             OrderType,
             Callable[[Order, BinanceFuturesPositionSide | None, str | None], Awaitable[None]],
@@ -239,9 +238,8 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
 
         # Hot caches
         self._instrument_ids: dict[str, InstrumentId] = {}
+        self._active_symbols_cache: tuple[str | None, set[str], list[BinanceOrder]] | None = None
         self._generate_order_status_retries: dict[ClientOrderId, int] = {}
-
-        # Track triggered algo orders - these need to be cancelled via regular endpoint
         self._triggered_algo_order_ids: set[ClientOrderId] = set()
 
         self._retry_manager_pool = RetryManagerPool[None](
@@ -318,7 +316,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         # Set up WebSocket listen key
         self._listen_key = response.listenKey
         self._last_successful_ping_ns = self._clock.timestamp_ns()  # Initialize on connection
-        self._log.info(f"Listen key {self._listen_key}")
+        self._log.info(f"Listen key {mask_api_key(self._listen_key)}")
         self._ping_listen_keys_task = self.create_task(self._ping_listen_keys())
 
         await self._ws_client.subscribe_listen_key(self._listen_key)
@@ -344,7 +342,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                     self._log.warning("No listen key available for ping")
                     continue
 
-                self._log.debug(f"Pinging WebSocket listen key {self._listen_key}")
+                self._log.debug(f"Pinging WebSocket listen key {mask_api_key(self._listen_key)}")
 
                 try:
                     await self._http_user.keepalive_listen_key(listen_key=self._listen_key)
@@ -352,7 +350,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                     # Reset failure tracking on success
                     self._ping_consecutive_failures = 0
                     self._last_successful_ping_ns = self._clock.timestamp_ns()
-                    self._log.debug(f"Listen key ping successful: {self._listen_key}")
+                    self._log.debug(f"Listen key ping successful: {mask_api_key(self._listen_key)}")
 
                 except (BinanceClientError, BinanceError) as e:
                     self._ping_consecutive_failures += 1
@@ -397,7 +395,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             response: BinanceListenKey = await self._http_user.create_listen_key()
             self._listen_key = response.listenKey
             self._last_successful_ping_ns = self._clock.timestamp_ns()
-            self._log.info(f"Created new listen key for recovery: {self._listen_key}")
+            self._log.info(f"Created new listen key for recovery: {mask_api_key(self._listen_key)}")
 
             # Reconnect WebSocket with new key
             await self._ws_client.subscribe_listen_key(self._listen_key)
@@ -570,23 +568,36 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         # Implement in child class
         raise NotImplementedError
 
+    async def _build_active_symbols(
+        self,
+        symbol: str | None,
+    ) -> tuple[set[str], list[BinanceOrder]]:
+        if self._active_symbols_cache is not None and self._active_symbols_cache[0] == symbol:
+            return self._active_symbols_cache[1], self._active_symbols_cache[2]
+
+        active_symbols = self._get_cache_active_symbols()
+        active_symbols.update(await self._get_binance_active_position_symbols(symbol))
+        open_orders = await self._http_account.query_open_orders(symbol)
+
+        for order in open_orders:
+            active_symbols.add(order.symbol)
+
+        self._active_symbols_cache = (symbol, active_symbols, open_orders)
+
+        return active_symbols, open_orders
+
     async def generate_order_status_reports(
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
         self._log.debug("Requesting OrderStatusReports...")
+        self._active_symbols_cache = None
 
         try:
-            # Check Binance for all order active symbols
             symbol = (
                 command.instrument_id.symbol.value if command.instrument_id is not None else None
             )
-            active_symbols = self._get_cache_active_symbols()
-            active_symbols.update(await self._get_binance_active_position_symbols(symbol))
-            binance_open_orders = await self._http_account.query_open_orders(symbol)
-
-            for order in binance_open_orders:
-                active_symbols.add(order.symbol)
+            active_symbols, binance_open_orders = await self._build_active_symbols(symbol)
 
             # Get all orders for those active symbols
             binance_orders: list[BinanceOrder] = []
@@ -612,20 +623,6 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         end_ms = secs_to_millis(command.end.timestamp()) if command.end is not None else None
 
         reports = self._parse_order_status_reports(binance_orders, start_ms, end_ms)
-
-        # For futures accounts, also fetch algo orders (conditional orders)
-        if self._binance_account_type.is_futures:
-            try:
-                algo_reports = await self._generate_algo_order_status_reports(
-                    symbol=symbol,
-                    active_symbols=active_symbols,
-                    open_only=command.open_only,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                )
-                reports.extend(algo_reports)
-            except BinanceError as e:
-                self._log.warning(f"Cannot generate algo OrderStatusReports: {e.message}")
 
         self._log_report_receipt(
             len(reports),
@@ -659,82 +656,6 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             )
             self._log.debug(f"Received {report}")
             reports.append(report)
-        return reports
-
-    async def _generate_algo_order_status_reports(
-        self,
-        symbol: str | None,
-        active_symbols: set[str],
-        open_only: bool,
-        start_ms: int | None,
-        end_ms: int | None,
-    ) -> list[OrderStatusReport]:
-        reports: list[OrderStatusReport] = []
-
-        # Import here to avoid circular import
-        from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEnumParser
-        from nautilus_trader.adapters.binance.futures.http.account import BinanceFuturesAccountHttpAPI
-
-        if not isinstance(self._http_account, BinanceFuturesAccountHttpAPI):
-            return reports
-
-        # This method only runs for futures, so enum_parser is BinanceFuturesEnumParser
-        assert isinstance(self._enum_parser, BinanceFuturesEnumParser)
-
-        algo_orders: list = []
-
-        if open_only:
-            algo_orders = await self._http_account.query_open_algo_orders(symbol)
-            self._log.debug(f"Fetched {len(algo_orders)} open algo orders")
-        else:
-            for active_symbol in active_symbols:
-                response = await self._http_account.query_all_algo_orders(
-                    symbol=active_symbol,
-                    start_time=start_ms,
-                    end_time=end_ms,
-                    limit=1000,
-                )
-                algo_orders.extend(response)
-            self._log.debug(f"Fetched {len(algo_orders)} historical algo orders")
-
-        for algo_order in algo_orders:
-            # Filter by time range on the Nautilus side
-            if start_ms is not None and algo_order.createTime < start_ms:
-                continue
-            if end_ms is not None and algo_order.createTime > end_ms:
-                continue
-
-            # Skip triggered algo orders - the regular orders API provides accurate
-            # fill data for these. Algo order reports have filled_qty=0 which causes
-            # reconciliation conflicts with cached orders that have actual fill data.
-            if algo_order.actualOrderId:
-                client_order_id = (
-                    ClientOrderId(algo_order.clientAlgoId) if algo_order.clientAlgoId else None
-                )
-                if client_order_id:
-                    self._triggered_algo_order_ids.add(client_order_id)
-                self._log.debug(
-                    f"Skipping triggered algo order {algo_order.clientAlgoId} "
-                    f"(actualOrderId={algo_order.actualOrderId}) - using regular order data",
-                )
-                continue
-
-            try:
-                report = algo_order.parse_to_order_status_report(
-                    account_id=self.account_id,
-                    instrument_id=self._get_cached_instrument_id(algo_order.symbol),
-                    report_id=UUID4(),
-                    enum_parser=self._enum_parser,
-                    ts_init=self._clock.timestamp_ns(),
-                )
-            except ValueError as e:
-                # Close-position orders don't have quantity, skip them
-                self._log.warning(f"Skipping algo order during reconciliation: {e}")
-                continue
-
-            self._log.debug(f"Received algo {report}")
-            reports.append(report)
-
         return reports
 
     async def generate_fill_reports(

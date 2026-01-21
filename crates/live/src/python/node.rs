@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -20,7 +20,7 @@ use std::{cell::RefCell, rc::Rc};
 use nautilus_common::{
     actor::data_actor::{DataActorConfig, ImportableActorConfig},
     enums::Environment,
-    live::runtime::get_runtime,
+    live::get_runtime,
     python::actor::PyDataActor,
 };
 use nautilus_core::{UUID4, python::to_pyruntime_err};
@@ -33,7 +33,7 @@ use pyo3::{
 };
 use serde_json;
 
-use crate::node::{LiveNode, LiveNodeBuilder};
+use crate::{builder::LiveNodeBuilder, node::LiveNode};
 
 #[pymethods]
 impl LiveNode {
@@ -72,7 +72,7 @@ impl LiveNode {
 
     #[getter]
     #[pyo3(name = "is_running")]
-    const fn py_is_running(&self) -> bool {
+    fn py_is_running(&self) -> bool {
         self.is_running()
     }
 

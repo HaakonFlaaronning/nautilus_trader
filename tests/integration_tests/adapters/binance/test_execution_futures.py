@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -26,6 +26,7 @@ from nautilus_trader.adapters.binance.config import BinanceExecClientConfig
 from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExecutionClient
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAccountInfo
+from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAlgoOrder
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesSymbolConfig
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.common.component import LiveClock
@@ -36,6 +37,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.execution.messages import CancelOrder
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import SubmitOrder
@@ -1883,6 +1885,80 @@ class TestBinanceFuturesExecutionClient:
         # Assert - order is skipped, no reports returned
         assert len(reports) == 0
 
+    @pytest.mark.asyncio
+    async def test_algo_order_reconciliation_deduplicates_open_and_historical(self, mocker):
+        """
+        Test that when open_only=False, open orders are fetched first and deduplicated
+        against historical orders from allAlgoOrders endpoint.
+
+        This ensures orders older than 7 days (beyond allAlgoOrders limit) are still
+        captured via openAlgoOrders, while preventing duplicates.
+
+        """
+        # Order that appears in both endpoints (open and historical)
+        shared_order = {
+            "algoId": 1000000000001,
+            "clientAlgoId": "O-SHARED-001",
+            "algoType": "CONDITIONAL",
+            "orderType": "STOP_MARKET",
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "positionSide": "BOTH",
+            "quantity": "10",
+            "algoStatus": "NEW",
+            "triggerPrice": "3000.00",
+            "workingType": "CONTRACT_PRICE",
+            "createTime": 1733900000000,
+        }
+
+        # Order only in historical (recently closed, within 7 days)
+        historical_only_order = {
+            "algoId": 1000000000002,
+            "clientAlgoId": "O-HISTORICAL-001",
+            "algoType": "CONDITIONAL",
+            "orderType": "STOP_MARKET",
+            "symbol": "ETHUSDT",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "quantity": "5",
+            "algoStatus": "CANCELED",
+            "triggerPrice": "2500.00",
+            "workingType": "CONTRACT_PRICE",
+            "createTime": 1733900000000,
+        }
+
+        # Mock the HTTP account methods directly
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_open_algo_orders",
+            new=AsyncMock(return_value=[BinanceFuturesAlgoOrder(**shared_order)]),
+        )
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_all_algo_orders",
+            new=AsyncMock(
+                return_value=[
+                    BinanceFuturesAlgoOrder(**shared_order),  # Duplicate
+                    BinanceFuturesAlgoOrder(**historical_only_order),
+                ],
+            ),
+        )
+
+        # Act - open_only=False with active symbols triggers historical fetch
+        reports = await self.exec_client._generate_algo_order_status_reports(
+            symbol=None,
+            active_symbols={"ETHUSDT"},
+            open_only=False,
+            start_ms=None,
+            end_ms=None,
+        )
+
+        # Assert - should have 2 reports, not 3 (shared order deduplicated)
+        assert len(reports) == 2
+        algo_ids = {r.venue_order_id.value for r in reports}
+        assert "1000000000001" in algo_ids  # Shared order
+        assert "1000000000002" in algo_ids  # Historical only order
+
     # -------------------------------------------------------------------------
     # Algo Order Modification Tests
     # -------------------------------------------------------------------------
@@ -2208,3 +2284,100 @@ class TestBinanceFuturesExecutionClient:
         assert len(result) == 1
         assert result[0].algoId == 12345
         assert result[0].algoStatus == "CANCELLED"
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_falls_back_to_algo_order(self, mocker):
+        """
+        Test that generate_order_status_report falls back to algo order endpoint when
+        regular order query returns None.
+        """
+        # Arrange - mock base class returning None (order not found)
+        mocker.patch.object(
+            self.exec_client.__class__.__bases__[0],
+            "generate_order_status_report",
+            new=AsyncMock(return_value=None),
+        )
+
+        algo_order_response = BinanceFuturesAlgoOrder(
+            algoId=12345,
+            clientAlgoId="O-20251224-071254-eK0z-000-1",
+            algoType="CONDITIONAL",
+            orderType="STOP_MARKET",
+            symbol="ETHUSDT",
+            side="SELL",
+            positionSide="BOTH",
+            timeInForce="GTC",
+            quantity="80.0",
+            algoStatus="NEW",
+            triggerPrice="0.1243",
+            price="0",
+            workingType="CONTRACT_PRICE",
+            activatePrice=None,
+            callbackRate=None,
+            reduceOnly=False,
+            closePosition=False,
+            priceProtect=False,
+            selfTradePreventionMode="NONE",
+        )
+        mock_query_algo = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_algo_order",
+            return_value=algo_order_response,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            client_order_id=ClientOrderId("O-20251224-071254-eK0z-000-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        report = await self.exec_client.generate_order_status_report(command)
+
+        # Assert
+        mock_query_algo.assert_called_once_with(
+            algo_id=None,
+            client_algo_id="O-20251224-071254-eK0z-000-1",
+        )
+        assert report is not None
+        assert report.client_order_id == ClientOrderId("O-20251224-071254-eK0z-000-1")
+        assert report.venue_order_id == VenueOrderId("12345")
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_does_not_query_algo_when_regular_found(
+        self,
+        mocker,
+    ):
+        """
+        Test that generate_order_status_report does not query algo order endpoint when
+        regular order query succeeds.
+        """
+        # Arrange - mock base class returning a valid report
+        mock_report = mocker.Mock()
+        mocker.patch.object(
+            self.exec_client.__class__.__bases__[0],
+            "generate_order_status_report",
+            new=AsyncMock(return_value=mock_report),
+        )
+
+        mock_query_algo = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_algo_order",
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            client_order_id=ClientOrderId("O-20251224-071254-eK0z-000-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        report = await self.exec_client.generate_order_status_report(command)
+
+        # Assert - algo order endpoint should NOT be called
+        mock_query_algo.assert_not_called()
+        assert report is mock_report

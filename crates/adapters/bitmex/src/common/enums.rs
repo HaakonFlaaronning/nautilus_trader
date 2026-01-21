@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -768,7 +768,17 @@ pub enum BitmexTickDirection {
 
 /// Represents the state of an instrument.
 #[derive(
-    Clone, Debug, Display, PartialEq, Eq, AsRefStr, EnumIter, EnumString, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
 )]
 pub enum BitmexInstrumentState {
     /// Instrument is open for trading.
@@ -779,6 +789,8 @@ pub enum BitmexInstrumentState {
     Unlisted,
     /// Instrument is settled.
     Settled,
+    /// Instrument is delisted.
+    Delisted,
 }
 
 /// Represents the fair price calculation method.

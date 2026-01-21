@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -23,7 +23,9 @@ from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersDataClientConfig
 from nautilus_trader.adapters.interactive_brokers.parsing.data import timedelta_to_duration_str
-from nautilus_trader.adapters.interactive_brokers.providers import InteractiveBrokersInstrumentProvider
+from nautilus_trader.adapters.interactive_brokers.providers import (
+    InteractiveBrokersInstrumentProvider,
+)
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -192,11 +194,6 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             is_smart_depth=is_smart_depth,
         )
 
-    async def _subscribe_order_book_snapshots(self, command: SubscribeOrderBook) -> None:
-        raise NotImplementedError(  # pragma: no cover
-            "implement the `_subscribe_order_book_snapshots` coroutine",  # pragma: no cover
-        )
-
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         contract = self.instrument_provider.contract.get(command.instrument_id)
         if not contract:
@@ -295,11 +292,6 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             is_smart_depth=is_smart_depth,
         )
 
-    async def _unsubscribe_order_book_snapshots(self, command: UnsubscribeOrderBook) -> None:
-        raise NotImplementedError(  # pragma: no cover
-            "implement the `_unsubscribe_order_book_snapshots` coroutine",  # pragma: no cover
-        )
-
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         await self._client.unsubscribe_ticks(command.instrument_id, "BidAsk")
 
@@ -334,10 +326,9 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
                 f"Requesting instrument {request.instrument_id} with specified `end` which has no effect",
             )
 
-        force_instrument_update = request.params.get("force_instrument_update", False)
         await self.instrument_provider.load_with_return_async(
             request.instrument_id,
-            force_instrument_update=force_instrument_update,
+            request.params,
         )
 
         if instrument := self.instrument_provider.find(request.instrument_id):
@@ -349,7 +340,6 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
         self._handle_instrument(instrument, request.id, request.start, request.end, request.params)
 
     async def _request_instruments(self, request: RequestInstruments) -> None:
-        force_instrument_update = request.params.get("force_instrument_update", False)
         loaded_instrument_ids: list[InstrumentId] = []
 
         if "ib_contracts" in request.params:
@@ -357,7 +347,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             ib_contracts = [IBContract(**d) for d in request.params["ib_contracts"]]
             loaded_instrument_ids = await self.instrument_provider.load_ids_with_return_async(
                 ib_contracts,
-                force_instrument_update=force_instrument_update,
+                request.params,
             )
             loaded_instruments: list[Instrument] = []
 
@@ -389,7 +379,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
         instrument_ids = [instrument.id for instrument in instruments]
         loaded_instrument_ids = await self.instrument_provider.load_ids_with_return_async(
             instrument_ids,
-            force_instrument_update=force_instrument_update,
+            request.params,
         )
         self._handle_instruments(
             venue=request.venue,
@@ -700,7 +690,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
                 f"with duration '{segment_duration}'",
             )
 
-            bars = await self._client.get_historical_bars( # Changed self.get_historical_bars to self._client.get_historical_bars
+            bars = await self._client.get_historical_bars(  # Changed self.get_historical_bars to self._client.get_historical_bars
                 bar_type,
                 contract,
                 use_rth,
@@ -759,8 +749,8 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
         subsecond = (
             1
             if delta.components.milliseconds > 0
-               or delta.components.microseconds > 0
-               or delta.components.nanoseconds > 0
+            or delta.components.microseconds > 0
+            or delta.components.nanoseconds > 0
             else 0
         )
         seconds = (

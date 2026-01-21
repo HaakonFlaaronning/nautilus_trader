@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -42,6 +42,7 @@ use std::{
 };
 
 use futures_util::future;
+use nautilus_common::live::get_runtime;
 use nautilus_model::{
     enums::OrderSide,
     identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
@@ -238,7 +239,7 @@ struct TransportClient {
 
 impl Debug for TransportClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TransportClient")
+        f.debug_struct(stringify!(TransportClient))
             .field("client_id", &self.client_id)
             .field("healthy", &self.healthy)
             .field("cancel_count", &self.cancel_count)
@@ -285,17 +286,17 @@ impl TransportClient {
         )
         .await
         {
-            Ok(Ok(_)) => {
+            Ok(Ok(())) => {
                 self.mark_healthy();
                 true
             }
             Ok(Err(e)) => {
-                tracing::warn!("Health check failed for client {}: {e:?}", self.client_id);
+                log::warn!("Health check failed for client {}: {e:?}", self.client_id);
                 self.mark_unhealthy();
                 false
             }
             Err(_) => {
-                tracing::warn!("Health check timeout for client {}", self.client_id);
+                log::warn!("Health check timeout for client {}", self.client_id);
                 self.mark_unhealthy();
                 false
             }
@@ -418,7 +419,7 @@ impl CancelBroadcaster {
         let interval_secs = self.config.health_check_interval_secs;
         let timeout_secs = self.config.health_check_timeout_secs;
 
-        let task = tokio::spawn(async move {
+        let task = get_runtime().spawn(async move {
             let mut ticker = interval(Duration::from_secs(interval_secs));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -437,7 +438,7 @@ impl CancelBroadcaster {
                 let results = future::join_all(tasks).await;
                 let healthy_count = results.iter().filter(|&&r| r).count();
 
-                tracing::debug!(
+                log::debug!(
                     "Health check complete: {}/{} clients healthy",
                     healthy_count,
                     results.len()
@@ -447,7 +448,7 @@ impl CancelBroadcaster {
 
         *self.health_check_task.write().await = Some(task);
 
-        tracing::info!(
+        log::info!(
             "CancelBroadcaster started with {} clients",
             self.transports.len()
         );
@@ -467,7 +468,7 @@ impl CancelBroadcaster {
             task.abort();
         }
 
-        tracing::info!("CancelBroadcaster stopped");
+        log::info!("CancelBroadcaster stopped");
     }
 
     async fn run_health_checks(&self) {
@@ -480,7 +481,7 @@ impl CancelBroadcaster {
         let results = future::join_all(tasks).await;
         let healthy_count = results.iter().filter(|&&r| r).count();
 
-        tracing::debug!(
+        log::debug!(
             "Health check complete: {}/{} clients healthy",
             healthy_count,
             results.len()
@@ -530,12 +531,7 @@ impl CancelBroadcaster {
                     }
                     self.successful_cancels.fetch_add(1, Ordering::Relaxed);
 
-                    tracing::debug!(
-                        "{} broadcast succeeded [{}] {}",
-                        operation,
-                        client_id,
-                        params
-                    );
+                    log::debug!("{operation} broadcast succeeded [{client_id}] {params}");
 
                     return Ok(result);
                 }
@@ -549,7 +545,7 @@ impl CancelBroadcaster {
                         }
                         self.idempotent_successes.fetch_add(1, Ordering::Relaxed);
 
-                        tracing::debug!(
+                        log::debug!(
                             "Idempotent success [{client_id}] - {idempotent_reason}: {error_msg} {params}",
                         );
 
@@ -558,7 +554,7 @@ impl CancelBroadcaster {
 
                     if self.is_expected_reject(&error_msg) {
                         self.expected_rejects.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
+                        log::debug!(
                             "Expected {} rejection [{}]: {} {}",
                             operation.to_lowercase(),
                             client_id,
@@ -567,18 +563,14 @@ impl CancelBroadcaster {
                         );
                         errors.push(error_msg);
                     } else {
-                        tracing::warn!(
-                            "{} request failed [{}]: {} {}",
-                            operation,
-                            client_id,
-                            error_msg,
-                            params
+                        log::warn!(
+                            "{operation} request failed [{client_id}]: {error_msg} {params}"
                         );
                         errors.push(error_msg);
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("{} task join error: {e:?}", operation);
+                    log::warn!("{operation} task join error: {e:?}");
                     errors.push(format!("Task panicked: {e:?}"));
                 }
             }
@@ -586,7 +578,7 @@ impl CancelBroadcaster {
 
         // All tasks failed
         self.failed_cancels.fetch_add(1, Ordering::Relaxed);
-        tracing::error!(
+        log::error!(
             "All {} requests failed: {errors:?} {params}",
             operation.to_lowercase(),
         );
@@ -629,7 +621,7 @@ impl CancelBroadcaster {
 
         let mut handles = Vec::new();
         for transport in healthy_transports {
-            let handle = tokio::spawn(async move {
+            let handle = get_runtime().spawn(async move {
                 let client_id = transport.client_id.clone();
                 let result = transport
                     .cancel_order(instrument_id, client_order_id, venue_order_id)
@@ -680,7 +672,7 @@ impl CancelBroadcaster {
         for transport in healthy_transports {
             let client_order_ids_clone = client_order_ids.clone();
             let venue_order_ids_clone = venue_order_ids.clone();
-            let handle = tokio::spawn(async move {
+            let handle = get_runtime().spawn(async move {
                 let client_id = transport.client_id.clone();
                 let result = transport
                     .executor
@@ -727,7 +719,7 @@ impl CancelBroadcaster {
 
         let mut handles = Vec::new();
         for transport in healthy_transports {
-            let handle = tokio::spawn(async move {
+            let handle = get_runtime().spawn(async move {
                 let client_id = transport.client_id.clone();
                 let result = transport
                     .executor
@@ -1629,9 +1621,6 @@ mod tests {
             let task_guard = broadcaster.health_check_task.read().await;
             assert!(task_guard.is_some());
         }
-
-        // Wait a bit for health check to potentially run
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Stop the broadcaster
         broadcaster.stop().await;
