@@ -457,7 +457,8 @@ class NautilusKernel:
                 config=config.exec_engine,
             )
 
-        if config.exec_engine and config.exec_engine.load_cache:
+        flush_on_start = config.cache is not None and config.cache.flush_on_start
+        if config.exec_engine and config.exec_engine.load_cache and not flush_on_start:
             self.exec_engine.load_cache()
 
         self._emulator = OrderEmulator(
@@ -1169,7 +1170,11 @@ class NautilusKernel:
 
         # Get all tasks except the current one
         current_task = asyncio.current_task(self.loop)
-        pending_tasks = [task for task in asyncio.all_tasks(self.loop) if task is not current_task and not task.done()]
+        pending_tasks = [
+            task
+            for task in asyncio.all_tasks(self.loop)
+            if task is not current_task and not task.done()
+        ]
 
         if not pending_tasks:
             self._log.info("No pending tasks to cancel")
@@ -1218,7 +1223,11 @@ class NautilusKernel:
             cleanup_task = self.loop.create_task(_cancel_and_wait_for_tasks())
             cleanup_task.add_done_callback(
                 lambda t: self._log.info(
-                    ("Task cleanup completed" if not t.exception() else f"Task cleanup failed: {t.exception()}"),
+                    (
+                        "Task cleanup completed"
+                        if not t.exception()
+                        else f"Task cleanup failed: {t.exception()}"
+                    ),
                 ),
             )
         else:
