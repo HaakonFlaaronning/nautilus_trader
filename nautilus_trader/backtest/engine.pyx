@@ -1543,6 +1543,11 @@ cdef class BacktestEngine:
             # Common kernel start-up sequence
             self._kernel.start()
 
+            # Wire emulator to exchange matching engines for bar-only emulation support
+            if self._kernel.emulator is not None and self._kernel.emulator.is_running:
+                for exchange in self._venues.values():
+                    exchange.set_emulator(self._kernel.emulator)
+
             self._log_pre_run()
 
         self._log_run(start, end)
@@ -2782,6 +2787,7 @@ cdef class SimulatedExchange:
         self._message_queue = deque()
         self._inflight_queue: list[tuple[(uint64_t, uint64_t), TradingCommand]] = []
         self._inflight_counter: dict[uint64_t, uint64_t] = {}
+        self._emulator = None
 
         # For direct communication from SpreadQuoteAggregator
         spread_quote_endpoint = f"SimulatedExchange.spread_quote.{venue}"
@@ -2852,6 +2858,28 @@ cdef class SimulatedExchange:
 
         self._log.info("Changed latency model")
 
+    cpdef void set_emulator(self, object emulator):
+        """
+        Set the order emulator for bar-only backtest emulation support.
+
+        Wires the emulator's tick handlers as callbacks on all matching engines
+        so that synthetic bar-derived ticks are forwarded to the emulator.
+
+        Parameters
+        ----------
+        emulator : OrderEmulator or ``None``
+            The emulator to set, or ``None`` to clear.
+
+        """
+        self._emulator = emulator
+
+        cdef OrderMatchingEngine matching_engine
+        for matching_engine in self._matching_engines.values():
+            matching_engine._emulator_on_trade_tick = emulator.on_trade_tick if emulator is not None else None
+            matching_engine._emulator_on_quote_tick = emulator.on_quote_tick if emulator is not None else None
+
+        self._log.info(f"Set emulator for bar-only backtest support: {emulator is not None}")
+
     cpdef void initialize_account(self):
         """
         Initialize the account to the starting balances.
@@ -2916,6 +2944,8 @@ cdef class SimulatedExchange:
             queue_position=self.queue_position,
             price_protection_points=self.price_protection_points,
             settlement_prices=self.settlement_prices,
+            emulator_on_trade_tick=self._emulator.on_trade_tick if self._emulator is not None else None,
+            emulator_on_quote_tick=self._emulator.on_quote_tick if self._emulator is not None else None,
         )
 
         self._matching_engines[instrument.id] = matching_engine
@@ -3798,6 +3828,8 @@ cdef class OrderMatchingEngine:
         bint queue_position = False,
         price_protection_points=None,
         settlement_prices: dict[InstrumentId, float] | None = None,
+        emulator_on_trade_tick=None,
+        emulator_on_quote_tick=None,
     ) -> None:
         self._clock = clock
         self._log = Logger(name=f"{type(self).__name__}({instrument.id.venue})")
@@ -3830,6 +3862,9 @@ cdef class OrderMatchingEngine:
         self._liquidity_consumption = liquidity_consumption
         self._queue_position = queue_position
         self._price_protection_points = price_protection_points if price_protection_points is not None else 0
+
+        self._emulator_on_trade_tick = emulator_on_trade_tick
+        self._emulator_on_quote_tick = emulator_on_quote_tick
 
         self._fill_model = fill_model
         self._fee_model = fee_model
@@ -4554,6 +4589,8 @@ cdef class OrderMatchingEngine:
             self._book.update_trade_tick(tick)
             self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.open.raw)
+            if self._emulator_on_trade_tick is not None:
+                self._emulator_on_trade_tick(tick)
 
     cdef void _process_trade_bar_high(self, Bar bar, TradeTick tick):
         if bar._mem.high.raw > self._core.last_raw:
@@ -4567,6 +4604,8 @@ cdef class OrderMatchingEngine:
             self._book.update_trade_tick(tick)
             self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.high.raw)
+            if self._emulator_on_trade_tick is not None:
+                self._emulator_on_trade_tick(tick)
 
     cdef void _process_trade_bar_low(self, Bar bar, TradeTick tick):
         if bar._mem.low.raw < self._core.last_raw:
@@ -4580,6 +4619,8 @@ cdef class OrderMatchingEngine:
             self._book.update_trade_tick(tick)
             self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.low.raw)
+            if self._emulator_on_trade_tick is not None:
+                self._emulator_on_trade_tick(tick)
 
     cdef void _process_trade_bar_close(self, Bar bar, TradeTick tick, Quantity close_size = None):
         if bar._mem.close.raw != self._core.last_raw:
@@ -4598,6 +4639,8 @@ cdef class OrderMatchingEngine:
             self._book.update_trade_tick(tick)
             self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.close.raw)
+            if self._emulator_on_trade_tick is not None:
+                self._emulator_on_trade_tick(tick)
 
     cdef void _process_quote_ticks_from_bar(self):
         if self._last_bid_bar is None or self._last_ask_bar is None:
@@ -4666,6 +4709,8 @@ cdef class OrderMatchingEngine:
         self._fill_at_market = True  # Gap from previous bar
         self._book.update_quote_tick(tick)
         self.iterate(tick.ts_init)
+        if self._emulator_on_quote_tick is not None:
+            self._emulator_on_quote_tick(tick)
 
     cdef void _process_quote_bar_high(self, QuoteTick tick):
         self._fill_at_market = False  # Market moving through prices
@@ -4673,6 +4718,8 @@ cdef class OrderMatchingEngine:
         tick._mem.ask_price = self._last_ask_bar._mem.high
         self._book.update_quote_tick(tick)
         self.iterate(tick.ts_init)
+        if self._emulator_on_quote_tick is not None:
+            self._emulator_on_quote_tick(tick)
 
     cdef void _process_quote_bar_low(self, QuoteTick tick):
         self._fill_at_market = False  # Market moving through prices
@@ -4680,6 +4727,8 @@ cdef class OrderMatchingEngine:
         tick._mem.ask_price = self._last_ask_bar._mem.low
         self._book.update_quote_tick(tick)
         self.iterate(tick.ts_init)
+        if self._emulator_on_quote_tick is not None:
+            self._emulator_on_quote_tick(tick)
 
     cdef void _process_quote_bar_close(self, QuoteTick tick, Quantity bid_close_size = None, Quantity ask_close_size = None):
         self._fill_at_market = False  # Market moving through prices
@@ -4691,6 +4740,8 @@ cdef class OrderMatchingEngine:
             tick._mem.ask_size = ask_close_size._mem
         self._book.update_quote_tick(tick)
         self.iterate(tick.ts_init)
+        if self._emulator_on_quote_tick is not None:
+            self._emulator_on_quote_tick(tick)
 
     # -- TRADING COMMANDS -----------------------------------------------------------------------------
 

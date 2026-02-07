@@ -282,12 +282,14 @@ cdef class SimulatedExchange:
     cdef object _message_queue
     cdef list[tuple[tuple[uint64_t, uint64_t], TradingCommand]] _inflight_queue
     cdef dict[uint64_t, uint64_t] _inflight_counter
+    cdef object _emulator    # Optional OrderEmulator reference
 
 # -- REGISTRATION ---------------------------------------------------------------------------------
 
     cpdef void register_client(self, BacktestExecClient client)
     cpdef void set_fill_model(self, FillModel fill_model)
     cpdef void set_latency_model(self, LatencyModel latency_model)
+    cpdef void set_emulator(self, object emulator)
     cpdef void initialize_account(self)
     cpdef void add_instrument(self, Instrument instrument)
 
@@ -414,6 +416,9 @@ cdef class OrderMatchingEngine:
     cdef dict[PriceRaw, tuple[QuantityRaw, QuantityRaw]] _bid_consumption
     cdef dict[PriceRaw, tuple[QuantityRaw, QuantityRaw]] _ask_consumption
     cdef QuantityRaw _trade_consumption
+
+    cdef object _emulator_on_trade_tick    # Optional callback: (TradeTick) -> void
+    cdef object _emulator_on_quote_tick    # Optional callback: (QuoteTick) -> void
 
     cdef int _position_count
     cdef int _order_count
