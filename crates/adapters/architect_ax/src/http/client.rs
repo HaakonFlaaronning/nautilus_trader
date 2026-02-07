@@ -32,7 +32,7 @@ use nautilus_core::{
 use nautilus_model::{
     data::Bar,
     events::AccountState,
-    identifiers::AccountId,
+    identifiers::{AccountId, ClientOrderId},
     instruments::{Instrument, any::InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
 };
@@ -104,11 +104,7 @@ impl Default for AxRawHttpClient {
 
 impl Debug for AxRawHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_session_token = self
-            .session_token
-            .read()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false);
+        let has_session_token = self.session_token.read().is_ok_and(|guard| guard.is_some());
         f.debug_struct(stringify!(AxRawHttpClient))
             .field("base_url", &self.base_url)
             .field("orders_base_url", &self.orders_base_url)
@@ -123,6 +119,14 @@ impl AxRawHttpClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> String {
+        self.credential
+            .as_ref()
+            .map_or_else(|| "None".to_string(), |c| c.masked_api_key())
     }
 
     /// Cancel all pending HTTP requests.
@@ -262,21 +266,14 @@ impl AxRawHttpClient {
     }
 
     fn auth_headers(&self) -> Result<HashMap<String, String>, AxHttpError> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or(AxHttpError::MissingCredentials)?;
-
         // SAFETY: Lock poisoning indicates a panic in another thread, which is fatal
         let guard = self.session_token.read().expect("Lock poisoned");
-        let session_token = guard
-            .as_ref()
-            .ok_or_else(|| AxHttpError::ValidationError("Session token not set".to_string()))?;
+        let session_token = guard.as_ref().ok_or(AxHttpError::MissingSessionToken)?;
 
         let mut headers = HashMap::new();
         headers.insert(
             "Authorization".to_string(),
-            credential.bearer_token(session_token),
+            format!("Bearer {session_token}"),
         );
 
         Ok(headers)
@@ -377,11 +374,9 @@ impl AxRawHttpClient {
             }
         };
 
-        let should_retry = |_error: &AxHttpError| -> bool {
-            // For now, don't retry any errors
-            // TODO: Implement proper retry logic based on error type
-            false
-        };
+        // Only retry idempotent methods to avoid duplicate orders/cancels
+        let is_idempotent = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+        let should_retry = |error: &AxHttpError| -> bool { is_idempotent && error.is_retryable() };
 
         let create_error = |msg: String| -> AxHttpError {
             if msg == "canceled" {
@@ -552,6 +547,42 @@ impl AxRawHttpClient {
             false,
         )
         .await
+    }
+
+    /// Authenticates using stored credentials or environment variables.
+    ///
+    /// # Credential Resolution
+    ///
+    /// Credentials are resolved in the following order:
+    /// 1. Stored credentials (from `with_credentials` constructor)
+    /// 2. Environment variables (`AX_API_KEY` and `AX_API_SECRET`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No credentials are available from either source
+    /// - The HTTP request fails
+    /// - The credentials are invalid
+    pub async fn authenticate_auto(
+        &self,
+        expiration_seconds: i32,
+    ) -> Result<AxAuthenticateResponse, AxHttpError> {
+        let (api_key, api_secret) = self
+            .resolve_credentials()
+            .ok_or(AxHttpError::MissingCredentials)?;
+
+        self.authenticate(&api_key, &api_secret, expiration_seconds)
+            .await
+    }
+
+    fn resolve_credentials(&self) -> Option<(String, String)> {
+        if let Some(cred) = &self.credential {
+            return Some((cred.api_key().to_string(), cred.api_secret().to_string()));
+        }
+
+        let api_key = std::env::var("AX_API_KEY").ok()?;
+        let api_secret = std::env::var("AX_API_SECRET").ok()?;
+        Some((api_key, api_secret))
     }
 
     /// Places a new order.
@@ -844,22 +875,15 @@ impl AxRawHttpClient {
 pub struct AxHttpClient {
     pub(crate) inner: Arc<AxRawHttpClient>,
     pub(crate) instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
-    cache_initialized: AtomicBool,
+    cache_initialized: Arc<AtomicBool>,
 }
 
 impl Clone for AxHttpClient {
     fn clone(&self) -> Self {
-        let cache_initialized = AtomicBool::new(false);
-
-        let is_initialized = self.cache_initialized.load(Ordering::Acquire);
-        if is_initialized {
-            cache_initialized.store(true, Ordering::Release);
-        }
-
         Self {
             inner: self.inner.clone(),
             instruments_cache: self.instruments_cache.clone(),
-            cache_initialized,
+            cache_initialized: self.cache_initialized.clone(),
         }
     }
 }
@@ -898,7 +922,7 @@ impl AxHttpClient {
                 proxy_url,
             )?),
             instruments_cache: Arc::new(DashMap::new()),
-            cache_initialized: AtomicBool::new(false),
+            cache_initialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -932,7 +956,7 @@ impl AxHttpClient {
                 proxy_url,
             )?),
             instruments_cache: Arc::new(DashMap::new()),
-            cache_initialized: AtomicBool::new(false),
+            cache_initialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -940,6 +964,12 @@ impl AxHttpClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         self.inner.base_url()
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> String {
+        self.inner.api_key_masked()
     }
 
     /// Cancel all pending HTTP requests.
@@ -1039,6 +1069,28 @@ impl AxHttpClient {
         Ok(resp.token)
     }
 
+    /// Authenticates using stored credentials or environment variables.
+    ///
+    /// # Credential Resolution
+    ///
+    /// Credentials are resolved in the following order:
+    /// 1. Stored credentials (from `with_credentials` constructor)
+    /// 2. Environment variables (`AX_API_KEY` and `AX_API_SECRET`)
+    ///
+    /// On success, the session token is automatically stored for subsequent authenticated requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No credentials are available from either source
+    /// - The HTTP request fails
+    /// - The credentials are invalid
+    pub async fn authenticate_auto(&self, expiration_seconds: i32) -> Result<String, AxHttpError> {
+        let resp = self.inner.authenticate_auto(expiration_seconds).await?;
+        self.inner.set_session_token(resp.token.clone());
+        Ok(resp.token)
+    }
+
     /// Gets an instrument from the cache by symbol.
     pub fn get_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
         self.instruments_cache
@@ -1114,25 +1166,6 @@ impl AxHttpClient {
         parse_perp_instrument(&resp, maker_fee, taker_fee, ts_init, ts_init)
     }
 
-    /// Requests account state from Ax and parses to a Nautilus [`AccountState`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or parsing fails.
-    pub async fn request_account_state(
-        &self,
-        account_id: AccountId,
-    ) -> anyhow::Result<AccountState> {
-        let response = self
-            .inner
-            .get_balances()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        let ts_init = self.generate_ts_init();
-        parse_account_state(&response, account_id, ts_init, ts_init)
-    }
-
     /// Requests funding rates from Ax.
     ///
     /// # Errors
@@ -1192,9 +1225,31 @@ impl AxHttpClient {
         Ok(bars)
     }
 
+    /// Requests account state from Ax and parses to a Nautilus [`AccountState`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
+    pub async fn request_account_state(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<AccountState> {
+        let response = self
+            .inner
+            .get_balances()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        parse_account_state(&response, account_id, ts_init, ts_init)
+    }
+
     /// Requests open orders from Ax and parses them to Nautilus [`OrderStatusReport`].
     ///
     /// Requires instruments to be cached for parsing order details.
+    ///
+    /// The `cid_resolver` parameter is an optional function that resolves a `cid` (u64)
+    /// to a `ClientOrderId`. This is needed for correlating orders submitted via WebSocket.
     ///
     /// # Errors
     ///
@@ -1202,10 +1257,14 @@ impl AxHttpClient {
     /// - The HTTP request fails.
     /// - An order's instrument is not found in the cache.
     /// - Order parsing fails.
-    pub async fn request_order_status_reports(
+    pub async fn request_order_status_reports<F>(
         &self,
         account_id: AccountId,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        cid_resolver: Option<F>,
+    ) -> anyhow::Result<Vec<OrderStatusReport>>
+    where
+        F: Fn(u64) -> Option<ClientOrderId>,
+    {
         let response = self
             .inner
             .get_open_orders()
@@ -1220,7 +1279,13 @@ impl AxHttpClient {
                 .get_instrument(&order.s)
                 .ok_or_else(|| anyhow::anyhow!("Instrument {} not found in cache", order.s))?;
 
-            match parse_order_status_report(order, account_id, &instrument, ts_init) {
+            match parse_order_status_report(
+                order,
+                account_id,
+                &instrument,
+                ts_init,
+                cid_resolver.as_ref(),
+            ) {
                 Ok(report) => reports.push(report),
                 Err(e) => {
                     log::warn!("Failed to parse order {}: {e}", order.oid);
@@ -1294,6 +1359,11 @@ impl AxHttpClient {
         let mut reports = Vec::with_capacity(response.positions.len());
 
         for position in &response.positions {
+            // Skip flat positions (zero quantity)
+            if position.signed_quantity == 0 {
+                continue;
+            }
+
             let instrument = self.get_instrument(&position.symbol).ok_or_else(|| {
                 anyhow::anyhow!("Instrument {} not found in cache", position.symbol)
             })?;

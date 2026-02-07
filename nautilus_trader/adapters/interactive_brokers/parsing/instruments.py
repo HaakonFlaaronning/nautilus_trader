@@ -241,8 +241,8 @@ VENUES_CMDTY = ["IBCMDTY"]  # self named, in fact mapping to "SMART" when parsin
 RE_CASH = re.compile(r"^(?P<symbol>[A-Z]{3})\/(?P<currency>[A-Z]{3})$")  # "EUR/USD"
 RE_CFD_CASH = re.compile(r"^(?P<symbol>[A-Z]{3})\.(?P<currency>[A-Z]{3})$")  # "EUR.USD"
 RE_OPT = re.compile(
-    r"^(?P<symbol>^[A-Z. ]{1,6})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{5})(?P<decimal>\d{3})$",
-)  # "AAPL220617C00155000"
+    r"^(?P<symbol>[A-Z.]{1,6}) *(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{5})(?P<decimal>\d{3})$",
+)  # "AAPL220617C00155000" or "SPXW  260120P06835000" (OCC format with padding)
 RE_FUT_UNDERLYING = re.compile(r"^(?P<symbol>\w{1,3})$")  # "ES"
 RE_FUT = re.compile(r"^(?P<symbol>\w{1,3})(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{2})$")  # "ESM23"
 RE_FUT_ORIGINAL = re.compile(
@@ -258,10 +258,10 @@ RE_FUT3_ORIGINAL = re.compile(
     r"^(?P<symbol>[A-Z]+)(?P<year>\d{2})(?P<month>(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))FUT$",
 )  # "NIFTY25MARFUT"
 RE_FOP = re.compile(
-    r"^(?P<symbol>\w{1,3})(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{2})(?P<right>[CP])(?P<strike>.{4,5})$",
+    r"^(?P<symbol>\w{1,3})(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{2})(?P<right>[CP])(?P<strike>.{4,6})$",
 )  # "ESM23C4200"
 RE_FOP_ORIGINAL = re.compile(
-    r"^(?P<symbol>\w{1,3})(?P<month>[FGHJKMNQUVXZ])(?P<year>\d)\s(?P<right>[CP])(?P<strike>\d{1,4}(?:\.\d)?)$",
+    r"^(?P<symbol>\w{1,3})(?P<month>[FGHJKMNQUVXZ])(?P<year>\d)\s(?P<right>[CP])(?P<strike>\d{1,6}(?:\.\d+)?)$",
 )  # "ESM3 C4420"
 RE_CRYPTO = re.compile(r"^(?P<symbol>[A-Z]*)\/(?P<currency>[A-Z]{3})$")  # "BTC/USD"
 
@@ -319,7 +319,11 @@ def parse_instrument(  # noqa: C901
             instrument_id=instrument_id,
         )
     elif security_type in ("OPT", "FOP"):
-        return parse_option_contract(contract_details=contract_details, instrument_id=instrument_id)
+        return parse_option_contract(
+            contract_details=contract_details,
+            instrument_id=instrument_id,
+            symbology_method=symbology_method,
+        )
     elif security_type == "CASH":
         return parse_forex_contract(contract_details=contract_details, instrument_id=instrument_id)
     elif security_type == "CRYPTO":
@@ -433,6 +437,7 @@ def parse_futures_contract(
 def parse_option_contract(
     contract_details: IBContractDetails,
     instrument_id: InstrumentId,
+    symbology_method: SymbologyMethod = SymbologyMethod.IB_SIMPLIFIED,
 ) -> OptionContract:
     price_precision: int = _tick_size_to_precision(contract_details.minTick)
     timestamp = time.time_ns()
@@ -447,6 +452,15 @@ def parse_option_contract(
     # For options, the multiplier represents the lot size (e.g., 100 shares per contract)
     multiplier = Quantity.from_str(contract_details.contract.multiplier)
 
+    # Add ^ prefix for index underlyings to match IB simplified symbology
+    underlying = contract_details.underSymbol
+    if (
+        symbology_method == SymbologyMethod.IB_SIMPLIFIED
+        and contract_details.underSecType == "IND"
+        and not underlying.startswith("^")
+    ):
+        underlying = f"^{underlying}"
+
     return OptionContract(
         instrument_id=instrument_id,
         raw_symbol=Symbol(contract_details.contract.localSymbol),
@@ -456,7 +470,7 @@ def parse_option_contract(
         price_increment=Price(contract_details.minTick, price_precision),
         multiplier=multiplier,
         lot_size=multiplier,  # For options, lot size equals multiplier
-        underlying=contract_details.underSymbol,
+        underlying=underlying,
         strike_price=Price(contract_details.contract.strike, price_precision),
         activation_ns=activation.value,
         expiration_ns=expiration.value,
@@ -1045,7 +1059,7 @@ def ib_contract_to_instrument_id_simplified_symbology(  # noqa: C901 (too comple
     elif security_type == "IND":
         symbol = f"^{(contract.localSymbol or contract.symbol)}"
     elif security_type == "OPT":
-        symbol = contract.localSymbol.replace(" ", "")
+        symbol = contract.localSymbol
     elif security_type == "CONTFUT":
         symbol = contract.symbol
     elif security_type == "FUT" and (m := RE_FUT_ORIGINAL.match(contract.localSymbol)):

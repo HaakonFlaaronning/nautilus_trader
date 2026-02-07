@@ -18,11 +18,12 @@
 use std::{
     future::Future,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
+use ahash::AHashSet;
 use anyhow::Context;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -34,9 +35,10 @@ use nautilus_common::{
         DataEvent, DataResponse,
         data::{
             BarsResponse, InstrumentResponse, InstrumentsResponse, RequestBars, RequestInstrument,
-            RequestInstruments, SubscribeBars, SubscribeBookDeltas, SubscribeQuotes,
-            SubscribeTrades, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeQuotes,
-            UnsubscribeTrades,
+            RequestInstruments, SubscribeBars, SubscribeBookDeltas, SubscribeInstrument,
+            SubscribeInstruments, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeInstrument, UnsubscribeInstruments,
+            UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -89,6 +91,7 @@ pub struct AxDataClient {
     instruments: Arc<DashMap<Ustr, InstrumentAny>>,
     /// High-resolution clock for timestamps.
     clock: &'static AtomicTime,
+    subscribed_symbols: Arc<Mutex<AHashSet<String>>>,
 }
 
 impl AxDataClient {
@@ -120,6 +123,7 @@ impl AxDataClient {
             data_sender,
             instruments,
             clock,
+            subscribed_symbols: Arc::new(Mutex::new(AHashSet::new())),
         })
     }
 
@@ -199,7 +203,14 @@ impl AxDataClient {
                 log::info!("WebSocket reconnected");
             }
             NautilusDataWsMessage::Error(err) => {
-                log::error!("WebSocket error: {err:?}");
+                // Subscription state messages are benign (e.g. duplicate subscribe/unsubscribe)
+                if err.message.contains("already subscribed")
+                    || err.message.contains("not subscribed")
+                {
+                    log::warn!("WebSocket subscription state: {err:?}");
+                } else {
+                    log::error!("WebSocket error: {err:?}");
+                }
             }
         }
     }
@@ -213,6 +224,33 @@ impl AxDataClient {
                 log::error!("{context}: {e:?}");
             }
         });
+    }
+
+    fn spawn_subscribe<F>(&self, fut: F, symbol: String, context: &'static str)
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let subscribed_symbols = Arc::clone(&self.subscribed_symbols);
+        get_runtime().spawn(async move {
+            if let Err(e) = fut.await {
+                log::error!("{context}: {e:?}");
+
+                // Rollback on failure to allow retry
+                if let Ok(mut guard) = subscribed_symbols.lock() {
+                    guard.remove(&symbol);
+                }
+            }
+        });
+    }
+
+    fn mark_symbol_subscribed(&self, symbol: &str) -> bool {
+        let mut guard = self.subscribed_symbols.lock().unwrap();
+        guard.insert(symbol.to_string())
+    }
+
+    fn mark_symbol_unsubscribed(&self, symbol: &str) -> bool {
+        let mut guard = self.subscribed_symbols.lock().unwrap();
+        guard.remove(symbol)
     }
 }
 
@@ -294,6 +332,12 @@ impl DataClient for AxDataClient {
 
         for instrument in &instruments {
             self.ws_client.cache_instrument(instrument.clone());
+            if let Err(e) = self
+                .data_sender
+                .send(DataEvent::Instrument(instrument.clone()))
+            {
+                log::warn!("Failed to send instrument: {e}");
+            }
         }
         self.http_client.cache_instruments(instruments);
         log::info!(
@@ -329,17 +373,45 @@ impl DataClient for AxDataClient {
         Ok(())
     }
 
+    fn subscribe_instruments(&mut self, _cmd: &SubscribeInstruments) -> anyhow::Result<()> {
+        // AX does not have a real-time instruments channel; instruments are fetched via HTTP
+        log::debug!("Instruments subscription not applicable for AX (use request_instruments)");
+        Ok(())
+    }
+
+    fn unsubscribe_instruments(&mut self, _cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn subscribe_instrument(&mut self, _cmd: &SubscribeInstrument) -> anyhow::Result<()> {
+        // AX does not have a real-time instrument channel; instruments are fetched via HTTP
+        log::debug!("Instrument subscription not applicable for AX (use request_instrument)");
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, _cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
         let symbol = cmd.instrument_id.symbol.to_string();
-        log::debug!("Subscribing to quotes for {symbol}");
 
+        // Architect allows only one subscription per symbol
+        if !self.mark_symbol_subscribed(&symbol) {
+            log::debug!("Symbol {symbol} already subscribed, skipping quotes subscription");
+            return Ok(());
+        }
+
+        log::debug!("Subscribing to quotes for {symbol}");
         let ws = self.ws_client.clone();
-        self.spawn_ws(
+        let symbol_clone = symbol.clone();
+        self.spawn_subscribe(
             async move {
-                ws.subscribe(&symbol, AxMarketDataLevel::Level1)
+                ws.subscribe(&symbol_clone, AxMarketDataLevel::Level1)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))
             },
+            symbol,
             "subscribe quotes",
         );
 
@@ -348,8 +420,14 @@ impl DataClient for AxDataClient {
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
         let symbol = cmd.instrument_id.symbol.to_string();
-        log::debug!("Unsubscribing from quotes for {symbol}");
 
+        // Architect allows only one subscription per symbol
+        if !self.mark_symbol_unsubscribed(&symbol) {
+            log::debug!("Symbol {symbol} not subscribed, skipping quotes unsubscription");
+            return Ok(());
+        }
+
+        log::debug!("Unsubscribing from quotes for {symbol}");
         let ws = self.ws_client.clone();
         self.spawn_ws(
             async move {
@@ -365,16 +443,25 @@ impl DataClient for AxDataClient {
 
     fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
         let symbol = cmd.instrument_id.symbol.to_string();
+
+        // Architect allows only one subscription per symbol
+        if !self.mark_symbol_subscribed(&symbol) {
+            log::debug!("Symbol {symbol} already subscribed, skipping trades subscription");
+            return Ok(());
+        }
+
         log::debug!("Subscribing to trades for {symbol}");
 
         // Trades come with Level1 subscription
         let ws = self.ws_client.clone();
-        self.spawn_ws(
+        let symbol_clone = symbol.clone();
+        self.spawn_subscribe(
             async move {
-                ws.subscribe(&symbol, AxMarketDataLevel::Level1)
+                ws.subscribe(&symbol_clone, AxMarketDataLevel::Level1)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))
             },
+            symbol,
             "subscribe trades",
         );
 
@@ -383,8 +470,14 @@ impl DataClient for AxDataClient {
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
         let symbol = cmd.instrument_id.symbol.to_string();
-        log::debug!("Unsubscribing from trades for {symbol}");
 
+        // Architect allows only one subscription per symbol
+        if !self.mark_symbol_unsubscribed(&symbol) {
+            log::debug!("Symbol {symbol} not subscribed, skipping trades unsubscription");
+            return Ok(());
+        }
+
+        log::debug!("Unsubscribing from trades for {symbol}");
         let ws = self.ws_client.clone();
         self.spawn_ws(
             async move {
@@ -400,16 +493,25 @@ impl DataClient for AxDataClient {
 
     fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
         let symbol = cmd.instrument_id.symbol.to_string();
+
+        // Architect allows only one subscription per symbol
+        if !self.mark_symbol_subscribed(&symbol) {
+            log::debug!("Symbol {symbol} already subscribed, skipping book deltas subscription");
+            return Ok(());
+        }
+
         let level = AxMarketDataLevel::Level2;
         log::debug!("Subscribing to book deltas for {symbol} at {level:?}");
 
         let ws = self.ws_client.clone();
-        self.spawn_ws(
+        let symbol_clone = symbol.clone();
+        self.spawn_subscribe(
             async move {
-                ws.subscribe(&symbol, level)
+                ws.subscribe(&symbol_clone, level)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))
             },
+            symbol,
             "subscribe book deltas",
         );
 
@@ -418,8 +520,14 @@ impl DataClient for AxDataClient {
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let symbol = cmd.instrument_id.symbol.to_string();
-        log::debug!("Unsubscribing from book deltas for {symbol}");
 
+        // Architect allows only one subscription per symbol
+        if !self.mark_symbol_unsubscribed(&symbol) {
+            log::debug!("Symbol {symbol} not subscribed, skipping book deltas unsubscription");
+            return Ok(());
+        }
+
+        log::debug!("Unsubscribing from book deltas for {symbol}");
         let ws = self.ws_client.clone();
         self.spawn_ws(
             async move {
@@ -471,7 +579,7 @@ impl DataClient for AxDataClient {
         Ok(())
     }
 
-    fn request_instruments(&self, request: &RequestInstruments) -> anyhow::Result<()> {
+    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let request_id = request.request_id;
@@ -479,7 +587,7 @@ impl DataClient for AxDataClient {
         let venue = *AX_VENUE;
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
 
         get_runtime().spawn(async move {
@@ -512,7 +620,7 @@ impl DataClient for AxDataClient {
         Ok(())
     }
 
-    fn request_instrument(&self, request: &RequestInstrument) -> anyhow::Result<()> {
+    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let request_id = request.request_id;
@@ -521,7 +629,7 @@ impl DataClient for AxDataClient {
         let symbol = instrument_id.symbol.to_string();
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
 
         get_runtime().spawn(async move {
@@ -554,7 +662,7 @@ impl DataClient for AxDataClient {
         Ok(())
     }
 
-    fn request_bars(&self, request: &RequestBars) -> anyhow::Result<()> {
+    fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let request_id = request.request_id;
@@ -563,7 +671,7 @@ impl DataClient for AxDataClient {
         let symbol = bar_type.instrument_id().symbol.to_string();
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
         let width = match map_bar_spec_to_candle_width(&bar_type.spec()) {
             Ok(w) => w,

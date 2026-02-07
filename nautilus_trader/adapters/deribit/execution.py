@@ -114,10 +114,10 @@ class DeribitExecutionClient(LiveExecutionClient):
 
         # Configuration
         self._config = config
-        instrument_kinds = (
-            [i.name.upper() for i in config.instrument_kinds] if config.instrument_kinds else None
+        product_types = (
+            [i.name.upper() for i in config.product_types] if config.product_types else None
         )
-        self._log.info(f"config.instrument_kinds={instrument_kinds}", LogColor.BLUE)
+        self._log.info(f"config.product_types={product_types}", LogColor.BLUE)
         self._log.info(f"{config.is_testnet=}", LogColor.BLUE)
         self._log.info(f"{config.http_timeout_secs=}", LogColor.BLUE)
         self._log.info(f"{config.max_retries=}", LogColor.BLUE)
@@ -488,8 +488,8 @@ class DeribitExecutionClient(LiveExecutionClient):
         pyo3_client_order_id = nautilus_pyo3.ClientOrderId(order.client_order_id.value)
 
         # Use command values if provided, otherwise fall back to existing order values
-        price = command.price if command.price else order.price
-        quantity = command.quantity if command.quantity else order.quantity
+        price = command.price or order.price
+        quantity = command.quantity or order.quantity
 
         pyo3_quantity = nautilus_pyo3.Quantity.from_str(str(quantity))
         pyo3_price = nautilus_pyo3.Price.from_str(str(price))

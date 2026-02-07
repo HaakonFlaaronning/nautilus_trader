@@ -51,7 +51,7 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
-    common::{HyperliquidProductType, consts::HYPERLIQUID_VENUE, parse::bar_type_to_interval},
+    common::{consts::HYPERLIQUID_VENUE, parse::bar_type_to_interval},
     config::HyperliquidDataClientConfig,
     http::{client::HyperliquidHttpClient, models::HyperliquidCandle},
     websocket::{
@@ -101,7 +101,7 @@ impl HyperliquidDataClient {
                 is_testnet: config.is_testnet,
                 vault_address: None,
             };
-            HyperliquidHttpClient::with_credentials(
+            HyperliquidHttpClient::with_secrets(
                 &secrets,
                 config.http_timeout_secs,
                 config.http_proxy_url.clone(),
@@ -115,13 +115,7 @@ impl HyperliquidDataClient {
         };
 
         // Note: Rust data client is not the primary interface; Python adapter is used instead.
-        // Defaulting to Perp for basic functionality.
-        let ws_client = HyperliquidWebSocketClient::new(
-            None,
-            config.is_testnet,
-            HyperliquidProductType::Perp,
-            None,
-        );
+        let ws_client = HyperliquidWebSocketClient::new(None, config.is_testnet, None);
 
         Ok(Self {
             client_id,
@@ -520,7 +514,7 @@ impl DataClient for HyperliquidDataClient {
         Ok(())
     }
 
-    fn request_instruments(&self, request: &RequestInstruments) -> anyhow::Result<()> {
+    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         log::debug!("Requesting all instruments");
 
         let instruments = {
@@ -536,7 +530,7 @@ impl DataClient for HyperliquidDataClient {
             datetime_to_unix_nanos(request.start),
             datetime_to_unix_nanos(request.end),
             self.clock.get_time_ns(),
-            request.params.clone(),
+            request.params,
         ));
 
         if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
@@ -546,7 +540,7 @@ impl DataClient for HyperliquidDataClient {
         Ok(())
     }
 
-    fn request_instrument(&self, request: &RequestInstrument) -> anyhow::Result<()> {
+    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
         log::debug!("Requesting instrument: {}", request.instrument_id);
 
         let instrument = self.get_instrument(&request.instrument_id)?;
@@ -559,7 +553,7 @@ impl DataClient for HyperliquidDataClient {
             datetime_to_unix_nanos(request.start),
             datetime_to_unix_nanos(request.end),
             self.clock.get_time_ns(),
-            request.params.clone(),
+            request.params,
         )));
 
         if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
@@ -569,7 +563,7 @@ impl DataClient for HyperliquidDataClient {
         Ok(())
     }
 
-    fn request_bars(&self, request: &RequestBars) -> anyhow::Result<()> {
+    fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         log::debug!("Requesting bars for {}", request.bar_type);
 
         let http = self.http_client.clone();
@@ -580,7 +574,7 @@ impl DataClient for HyperliquidDataClient {
         let limit = request.limit.map(|n| n.get() as u32);
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
@@ -610,7 +604,7 @@ impl DataClient for HyperliquidDataClient {
         Ok(())
     }
 
-    fn request_trades(&self, request: &RequestTrades) -> anyhow::Result<()> {
+    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         log::debug!("Requesting trades for {}", request.instrument_id);
 
         // NOTE: Hyperliquid does not provide public historical trade data via REST API
@@ -632,7 +626,7 @@ impl DataClient for HyperliquidDataClient {
             datetime_to_unix_nanos(request.start),
             datetime_to_unix_nanos(request.end),
             self.clock.get_time_ns(),
-            request.params.clone(),
+            request.params,
         ));
 
         if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
@@ -849,14 +843,8 @@ async fn request_bars_from_http(
 
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-
-    // Extract coin symbol from instrument ID (e.g., "BTC-PERP.HYPERLIQUID" -> "BTC")
-    let coin = instrument_id
-        .symbol
-        .as_str()
-        .split('-')
-        .next()
-        .context("invalid instrument symbol")?;
+    let raw_symbol = instrument.raw_symbol();
+    let coin = raw_symbol.as_str();
 
     let interval = bar_type_to_interval(&bar_type)?;
 

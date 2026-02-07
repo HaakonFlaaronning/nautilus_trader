@@ -51,6 +51,7 @@ use nautilus_common::{
         self, MessagingSwitchboard, TypedIntoHandler, get_message_bus,
         switchboard::{self},
     },
+    runner::try_get_trading_cmd_sender,
 };
 use nautilus_core::{UUID4, UnixNanos, WeakCell};
 use nautilus_model::{
@@ -143,6 +144,20 @@ impl ExecutionEngine {
             TypedIntoHandler::from(move |cmd: TradingCommand| {
                 if let Some(rc) = weak1.upgrade() {
                     rc.borrow().execute(cmd);
+                }
+            }),
+        );
+
+        // Queued endpoint for deferred command execution (re-entrancy safe),
+        // falls back to direct endpoint if no sender is initialized (e.g., backtest/test).
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            TypedIntoHandler::from(move |cmd: TradingCommand| {
+                if let Some(sender) = try_get_trading_cmd_sender() {
+                    sender.execute(cmd);
+                } else {
+                    let endpoint = MessagingSwitchboard::exec_engine_execute();
+                    msgbus::send_trading_command(endpoint, cmd);
                 }
             }),
         );
@@ -944,7 +959,6 @@ impl ExecutionEngine {
     fn handle_submit_order(&self, client: &dyn ExecutionClient, cmd: &SubmitOrder) {
         let client_order_id = cmd.client_order_id;
 
-        // Order should already exist, added by creator
         let mut order = {
             let cache = self.cache.borrow();
             match cache.order(&client_order_id) {
@@ -958,13 +972,22 @@ impl ExecutionEngine {
             }
         };
 
+        let order_venue = order.instrument_id().venue;
+        let client_venue = client.venue();
+        if order_venue != client_venue {
+            self.deny_order(
+                &order,
+                &format!("Order venue {order_venue} does not match client venue {client_venue}"),
+            );
+            return;
+        }
+
         let instrument_id = order.instrument_id();
 
         if self.config.snapshot_orders {
             self.create_order_state_snapshot(&order);
         }
 
-        // Get instrument in a separate scope to manage borrows
         let instrument = {
             let cache = self.cache.borrow();
             if let Some(instrument) = cache.instrument(&instrument_id) {
@@ -1004,15 +1027,25 @@ impl ExecutionEngine {
             own_book.add(order.to_own_book_order());
         }
 
-        // Send the order to the execution client
         if let Err(e) = client.submit_order(cmd) {
-            log::error!("Error submitting order to client: {e}");
             self.deny_order(&order, &format!("failed-to-submit-order-to-client: {e}"));
         }
     }
 
     fn handle_submit_order_list(&self, client: &dyn ExecutionClient, cmd: &SubmitOrderList) {
         let orders = cmd.order_list.orders.clone();
+
+        let order_list_venue = cmd.instrument_id.venue;
+        let client_venue = client.venue();
+        if order_list_venue != client_venue {
+            for order in &orders {
+                self.deny_order(
+                    order,
+                    &format!("Order list venue {order_list_venue} does not match client venue {client_venue}"),
+                );
+            }
+            return;
+        }
 
         let mut cache = self.cache.borrow_mut();
         for order in &orders {
@@ -1093,7 +1126,6 @@ impl ExecutionEngine {
             }
         }
 
-        // Send to execution client
         if let Err(e) = client.submit_order_list(cmd) {
             log::error!("Error submitting order list to client: {e}");
             for order in &orders {
@@ -1860,11 +1892,6 @@ impl ExecutionEngine {
     }
 
     fn deny_order(&self, order: &OrderAny, reason: &str) {
-        log::error!(
-            "Order denied: {reason}, order ID: {}",
-            order.client_order_id()
-        );
-
         let denied = OrderDenied::new(
             order.trader_id(),
             order.strategy_id(),

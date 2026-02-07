@@ -93,6 +93,7 @@ pub struct AxMdWebSocketClient {
     subscriptions: SubscriptionState,
     instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
     request_id_counter: Arc<AtomicI64>,
+    subscribe_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Debug for AxMdWebSocketClient {
@@ -117,6 +118,7 @@ impl Clone for AxMdWebSocketClient {
             signal: Arc::clone(&self.signal),
             task_handle: None, // Each clone gets its own task handle
             subscriptions: self.subscriptions.clone(),
+            subscribe_lock: Arc::clone(&self.subscribe_lock),
             instruments_cache: Arc::clone(&self.instruments_cache),
             request_id_counter: Arc::clone(&self.request_id_counter),
         }
@@ -146,6 +148,7 @@ impl AxMdWebSocketClient {
             subscriptions: SubscriptionState::new(AX_TOPIC_DELIMITER),
             instruments_cache: Arc::new(DashMap::new()),
             request_id_counter: Arc::new(AtomicI64::new(1)),
+            subscribe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -171,6 +174,7 @@ impl AxMdWebSocketClient {
             subscriptions: SubscriptionState::new(AX_TOPIC_DELIMITER),
             instruments_cache: Arc::new(DashMap::new()),
             request_id_counter: Arc::new(AtomicI64::new(1)),
+            subscribe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -209,9 +213,33 @@ impl AxMdWebSocketClient {
         self.subscriptions.len()
     }
 
-    /// Generates a unique request ID.
     fn next_request_id(&self) -> i64 {
         self.request_id_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn is_subscribed_topic(&self, topic: &str) -> bool {
+        let (channel, symbol) = topic
+            .split_once(AX_TOPIC_DELIMITER)
+            .map_or((topic, None), |(c, s)| (c, Some(s)));
+        let channel_ustr = Ustr::from(channel);
+        let symbol_ustr = symbol.map_or_else(|| Ustr::from(""), Ustr::from);
+        self.subscriptions
+            .is_subscribed(&channel_ustr, &symbol_ustr)
+    }
+
+    fn is_symbol_subscribed(&self, symbol: &str) -> bool {
+        let symbol_ustr = Ustr::from(symbol);
+        for level in [
+            AxMarketDataLevel::Level1,
+            AxMarketDataLevel::Level2,
+            AxMarketDataLevel::Level3,
+        ] {
+            let level_ustr = Ustr::from(&format!("{level:?}"));
+            if self.subscriptions.is_subscribed(&symbol_ustr, &level_ustr) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Caches an instrument for use during message parsing.
@@ -244,7 +272,7 @@ impl AxMdWebSocketClient {
         const MAX_RETRIES: u32 = 5;
         const CONNECTION_TIMEOUT_SECS: u64 = 10;
 
-        self.signal.store(false, Ordering::Relaxed);
+        self.signal.store(false, Ordering::Release);
 
         let (raw_handler, raw_rx) = channel_message_handler();
 
@@ -374,8 +402,7 @@ impl AxMdWebSocketClient {
 
             while let Some(msg) = handler.next().await {
                 if matches!(msg, NautilusDataWsMessage::Reconnected) {
-                    log::info!("WebSocket reconnected, resubscribing...");
-                    // TODO: Replay subscriptions on reconnect
+                    log::info!("WebSocket reconnected, subscriptions will be replayed");
                 }
 
                 if out_tx.send(msg).is_err() {
@@ -394,21 +421,42 @@ impl AxMdWebSocketClient {
 
     /// Subscribes to market data for a symbol at the specified level.
     ///
+    /// Skips sending if already subscribed at any level - Architect allows only
+    /// one subscription per symbol. Trades and tickers come with any level.
+    ///
     /// # Errors
     ///
     /// Returns an error if the subscription command cannot be sent.
     pub async fn subscribe(&self, symbol: &str, level: AxMarketDataLevel) -> AxWsResult<()> {
-        let request_id = self.next_request_id();
-        let topic = format!("{symbol}:{level:?}");
+        // Lock to prevent concurrent subscribe race conditions
+        let _guard = self.subscribe_lock.lock().await;
 
+        // Skip if symbol already subscribed at any level
+        if self.is_symbol_subscribed(symbol) {
+            log::debug!("Symbol {symbol} already subscribed, skipping");
+            return Ok(());
+        }
+
+        let topic = format!("{symbol}:{level:?}");
+        let request_id = self.next_request_id();
+
+        // Mark pending before sending
         self.subscriptions.mark_subscribe(&topic);
 
-        self.send_cmd(HandlerCommand::Subscribe {
-            request_id,
-            symbol: symbol.to_string(),
-            level,
-        })
-        .await
+        if let Err(e) = self
+            .send_cmd(HandlerCommand::Subscribe {
+                request_id,
+                symbol: symbol.to_string(),
+                level,
+            })
+            .await
+        {
+            // Rollback pending state on send failure
+            self.subscriptions.mark_unsubscribe(&topic);
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     /// Unsubscribes from market data for a symbol.
@@ -417,6 +465,15 @@ impl AxMdWebSocketClient {
     ///
     /// Returns an error if the unsubscribe command cannot be sent.
     pub async fn unsubscribe(&self, symbol: &str) -> AxWsResult<()> {
+        // Lock to prevent concurrent unsubscribe race conditions
+        let _guard = self.subscribe_lock.lock().await;
+
+        // Skip if symbol not subscribed at any level
+        if !self.is_symbol_subscribed(symbol) {
+            log::debug!("Symbol {symbol} not subscribed, skipping unsubscribe");
+            return Ok(());
+        }
+
         let request_id = self.next_request_id();
 
         for level in [
@@ -437,21 +494,39 @@ impl AxMdWebSocketClient {
 
     /// Subscribes to candle data for a symbol.
     ///
+    /// Skips sending if already subscribed or subscription is pending.
+    ///
     /// # Errors
     ///
     /// Returns an error if the subscription command cannot be sent.
     pub async fn subscribe_candles(&self, symbol: &str, width: AxCandleWidth) -> AxWsResult<()> {
-        let request_id = self.next_request_id();
         let topic = format!("candles:{symbol}:{width:?}");
 
+        // Skip if already subscribed or pending
+        if self.is_subscribed_topic(&topic) {
+            log::debug!("Already subscribed to {topic}, skipping");
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+
+        // Mark pending BEFORE sending to prevent race conditions with concurrent subscribes
         self.subscriptions.mark_subscribe(&topic);
 
-        self.send_cmd(HandlerCommand::SubscribeCandles {
-            request_id,
-            symbol: symbol.to_string(),
-            width,
-        })
-        .await
+        if let Err(e) = self
+            .send_cmd(HandlerCommand::SubscribeCandles {
+                request_id,
+                symbol: symbol.to_string(),
+                width,
+            })
+            .await
+        {
+            // Rollback pending state on send failure
+            self.subscriptions.mark_unsubscribe(&topic);
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     /// Unsubscribes from candle data for a symbol.
@@ -473,17 +548,19 @@ impl AxMdWebSocketClient {
         .await
     }
 
-    /// Returns a stream of messages from the WebSocket.
+    /// Returns a stream of WebSocket messages.
     ///
     /// # Panics
     ///
-    /// Panics if called more than once or before connecting.
+    /// Panics if called before `connect()` or if the stream has already been taken.
     pub fn stream(&mut self) -> impl futures_util::Stream<Item = NautilusDataWsMessage> + 'static {
         let rx = self
             .out_rx
             .take()
-            .expect("Stream receiver already taken or client not connected");
-        let mut rx = Arc::try_unwrap(rx).expect("Cannot take ownership - other references exist");
+            .expect("Stream receiver already taken or client not connected - stream() can only be called once");
+        let mut rx = Arc::try_unwrap(rx).expect(
+            "Cannot take ownership of stream - client was cloned and other references exist",
+        );
         async_stream::stream! {
             while let Some(msg) = rx.recv().await {
                 yield msg;
@@ -500,9 +577,11 @@ impl AxMdWebSocketClient {
     /// Closes the WebSocket connection and cleans up resources.
     pub async fn close(&mut self) {
         log::debug!("Closing WebSocket client");
-        self.signal.store(true, Ordering::Relaxed);
 
+        // Send disconnect first to allow graceful cleanup before signal
         let _ = self.send_cmd(HandlerCommand::Disconnect).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.signal.store(true, Ordering::Release);
 
         if let Some(handle) = self.task_handle.take() {
             const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);

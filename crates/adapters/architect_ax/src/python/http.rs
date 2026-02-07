@@ -16,8 +16,12 @@
 //! Python bindings for the Ax HTTP client.
 
 use nautilus_core::python::to_pyvalue_err;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::{
+    identifiers::{AccountId, ClientOrderId},
+    python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+};
 use pyo3::{IntoPyObjectExt, prelude::*, types::PyList};
+use rust_decimal::Decimal;
 
 use crate::http::{client::AxHttpClient, error::AxHttpError};
 
@@ -101,9 +105,127 @@ impl AxHttpClient {
         self.base_url()
     }
 
+    #[getter]
+    #[pyo3(name = "api_key_masked")]
+    #[must_use]
+    pub fn py_api_key_masked(&self) -> String {
+        self.api_key_masked()
+    }
+
     #[pyo3(name = "cancel_all_requests")]
     pub fn py_cancel_all_requests(&self) {
         self.cancel_all_requests();
+    }
+
+    /// Caches a single instrument for use in parsing responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument cannot be converted from Python.
+    #[pyo3(name = "cache_instrument")]
+    pub fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
+        self.cache_instrument(pyobject_to_instrument_any(py, instrument)?);
+        Ok(())
+    }
+
+    /// Authenticates with Ax and stores the session token for subsequent requests.
+    ///
+    /// Returns the session token string.
+    #[pyo3(name = "authenticate")]
+    #[pyo3(signature = (api_key, api_secret, expiration_seconds=86400))]
+    fn py_authenticate<'py>(
+        &self,
+        py: Python<'py>,
+        api_key: String,
+        api_secret: String,
+        expiration_seconds: i32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .authenticate(&api_key, &api_secret, expiration_seconds)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Authenticates using stored credentials or environment variables.
+    ///
+    /// Credentials are resolved in the following order:
+    /// 1. Stored credentials (from `with_credentials` constructor)
+    /// 2. Environment variables (`AX_API_KEY` and `AX_API_SECRET`)
+    ///
+    /// Returns the session token string.
+    #[pyo3(name = "authenticate_auto")]
+    #[pyo3(signature = (expiration_seconds=86400))]
+    fn py_authenticate_auto<'py>(
+        &self,
+        py: Python<'py>,
+        expiration_seconds: i32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .authenticate_auto(expiration_seconds)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Request all instruments from Ax.
+    ///
+    /// Returns a list of instrument definitions.
+    #[pyo3(name = "request_instruments")]
+    #[pyo3(signature = (maker_fee=None, taker_fee=None))]
+    fn py_request_instruments<'py>(
+        &self,
+        py: Python<'py>,
+        maker_fee: Option<Decimal>,
+        taker_fee: Option<Decimal>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let instruments = client
+                .request_instruments(maker_fee, taker_fee)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_instruments: PyResult<Vec<_>> = instruments
+                    .into_iter()
+                    .map(|inst| instrument_any_to_pyobject(py, inst))
+                    .collect();
+                let pylist = PyList::new(py, py_instruments?)
+                    .unwrap()
+                    .into_any()
+                    .unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    /// Request account state from Ax.
+    ///
+    /// Returns an `AccountState` with current balances and margins.
+    #[pyo3(name = "request_account_state")]
+    fn py_request_account_state<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let account_state = client
+                .request_account_state(account_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| account_state.into_py_any(py))
+        })
     }
 
     /// Request order status reports from Ax.
@@ -119,7 +241,7 @@ impl AxHttpClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let reports = client
-                .request_order_status_reports(account_id)
+                .request_order_status_reports(account_id, None::<fn(u64) -> Option<ClientOrderId>>)
                 .await
                 .map_err(to_pyvalue_err)?;
 

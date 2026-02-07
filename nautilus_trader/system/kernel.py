@@ -258,6 +258,9 @@ class NautilusKernel:
                     "`LoggingConfig.bypass_logging` was set `True` when not safe to bypass logging in a LIVE context",
                 )
 
+        if logging.use_tracing and not nautilus_pyo3.tracing_is_initialized():
+            nautilus_pyo3.init_tracing()
+
         self._log: Logger = Logger(name=name)
         self._log.info("Building system kernel")
 
