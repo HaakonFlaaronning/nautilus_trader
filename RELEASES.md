@@ -9,6 +9,7 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Added sandbox execution adapter in Rust
 - Added multi-account execution support (#3194), thanks @faysou
 - Added `OrderBookDeltas` historical request support (#3438), thanks @faysou
+- Added `market_exit()` method for `Strategy` with configurable `market_exit_time_in_force` and `market_exit_reduce_only` options (supports venues requiring IOC for market orders)
 - Added `manage_stop` config option to `StrategyConfig` for automatic market exit on stop
 - Added matching engine `queue_position` tracking heuristic for backtests
 - Added tracing subscriber for external Rust library logs (`use_tracing=True` in `LoggingConfig`, filter with `RUST_LOG` env var)
@@ -41,14 +42,17 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Changed `Quantity + Quantity`, `Quantity - Quantity`, `Price + Price`, `Price - Price`, `Money + Money`, and `Money - Money` Python operators to return the same type instead of `Decimal` (`Quantity - Quantity` raises `ValueError` if result would be negative)
 - Changed `trade_execution` default from `False` to `True` for consistency with `bar_execution`; users who want to isolate execution to L1 book data only must now explicitly set `trade_execution=False`
 - Changed price-protected market orders to no longer emit `OrderAccepted` by default; set `use_market_order_acks=True` to restore previous behavior
+- Changed Polymarket instrument provider config from `instrument_provider` to `instrument_config` on `PolymarketDataClientConfig` and `PolymarketExecClientConfig`; use `PolymarketInstrumentProviderConfig` instead of `InstrumentProviderConfig`
 - Adapter implementations should now override `_subscribe_order_book_depth` and `_unsubscribe_order_book_depth` for `OrderBookDepth10` subscriptions
 
 ### Security
 - Upgraded `arc-swap` to 1.8.1 fixing potential use-after-free in debt mechanism (memory ordering fix)
 - Fixed `CVec::empty()` to use dangling pointer instead of null, avoiding undefined behavior in `Vec::from_raw_parts`
+- Fixed credential and auth header leaks in trace logging
 - Masked Binance listen keys in execution client logs
 - Refactored supply chain security checks and update dependencies
 - Improved TLS cert loading and socket suffix validation
+- Hardened Postgres SQL and credential security
 
 ### Fixes
 - Fixed matching engine liquidity consumption using cumulative book quantity
@@ -82,6 +86,7 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Fixed `request_order_book_snapshot` and add Bybit support (#3416), thanks @dxwil
 - Fixed Arrow serialization encoding for custom Nautilus types (#3515), thanks @dennisnissle
 - Fixed Redis cache buffer flushing during idle periods (#3426), thanks for reporting @santivazq
+- Fixed cache loading when flush_on_start set to True (#3551), thanks @HaakonFlaaronning
 - Fixed Betfair dropped fills from premature cache update
 - Fixed Betfair duplicate cancel event race condition(s)
 - Fixed Betfair stream batch handling and modify/cancel edge cases
@@ -125,6 +130,7 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 ### Internal Improvements
 - Added support for setting cache database adapter in cache and `LiveNode` (#3401), thanks @filipmacek
 - Added `ts_init` normalization option to `convert_stream_to_data` (#3433), thanks @faysou
+- Added metadata validation for parquet file consolidation to improve handling of mixed precision instruments
 - Added Binance `listenKeyExpired` event handling (#3387), thanks @Johnkhk
 - Added Deribit data client (#3368), thanks @filipmacek
 - Added Deribit order submission (#3408), thanks @filipmacek
