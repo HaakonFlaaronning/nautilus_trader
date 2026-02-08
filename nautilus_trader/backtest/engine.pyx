@@ -4587,8 +4587,8 @@ cdef class OrderMatchingEngine:
 
             self._fill_at_market = True  # Gap from previous bar
             self._book.update_trade_tick(tick)
-            self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.open.raw)
+            self.iterate(tick.ts_init)
             if self._emulator_on_trade_tick is not None:
                 self._emulator_on_trade_tick(tick)
 
@@ -4602,8 +4602,8 @@ cdef class OrderMatchingEngine:
             tick._mem.aggressor_side = AggressorSide.BUYER
             tick._mem.trade_id = trade_id_new(pystr_to_cstr(self._generate_trade_id_str()))
             self._book.update_trade_tick(tick)
-            self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.high.raw)
+            self.iterate(tick.ts_init)
             if self._emulator_on_trade_tick is not None:
                 self._emulator_on_trade_tick(tick)
 
@@ -4617,8 +4617,8 @@ cdef class OrderMatchingEngine:
             tick._mem.aggressor_side = AggressorSide.SELLER
             tick._mem.trade_id = trade_id_new(pystr_to_cstr(self._generate_trade_id_str()))
             self._book.update_trade_tick(tick)
-            self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.low.raw)
+            self.iterate(tick.ts_init)
             if self._emulator_on_trade_tick is not None:
                 self._emulator_on_trade_tick(tick)
 
@@ -4637,8 +4637,8 @@ cdef class OrderMatchingEngine:
                 tick._mem.aggressor_side = AggressorSide.SELLER
             tick._mem.trade_id = trade_id_new(pystr_to_cstr(self._generate_trade_id_str()))
             self._book.update_trade_tick(tick)
-            self.iterate(tick.ts_init)
             self._core.set_last_raw(bar._mem.close.raw)
+            self.iterate(tick.ts_init)
             if self._emulator_on_trade_tick is not None:
                 self._emulator_on_trade_tick(tick)
 
@@ -4988,6 +4988,19 @@ cdef class OrderMatchingEngine:
 
         if self._use_market_order_acks:
             self._generate_order_accepted(order, venue_order_id=self._get_venue_order_id(order))
+
+        # For emulator-released orders from trailing stops, extract trigger price
+        # from original order's event history for trigger-price fill semantics
+        cdef object event
+        cdef Price last_trigger_price
+        if order.get_triggered_price_c() is None:
+            last_trigger_price = None
+            for event in reversed(order.events_c()):
+                if isinstance(event, OrderUpdated) and (<OrderUpdated>event).trigger_price is not None:
+                    last_trigger_price = (<OrderUpdated>event).trigger_price
+                    break
+            if last_trigger_price is not None:
+                order.set_triggered_price_c(last_trigger_price)
 
         # Immediately fill marketable order
         self.fill_market_order(order)
@@ -5811,14 +5824,16 @@ cdef class OrderMatchingEngine:
         # Apply liquidity consumption after protection filtering
         # Skip for trigger price fills (gap price may not exist in book)
         cdef bint is_trigger_price_fill = (
-            not self._fill_at_market
-            and self._book.book_type == BookType.L1_MBP
+            self._book.book_type == BookType.L1_MBP
+            and order.get_triggered_price_c() is not None
             and (
-                order.order_type == OrderType.STOP_MARKET
-                or order.order_type == OrderType.TRAILING_STOP_MARKET
-                or order.order_type == OrderType.MARKET_IF_TOUCHED
+                (not self._fill_at_market and (
+                    order.order_type == OrderType.STOP_MARKET
+                    or order.order_type == OrderType.TRAILING_STOP_MARKET
+                    or order.order_type == OrderType.MARKET_IF_TOUCHED
+                ))
+                or order.order_type == OrderType.MARKET
             )
-            and order.has_trigger_price_c()
         )
 
         if not is_trigger_price_fill:
@@ -6037,22 +6052,24 @@ cdef class OrderMatchingEngine:
             is_aggressive=True,
         )
 
-        # For stop market and market-if-touched orders during bar H/L/C processing, fill at trigger price
+        # For stop/trailing/MIT orders during bar H/L/C processing, fill at trigger price
         # (market moved through the trigger). For gaps/immediate triggers, fill at market.
-        cdef Price triggered_price
+        # Also applies to emulator-released MARKET orders that have trigger price from event history.
+        cdef Price triggered_price = order.get_triggered_price_c()
         if (
-            not self._fill_at_market
-            and self._book.book_type == BookType.L1_MBP
+            self._book.book_type == BookType.L1_MBP
             and fills
+            and triggered_price is not None
             and (
-                order.order_type == OrderType.STOP_MARKET
-                or order.order_type == OrderType.TRAILING_STOP_MARKET
-                or order.order_type == OrderType.MARKET_IF_TOUCHED
+                (not self._fill_at_market and (
+                    order.order_type == OrderType.STOP_MARKET
+                    or order.order_type == OrderType.TRAILING_STOP_MARKET
+                    or order.order_type == OrderType.MARKET_IF_TOUCHED
+                ))
+                or order.order_type == OrderType.MARKET
             )
         ):
-            triggered_price = order.get_triggered_price_c()
-            if triggered_price is not None:
-                fills[0] = (triggered_price, fills[0][1])
+            fills[0] = (triggered_price, fills[0][1])
 
         return fills
 
