@@ -389,16 +389,6 @@ cdef class OrderEmulator(Actor):
                     return
                 matching_core = self.create_matching_core(instrument.id, instrument.price_increment)
 
-        # Update trailing stop
-        if order.order_type == OrderType.TRAILING_STOP_MARKET or order.order_type == OrderType.TRAILING_STOP_LIMIT:
-            self._trail_stop_order(matching_core, order)
-
-        # Cache command
-        self._manager.cache_submit_order_command(command)
-
-        # Check if immediately marketable (initial match)
-        matching_core.match_order(order, initial=True)
-
         # Check data subscription
         if emulation_trigger == TriggerType.DEFAULT or emulation_trigger == TriggerType.BID_ASK:
             if trigger_instrument_id not in self._subscribed_quotes:
@@ -414,6 +404,16 @@ cdef class OrderEmulator(Actor):
             raise ValueError(  # pragma: no cover (design-time error)
                 f"invalid `TriggerType`, was {emulation_trigger}",  # pragma: no cover (design-time error)
             )
+
+        # Update trailing stop
+        if order.order_type == OrderType.TRAILING_STOP_MARKET or order.order_type == OrderType.TRAILING_STOP_LIMIT:
+            self._trail_stop_order(matching_core, order)
+
+        # Cache command
+        self._manager.cache_submit_order_command(command)
+
+        # Check if immediately marketable (initial match)
+        matching_core.match_order(order, initial=True)
 
         if order.client_order_id not in self._manager.get_submit_order_commands():
             return  # Already released
@@ -929,12 +929,11 @@ cdef class OrderEmulator(Actor):
                 # However, the implementation of the emulator bypass this step, and directly call this method through match_order().
                 market_price = ask if order.side == OrderSide.BUY else bid
                 if market_price is None:
-                    # If there is no market price, we cannot process the order
-                    raise RuntimeError(  # pragma: no cover (design-time error)
-                        f"cannot process trailing stop, "
-                        f"no BID or ASK price for {order.instrument_id} "
-                        f"(add quotes or use bars)",
+                    self._log.warning(
+                        f"Cannot activate trailing stop for {order.instrument_id}: "
+                        f"no market price available yet, will retry on next tick",
                     )
+                    return
                 order.set_activated_c(market_price)
             elif matching_core.is_touch_triggered(order.side, order.activation_price):
                 order.set_activated_c(None)

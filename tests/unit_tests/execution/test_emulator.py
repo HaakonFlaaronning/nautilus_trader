@@ -1316,3 +1316,52 @@ class TestOrderEmulatorWithSingleOrders:
         assert isinstance(order.events[2], OrderInitialized)
         assert isinstance(order.events[3], OrderReleased)
         assert self.exec_client.calls == ["_start", "submit_order"]
+
+    @pytest.mark.parametrize(
+        ("order_side", "expected_trigger_price"),
+        [
+            [OrderSide.BUY, ETHUSDT_PERP_BINANCE.make_price(5_075)],
+            [OrderSide.SELL, ETHUSDT_PERP_BINANCE.make_price(5_055)],
+        ],
+    )
+    def test_submit_trailing_stop_market_order_with_no_market_data_defers_activation(
+        self,
+        order_side: OrderSide,
+        expected_trigger_price: Price,
+    ) -> None:
+        # Arrange: Submit trailing stop WITHOUT any market data
+        order = self.strategy.order_factory.trailing_stop_market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=order_side,
+            quantity=Quantity.from_int(10),
+            trigger_type=TriggerType.BID_ASK,
+            trailing_offset=Decimal(5),
+            trailing_offset_type=TrailingOffsetType.PRICE,
+            emulation_trigger=TriggerType.BID_ASK,
+        )
+
+        # Act
+        self.strategy.submit_order(order)
+
+        # Assert: Order is emulated but NOT activated (no crash)
+        order = self.cache.order(order.client_order_id)
+        assert order.order_type == OrderType.TRAILING_STOP_MARKET
+        assert order.is_emulated
+        assert not order.is_activated
+        assert order.trigger_price is None
+        assert len(order.events) == 2  # Initialized + Emulated (no OrderUpdated)
+        assert isinstance(order.events[0], OrderInitialized)
+        assert isinstance(order.events[1], OrderEmulated)
+
+        # Act: Now provide market data
+        tick = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5_060.0,
+            ask_price=5_070.0,
+        )
+        self.data_engine.process(tick)
+
+        # Assert: Order is now activated with trigger price
+        order = self.cache.order(order.client_order_id)
+        assert order.is_activated
+        assert order.trigger_price == expected_trigger_price
