@@ -15,32 +15,43 @@
 
 //! Live execution client implementation for the BitMEX adapter.
 
-use std::{future::Future, sync::Mutex};
+use std::{
+    future::Future,
+    str::FromStr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
+    enums::LogLevel,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList,
     },
 };
 use nautilus_core::{
-    UnixNanos,
+    Params, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType},
+    enums::{AccountType, OmsType, OrderSide},
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, Venue, VenueOrderId},
-    instruments::Instrument,
-    orders::Order,
+    instruments::{Instrument, InstrumentAny},
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
@@ -52,6 +63,7 @@ use crate::{
         canceller::{CancelBroadcaster, CancelBroadcasterConfig},
         submitter::{SubmitBroadcaster, SubmitBroadcasterConfig},
     },
+    common::enums::BitmexPegPriceType,
     config::BitmexExecClientConfig,
     http::client::BitmexHttpClient,
     websocket::{client::BitmexWebSocketClient, messages::NautilusWsMessage},
@@ -69,9 +81,25 @@ pub struct BitmexExecutionClient {
     _canceller: CancelBroadcaster,
     ws_stream_handle: Option<JoinHandle<()>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    dms_task_handle: Option<JoinHandle<()>>,
+    dms_running: Arc<AtomicBool>,
 }
 
 impl BitmexExecutionClient {
+    fn log_report_receipt(count: usize, report_type: &str, log_level: LogLevel) {
+        let plural = if count == 1 { "" } else { "s" };
+        let message = format!("Received {count} {report_type}{plural}");
+
+        match log_level {
+            LogLevel::Off => {}
+            LogLevel::Trace => log::trace!("{message}"),
+            LogLevel::Debug => log::debug!("{message}"),
+            LogLevel::Info => log::info!("{message}"),
+            LogLevel::Warning => log::warn!("{message}"),
+            LogLevel::Error => log::error!("{message}"),
+        }
+    }
+
     /// Creates a new [`BitmexExecutionClient`].
     ///
     /// # Errors
@@ -102,12 +130,13 @@ impl BitmexExecutionClient {
             config.http_proxy_url.clone(),
         )
         .context("failed to construct BitMEX HTTP client")?;
-        let ws_client = BitmexWebSocketClient::new(
+        let ws_client = BitmexWebSocketClient::new_with_env(
             Some(config.ws_url()),
             config.api_key.clone(),
             config.api_secret.clone(),
             Some(account_id),
             config.heartbeat_interval_secs,
+            config.use_testnet,
         )
         .context("failed to construct BitMEX execution websocket client")?;
 
@@ -174,6 +203,8 @@ impl BitmexExecutionClient {
             _canceller,
             ws_stream_handle: None,
             pending_tasks: Mutex::new(Vec::new()),
+            dms_task_handle: None,
+            dms_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -207,16 +238,79 @@ impl BitmexExecutionClient {
         }
     }
 
+    fn start_deadmans_switch(&mut self) {
+        let Some(timeout_secs) = self.config.deadmans_switch_timeout_secs else {
+            return;
+        };
+
+        let timeout_ms = timeout_secs * 1000;
+        let interval_secs = (timeout_secs / 4).max(1);
+
+        log::info!(
+            "Starting dead man's switch: timeout={timeout_secs}s, refresh_interval={interval_secs}s",
+        );
+
+        self.dms_running.store(true, Ordering::SeqCst);
+        let running = self.dms_running.clone();
+        let http_client = self.http_client.clone();
+
+        let handle = get_runtime().spawn(async move {
+            while running.load(Ordering::SeqCst) {
+                if let Err(e) = http_client.cancel_all_after(timeout_ms).await {
+                    log::warn!("Dead man's switch heartbeat failed: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            }
+        });
+
+        self.dms_task_handle = Some(handle);
+    }
+
+    async fn stop_deadmans_switch(&mut self) {
+        if self.config.deadmans_switch_timeout_secs.is_none() {
+            return;
+        }
+
+        self.dms_running.store(false, Ordering::SeqCst);
+
+        // Abort and await loop shutdown so disconnect does not block on sleep/HTTP timeout.
+        if let Some(handle) = self.dms_task_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        log::info!("Disarming dead man's switch");
+        if let Err(e) = self.http_client.cancel_all_after(0).await {
+            log::warn!("Failed to disarm dead man's switch: {e}");
+        }
+    }
+
     async fn ensure_instruments_initialized_async(&mut self) -> anyhow::Result<()> {
         if self.core.instruments_initialized() {
             return Ok(());
         }
 
-        let http = self.http_client.clone();
-        let mut instruments = http
-            .request_instruments(self.config.active_only)
-            .await
-            .context("failed to request BitMEX instruments")?;
+        let mut instruments: Vec<InstrumentAny> = {
+            let cache = self.core.cache();
+            cache
+                .instruments(&self.core.venue, None)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+
+        if instruments.is_empty() {
+            let http = self.http_client.clone();
+            instruments = http
+                .request_instruments(self.config.active_only)
+                .await
+                .context("failed to request BitMEX instruments")?;
+        } else {
+            log::debug!(
+                "Reusing {} cached BitMEX instruments for execution client initialization",
+                instruments.len()
+            );
+        }
 
         instruments.sort_by_key(|instrument| instrument.id());
 
@@ -232,15 +326,6 @@ impl BitmexExecutionClient {
         Ok(())
     }
 
-    fn ensure_instruments_initialized(&mut self) -> anyhow::Result<()> {
-        if self.core.instruments_initialized() {
-            return Ok(());
-        }
-
-        let runtime = get_runtime();
-        runtime.block_on(self.ensure_instruments_initialized_async())
-    }
-
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
         let account_state = self
             .http_client
@@ -252,9 +337,32 @@ impl BitmexExecutionClient {
         Ok(())
     }
 
-    fn update_account_state(&self) -> anyhow::Result<()> {
-        let runtime = get_runtime();
-        runtime.block_on(self.refresh_account_state())
+    async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
+        let account_id = self.core.account_id;
+
+        if self.core.cache().account(&account_id).is_some() {
+            log::info!("Account {account_id} registered");
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        let interval = Duration::from_millis(10);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            if self.core.cache().account(&account_id).is_some() {
+                log::info!("Account {account_id} registered");
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                anyhow::bail!(
+                    "Timeout waiting for account {account_id} to be registered after {timeout_secs}s"
+                );
+            }
+        }
     }
 
     fn start_ws_stream(&mut self) -> anyhow::Result<()> {
@@ -273,6 +381,126 @@ impl BitmexExecutionClient {
         });
 
         self.ws_stream_handle = Some(handle);
+        Ok(())
+    }
+
+    fn submit_cached_order(
+        &self,
+        order: OrderAny,
+        submit_tries: Option<usize>,
+        peg_price_type: Option<BitmexPegPriceType>,
+        peg_offset_value: Option<f64>,
+        task_label: &'static str,
+    ) -> anyhow::Result<()> {
+        if order.is_closed() {
+            log::warn!("Cannot submit closed order {}", order.client_order_id());
+            return Ok(());
+        }
+
+        self.emitter.emit_order_submitted(&order);
+
+        let use_broadcaster = submit_tries.is_some_and(|n| n > 1);
+        let http_client = self.http_client.clone();
+        let submitter = self._submitter.clone_for_async();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        let strategy_id = order.strategy_id();
+        let instrument_id = order.instrument_id();
+        let client_order_id = order.client_order_id();
+        let order_side = order.order_side();
+        let order_type = order.order_type();
+        let quantity = order.quantity();
+        let time_in_force = order.time_in_force();
+        let price = order.price();
+        let trigger_price = order.trigger_price();
+        let trigger_type = order.trigger_type();
+        let trailing_offset = order.trailing_offset().and_then(|d| d.to_f64());
+        let trailing_offset_type = order.trailing_offset_type();
+        let display_qty = order.display_qty();
+        let post_only = order.is_post_only();
+        let reduce_only = order.is_reduce_only();
+        let order_list_id = order.order_list_id();
+        let contingency_type = order.contingency_type();
+
+        self.spawn_task(task_label, async move {
+            let result = if use_broadcaster {
+                submitter
+                    .broadcast_submit(
+                        instrument_id,
+                        client_order_id,
+                        order_side,
+                        order_type,
+                        quantity,
+                        time_in_force,
+                        price,
+                        trigger_price,
+                        trigger_type,
+                        trailing_offset,
+                        trailing_offset_type,
+                        display_qty,
+                        post_only,
+                        reduce_only,
+                        order_list_id,
+                        contingency_type,
+                        submit_tries,
+                        peg_price_type,
+                        peg_offset_value,
+                    )
+                    .await
+            } else {
+                http_client
+                    .submit_order(
+                        instrument_id,
+                        client_order_id,
+                        order_side,
+                        order_type,
+                        quantity,
+                        time_in_force,
+                        price,
+                        trigger_price,
+                        trigger_type,
+                        trailing_offset,
+                        trailing_offset_type,
+                        display_qty,
+                        post_only,
+                        reduce_only,
+                        order_list_id,
+                        contingency_type,
+                        peg_price_type,
+                        peg_offset_value,
+                    )
+                    .await
+            };
+
+            match result {
+                Ok(report) => emitter.send_order_status_report(report),
+                Err(e) => {
+                    let error_msg = e.to_string();
+
+                    // If all transports returned "Duplicate clOrdID", the order likely exists
+                    // but the success response was lost. Wait for WebSocket confirmation.
+                    if error_msg.contains("IDEMPOTENT_DUPLICATE") {
+                        log::warn!(
+                            "Order {client_order_id} may exist (duplicate clOrdID from all transports), \
+                             awaiting WebSocket confirmation",
+                        );
+                        return Ok(());
+                    }
+
+                    let ts_event = clock.get_time_ns();
+                    emitter.emit_order_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        &format!("submit-order-error: {error_msg}"),
+                        ts_event,
+                        post_only,
+                    );
+                }
+            }
+            Ok(())
+        });
+
         Ok(())
     }
 }
@@ -321,7 +549,6 @@ impl ExecutionClient for BitmexExecutionClient {
         }
 
         self.emitter.set_sender(get_exec_event_sender());
-        self.ensure_instruments_initialized()?;
         self.core.set_started();
         log::info!(
             "BitMEX execution client started: client_id={}, account_id={}, use_testnet={}, submitter_pool_size={:?}, canceller_pool_size={:?}, http_proxy_url={:?}, ws_proxy_url={:?}, submitter_proxy_urls={:?}, canceller_proxy_urls={:?}",
@@ -348,6 +575,10 @@ impl ExecutionClient for BitmexExecutionClient {
         if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
+        if let Some(handle) = self.dms_task_handle.take() {
+            handle.abort();
+        }
+        self.dms_running.store(false, Ordering::SeqCst);
         self.abort_pending_tasks();
         log::info!("BitMEX execution client {} stopped", self.core.client_id);
         Ok(())
@@ -357,6 +588,9 @@ impl ExecutionClient for BitmexExecutionClient {
         if self.core.is_connected() {
             return Ok(());
         }
+
+        // Reset cancellation token so HTTP requests succeed after reconnect
+        self.http_client.reset_cancellation_token();
 
         self.ensure_instruments_initialized_async().await?;
 
@@ -377,8 +611,10 @@ impl ExecutionClient for BitmexExecutionClient {
 
         self.start_ws_stream()?;
         self.refresh_account_state().await?;
+        self.await_account_registered(30.0).await?;
 
         self.core.set_connected();
+        self.start_deadmans_switch();
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
     }
@@ -387,6 +623,9 @@ impl ExecutionClient for BitmexExecutionClient {
         if self.core.is_disconnected() {
             return Ok(());
         }
+
+        // Disarm DMS before cancelling requests (needs working HTTP)
+        self.stop_deadmans_switch().await;
 
         self.http_client.cancel_all_requests();
         self._submitter.stop().await;
@@ -428,11 +667,25 @@ impl ExecutionClient for BitmexExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let reports = self
+        let start_dt = cmd.start.map(|nanos| nanos.to_datetime_utc());
+        let end_dt = cmd.end.map(|nanos| nanos.to_datetime_utc());
+
+        let mut reports = self
             .http_client
-            .request_order_status_reports(cmd.instrument_id, cmd.open_only, None)
+            .request_order_status_reports(cmd.instrument_id, cmd.open_only, start_dt, end_dt, None)
             .await
             .context("failed to request BitMEX order status reports")?;
+
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_last >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_last <= end);
+        }
+
+        Self::log_report_receipt(reports.len(), "OrderStatusReport", cmd.log_receipt_level);
+
         Ok(reports)
     }
 
@@ -440,15 +693,28 @@ impl ExecutionClient for BitmexExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
+        let start_dt = cmd.start.map(|nanos| nanos.to_datetime_utc());
+        let end_dt = cmd.end.map(|nanos| nanos.to_datetime_utc());
+
         let mut reports = self
             .http_client
-            .request_fill_reports(cmd.instrument_id, None)
+            .request_fill_reports(cmd.instrument_id, start_dt, end_dt, None)
             .await
             .context("failed to request BitMEX fill reports")?;
 
         if let Some(order_id) = cmd.venue_order_id {
             reports.retain(|report| report.venue_order_id.as_str() == order_id.as_str());
         }
+
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_event >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_event <= end);
+        }
+
+        Self::log_report_receipt(reports.len(), "FillReport", cmd.log_receipt_level);
 
         Ok(reports)
     }
@@ -467,19 +733,84 @@ impl ExecutionClient for BitmexExecutionClient {
             reports.retain(|report| report.instrument_id == instrument_id);
         }
 
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_last >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_last <= end);
+        }
+
+        Self::log_report_receipt(reports.len(), "PositionStatusReport", cmd.log_receipt_level);
+
         Ok(reports)
     }
 
     async fn generate_mass_status(
         &self,
-        _lookback_mins: Option<u64>,
+        lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        log::warn!("generate_mass_status not yet implemented for BitMEX execution client");
-        Ok(None)
+        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
+
+        let ts_now = self.clock.get_time_ns();
+        let start = lookback_mins.map(|mins| {
+            let lookback_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
+        });
+
+        let order_cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .open_only(false)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let fill_cmd = GenerateFillReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let position_cmd = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (order_reports, fill_reports, position_reports) = tokio::try_join!(
+            self.generate_order_status_reports(&order_cmd),
+            self.generate_fill_reports(fill_cmd),
+            self.generate_position_status_reports(&position_cmd),
+        )?;
+
+        let mut mass_status = ExecutionMassStatus::new(
+            self.core.client_id,
+            self.core.account_id,
+            self.core.venue,
+            ts_now,
+            None,
+        );
+        mass_status.add_order_reports(order_reports);
+        mass_status.add_fill_reports(fill_reports);
+        mass_status.add_position_reports(position_reports);
+
+        Ok(Some(mass_status))
     }
 
     fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
-        self.update_account_state()
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+
+        self.spawn_task("query_account", async move {
+            match http_client.request_account_state(account_id).await {
+                Ok(account_state) => emitter.send_account_state(account_state),
+                Err(e) => log::error!("BitMEX query account failed: {e:?}"),
+            }
+            Ok(())
+        });
+
+        Ok(())
     }
 
     fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
@@ -504,6 +835,15 @@ impl ExecutionClient for BitmexExecutionClient {
     }
 
     fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+        let submit_tries = cmd
+            .params
+            .as_ref()
+            .and_then(|p| p.get_usize("submit_tries"))
+            .filter(|&n| n > 0);
+
+        let peg_price_type = parse_peg_price_type(cmd.params.as_ref())?;
+        let peg_offset_value = parse_peg_offset_value(cmd.params.as_ref())?;
+
         let order = self
             .core
             .cache()
@@ -513,127 +853,48 @@ impl ExecutionClient for BitmexExecutionClient {
                 anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
             })?;
 
-        if order.is_closed() {
-            log::warn!("Cannot submit closed order {}", order.client_order_id());
+        self.submit_cached_order(
+            order,
+            submit_tries,
+            peg_price_type,
+            peg_offset_value,
+            "submit_order",
+        )
+    }
+
+    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
+        if cmd.order_list.client_order_ids.is_empty() {
+            log::debug!("submit_order_list called with empty order list");
             return Ok(());
         }
-
-        self.emitter.emit_order_submitted(&order);
 
         let submit_tries = cmd
             .params
             .as_ref()
-            .and_then(|params| params.get("submit_tries"))
-            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|p| p.get_usize("submit_tries"))
             .filter(|&n| n > 0);
 
-        let use_broadcaster = submit_tries.is_some_and(|n| n > 1);
+        let peg_price_type = parse_peg_price_type(cmd.params.as_ref())?;
+        let peg_offset_value = parse_peg_offset_value(cmd.params.as_ref())?;
 
-        let http_client = self.http_client.clone();
-        let submitter = self._submitter.clone_for_async();
-        let emitter = self.emitter.clone();
-        let clock = self.clock;
-        let strategy_id = order.strategy_id();
-        let instrument_id = order.instrument_id();
-        let client_order_id = order.client_order_id();
-        let order_side = order.order_side();
-        let order_type = order.order_type();
-        let quantity = order.quantity();
-        let time_in_force = order.time_in_force();
-        let price = order.price();
-        let trigger_price = order.trigger_price();
-        let trigger_type = order.trigger_type();
-        let trailing_offset = order.trailing_offset().and_then(|d| d.to_f64());
-        let trailing_offset_type = order.trailing_offset_type();
-        let display_qty = order.display_qty();
-        let post_only = order.is_post_only();
-        let reduce_only = order.is_reduce_only();
-        let order_list_id = order.order_list_id();
-        let contingency_type = order.contingency_type();
+        let orders = self.core.get_orders_for_list(&cmd.order_list)?;
 
-        self.spawn_task("submit_order", async move {
-            let result = if use_broadcaster {
-                submitter
-                    .broadcast_submit(
-                        instrument_id,
-                        client_order_id,
-                        order_side,
-                        order_type,
-                        quantity,
-                        time_in_force,
-                        price,
-                        trigger_price,
-                        trigger_type,
-                        trailing_offset,
-                        trailing_offset_type,
-                        display_qty,
-                        post_only,
-                        reduce_only,
-                        order_list_id,
-                        contingency_type,
-                        submit_tries,
-                    )
-                    .await
-            } else {
-                http_client
-                    .submit_order(
-                        instrument_id,
-                        client_order_id,
-                        order_side,
-                        order_type,
-                        quantity,
-                        time_in_force,
-                        price,
-                        trigger_price,
-                        trigger_type,
-                        trailing_offset,
-                        trailing_offset_type,
-                        display_qty,
-                        post_only,
-                        reduce_only,
-                        order_list_id,
-                        contingency_type,
-                    )
-                    .await
-            };
-
-            match result {
-                Ok(report) => emitter.send_order_status_report(report),
-                Err(e) => {
-                    let error_msg = e.to_string();
-
-                    // If all transports returned "Duplicate clOrdID", the order likely exists
-                    // but the success response was lost. Wait for WebSocket confirmation.
-                    if error_msg.contains("IDEMPOTENT_DUPLICATE") {
-                        log::warn!(
-                            "Order {client_order_id} may exist (duplicate clOrdID from all transports), \
-                             awaiting WebSocket confirmation",
-                        );
-                        return Ok(());
-                    }
-
-                    let ts_event = clock.get_time_ns();
-                    emitter.emit_order_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        &format!("submit-order-error: {error_msg}"),
-                        ts_event,
-                        post_only,
-                    );
-                }
-            }
-            Ok(())
-        });
-
-        Ok(())
-    }
-
-    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
-        log::warn!(
-            "submit_order_list not yet implemented for BitMEX execution client ({} orders)",
-            cmd.order_list.client_order_ids.len()
+        log::info!(
+            "Submitting BitMEX order list: order_list_id={}, count={}",
+            cmd.order_list.id,
+            orders.len(),
         );
+
+        for order in orders {
+            self.submit_cached_order(
+                order,
+                submit_tries,
+                peg_price_type,
+                peg_offset_value,
+                "submit_order_list_item",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -697,7 +958,14 @@ impl ExecutionClient for BitmexExecutionClient {
         let canceller = self._canceller.clone_for_async();
         let emitter = self.emitter.clone();
         let instrument_id = cmd.instrument_id;
-        let order_side = Some(cmd.order_side);
+        let order_side = if cmd.order_side == OrderSide::NoOrderSide {
+            log::debug!(
+                "BitMEX cancel_all_orders received NoOrderSide for {instrument_id}, using unfiltered cancel-all",
+            );
+            None
+        } else {
+            Some(cmd.order_side)
+        };
 
         self.spawn_task("cancel_all_orders", async move {
             match canceller
@@ -791,6 +1059,11 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
         NautilusWsMessage::OrderUpdated(event) => {
             emitter.send_order_event(OrderEventAny::Updated(*event));
         }
+        NautilusWsMessage::OrderUpdates(events) => {
+            for event in events {
+                emitter.send_order_event(OrderEventAny::Updated(event));
+            }
+        }
         NautilusWsMessage::Data(_)
         | NautilusWsMessage::Instruments(_)
         | NautilusWsMessage::FundingRateUpdates(_) => {
@@ -802,5 +1075,26 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
         NautilusWsMessage::Authenticated => {
             log::debug!("BitMEX execution websocket authenticated");
         }
+    }
+}
+
+fn parse_peg_price_type(params: Option<&Params>) -> anyhow::Result<Option<BitmexPegPriceType>> {
+    let value = params.and_then(|p| p.get_str("peg_price_type"));
+    match value {
+        Some(s) => BitmexPegPriceType::from_str(s)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("Invalid peg_price_type: {s}")),
+        None => Ok(None),
+    }
+}
+
+fn parse_peg_offset_value(params: Option<&Params>) -> anyhow::Result<Option<f64>> {
+    let value = params.and_then(|p| p.get_str("peg_offset_value"));
+    match value {
+        Some(s) => s
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("Invalid peg_offset_value: {s}")),
+        None => Ok(None),
     }
 }

@@ -15,7 +15,7 @@
 
 use std::{fmt::Display, str::FromStr};
 
-use nautilus_model::enums::{AggressorSide, OrderSide, OrderStatus, OrderType, TriggerType};
+use nautilus_model::enums::{AggressorSide, OrderSide, OrderStatus, OrderType};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
@@ -218,7 +218,11 @@ pub enum HyperliquidOrderType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.hyperliquid")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -227,62 +231,6 @@ pub enum HyperliquidTpSl {
     Tp,
     /// Stop Loss.
     Sl,
-}
-
-/// Represents trigger price types for conditional orders.
-///
-/// Hyperliquid supports different price references for trigger evaluation:
-/// - Last: Last traded price (most common)
-/// - Mark: Mark price (for risk management)
-/// - Oracle: Oracle/index price (for some perpetuals)
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Display,
-    PartialEq,
-    Eq,
-    Hash,
-    AsRefStr,
-    EnumIter,
-    EnumString,
-    Serialize,
-    Deserialize,
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.hyperliquid")
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum HyperliquidTriggerPriceType {
-    /// Last traded price.
-    Last,
-    /// Mark price.
-    Mark,
-    /// Oracle/index price.
-    Oracle,
-}
-
-impl From<HyperliquidTriggerPriceType> for TriggerType {
-    fn from(value: HyperliquidTriggerPriceType) -> Self {
-        match value {
-            HyperliquidTriggerPriceType::Last => Self::LastPrice,
-            HyperliquidTriggerPriceType::Mark => Self::MarkPrice,
-            HyperliquidTriggerPriceType::Oracle => Self::IndexPrice,
-        }
-    }
-}
-
-impl From<TriggerType> for HyperliquidTriggerPriceType {
-    fn from(value: TriggerType) -> Self {
-        match value {
-            TriggerType::LastPrice => Self::Last,
-            TriggerType::MarkPrice => Self::Mark,
-            TriggerType::IndexPrice => Self::Oracle,
-            _ => Self::Last, // Default fallback
-        }
-    }
 }
 
 /// Represents conditional/trigger order types.
@@ -305,7 +253,11 @@ impl From<TriggerType> for HyperliquidTriggerPriceType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.hyperliquid")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
@@ -373,7 +325,11 @@ impl From<OrderType> for HyperliquidConditionalOrderType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.hyperliquid")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -753,44 +709,6 @@ impl From<HyperliquidOrderStatus> for OrderStatus {
     }
 }
 
-pub fn hyperliquid_status_to_order_status(status: &str) -> OrderStatus {
-    match status {
-        "open" | "accepted" => OrderStatus::Accepted,
-        "triggered" => OrderStatus::Triggered,
-        "filled" => OrderStatus::Filled,
-        // All cancel variants
-        "canceled"
-        | "marginCanceled"
-        | "vaultWithdrawalCanceled"
-        | "openInterestCapCanceled"
-        | "selfTradeCanceled"
-        | "reduceOnlyCanceled"
-        | "siblingFilledCanceled"
-        | "delistedCanceled"
-        | "liquidatedCanceled"
-        | "scheduledCancel" => OrderStatus::Canceled,
-        // All reject variants
-        "rejected"
-        | "tickRejected"
-        | "minTradeNtlRejected"
-        | "perpMarginRejected"
-        | "reduceOnlyRejected"
-        | "badAloPxRejected"
-        | "iocCancelRejected"
-        | "badTriggerPxRejected"
-        | "marketOrderNoLiquidityRejected"
-        | "positionIncreaseAtOpenInterestCapRejected"
-        | "positionFlipAtOpenInterestCapRejected"
-        | "tooAggressiveAtOpenInterestCapRejected"
-        | "openInterestIncreaseRejected"
-        | "insufficientSpotBalanceRejected"
-        | "oracleRejected"
-        | "perpMaxPositionRejected" => OrderStatus::Rejected,
-        // Default to rejected for unknown statuses
-        _ => OrderStatus::Rejected,
-    }
-}
-
 /// Represents the direction of a fill (open/close position).
 ///
 /// For perpetuals:
@@ -878,8 +796,12 @@ pub enum HyperliquidInfoRequestType {
     SpotMetaAndAssetCtxs,
     /// Get L2 order book for a coin.
     L2Book,
+    /// Get all mid prices.
+    AllMids,
     /// Get user fills.
     UserFills,
+    /// Get user fills by time range.
+    UserFillsByTime,
     /// Get order status for a user.
     OrderStatus,
     /// Get all open orders for a user.
@@ -888,8 +810,42 @@ pub enum HyperliquidInfoRequestType {
     FrontendOpenOrders,
     /// Get user state (balances, positions, margin).
     ClearinghouseState,
-    /// Get candle/bar data.
+    /// Get spot clearinghouse state.
+    SpotClearinghouseState,
+    /// Get exchange status.
+    ExchangeStatus,
+    /// Get candle/bar data snapshot.
     CandleSnapshot,
+    /// Get candle/bar data (WS post).
+    Candle,
+    /// Get recent trades.
+    RecentTrades,
+    /// Get historical orders.
+    HistoricalOrders,
+    /// Get funding history.
+    FundingHistory,
+    /// Get user funding.
+    UserFunding,
+    /// Get non-user funding updates.
+    NonUserFundingUpdates,
+    /// Get TWAP history.
+    TwapHistory,
+    /// Get user TWAP slice fills.
+    UserTwapSliceFills,
+    /// Get user TWAP slice fills by time range.
+    UserTwapSliceFillsByTime,
+    /// Get user rate limit.
+    UserRateLimit,
+    /// Get user role.
+    UserRole,
+    /// Get delegator history.
+    DelegatorHistory,
+    /// Get delegator rewards.
+    DelegatorRewards,
+    /// Get validator stats.
+    ValidatorStats,
+    /// Get user fee schedule and effective rates.
+    UserFees,
 }
 
 impl HyperliquidInfoRequestType {
@@ -900,14 +856,45 @@ impl HyperliquidInfoRequestType {
             Self::MetaAndAssetCtxs => "metaAndAssetCtxs",
             Self::SpotMetaAndAssetCtxs => "spotMetaAndAssetCtxs",
             Self::L2Book => "l2Book",
+            Self::AllMids => "allMids",
             Self::UserFills => "userFills",
+            Self::UserFillsByTime => "userFillsByTime",
             Self::OrderStatus => "orderStatus",
             Self::OpenOrders => "openOrders",
             Self::FrontendOpenOrders => "frontendOpenOrders",
             Self::ClearinghouseState => "clearinghouseState",
+            Self::SpotClearinghouseState => "spotClearinghouseState",
+            Self::ExchangeStatus => "exchangeStatus",
             Self::CandleSnapshot => "candleSnapshot",
+            Self::Candle => "candle",
+            Self::RecentTrades => "recentTrades",
+            Self::HistoricalOrders => "historicalOrders",
+            Self::FundingHistory => "fundingHistory",
+            Self::UserFunding => "userFunding",
+            Self::NonUserFundingUpdates => "nonUserFundingUpdates",
+            Self::TwapHistory => "twapHistory",
+            Self::UserTwapSliceFills => "userTwapSliceFills",
+            Self::UserTwapSliceFillsByTime => "userTwapSliceFillsByTime",
+            Self::UserRateLimit => "userRateLimit",
+            Self::UserRole => "userRole",
+            Self::DelegatorHistory => "delegatorHistory",
+            Self::DelegatorRewards => "delegatorRewards",
+            Self::ValidatorStats => "validatorStats",
+            Self::UserFees => "userFees",
         }
     }
+}
+
+#[derive(
+    Clone, Copy, Debug, Display, PartialEq, Eq, Hash, Serialize, Deserialize, AsRefStr, EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum HyperliquidLeverageType {
+    Cross,
+    Isolated,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Hyperliquid product type.
@@ -927,7 +914,11 @@ impl HyperliquidInfoRequestType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.hyperliquid")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
 )]
 #[serde(rename_all = "UPPERCASE")]
 #[strum(serialize_all = "UPPERCASE")]
@@ -957,7 +948,7 @@ impl HyperliquidProductType {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::enums::{OrderType, TriggerType};
+    use nautilus_model::enums::OrderType;
     use rstest::rstest;
     use serde_json;
 
@@ -1174,69 +1165,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_order_status_string_mapping() {
-        // Test direct string to OrderStatus conversion
-        assert_eq!(
-            hyperliquid_status_to_order_status("open"),
-            OrderStatus::Accepted
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("accepted"),
-            OrderStatus::Accepted
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("triggered"),
-            OrderStatus::Triggered
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("filled"),
-            OrderStatus::Filled
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("canceled"),
-            OrderStatus::Canceled
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("rejected"),
-            OrderStatus::Rejected
-        );
-
-        // Test camelCase cancel reasons
-        assert_eq!(
-            hyperliquid_status_to_order_status("marginCanceled"),
-            OrderStatus::Canceled
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("selfTradeCanceled"),
-            OrderStatus::Canceled
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("reduceOnlyCanceled"),
-            OrderStatus::Canceled
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("liquidatedCanceled"),
-            OrderStatus::Canceled
-        );
-
-        // Test camelCase reject reasons
-        assert_eq!(
-            hyperliquid_status_to_order_status("tickRejected"),
-            OrderStatus::Rejected
-        );
-        assert_eq!(
-            hyperliquid_status_to_order_status("perpMarginRejected"),
-            OrderStatus::Rejected
-        );
-
-        // Unknown status defaults to Rejected
-        assert_eq!(
-            hyperliquid_status_to_order_status("unknown_status"),
-            OrderStatus::Rejected
-        );
-    }
-
-    #[rstest]
     fn test_order_status_serde_deserialization() {
         // Test that camelCase status values deserialize correctly
         let open: HyperliquidOrderStatus = serde_json::from_str(r#""open""#).unwrap();
@@ -1284,49 +1212,6 @@ mod tests {
 
         assert_eq!(tp, HyperliquidTpSl::Tp);
         assert_eq!(sl, HyperliquidTpSl::Sl);
-    }
-
-    #[rstest]
-    fn test_hyperliquid_trigger_price_type_serialization() {
-        let last = HyperliquidTriggerPriceType::Last;
-        let mark = HyperliquidTriggerPriceType::Mark;
-        let oracle = HyperliquidTriggerPriceType::Oracle;
-
-        assert_eq!(serde_json::to_string(&last).unwrap(), r#""last""#);
-        assert_eq!(serde_json::to_string(&mark).unwrap(), r#""mark""#);
-        assert_eq!(serde_json::to_string(&oracle).unwrap(), r#""oracle""#);
-    }
-
-    #[rstest]
-    fn test_hyperliquid_trigger_price_type_to_nautilus() {
-        assert_eq!(
-            TriggerType::from(HyperliquidTriggerPriceType::Last),
-            TriggerType::LastPrice
-        );
-        assert_eq!(
-            TriggerType::from(HyperliquidTriggerPriceType::Mark),
-            TriggerType::MarkPrice
-        );
-        assert_eq!(
-            TriggerType::from(HyperliquidTriggerPriceType::Oracle),
-            TriggerType::IndexPrice
-        );
-    }
-
-    #[rstest]
-    fn test_nautilus_trigger_type_to_hyperliquid() {
-        assert_eq!(
-            HyperliquidTriggerPriceType::from(TriggerType::LastPrice),
-            HyperliquidTriggerPriceType::Last
-        );
-        assert_eq!(
-            HyperliquidTriggerPriceType::from(TriggerType::MarkPrice),
-            HyperliquidTriggerPriceType::Mark
-        );
-        assert_eq!(
-            HyperliquidTriggerPriceType::from(TriggerType::IndexPrice),
-            HyperliquidTriggerPriceType::Oracle
-        );
     }
 
     #[rstest]
@@ -1634,21 +1519,6 @@ mod tests {
             let order_type = OrderType::from(cond_type);
             let back_to_cond = HyperliquidConditionalOrderType::from(order_type);
             assert_eq!(cond_type, back_to_cond, "Roundtrip conversion failed");
-        }
-    }
-
-    #[rstest]
-    fn test_all_trigger_price_types() {
-        let trigger_types = vec![
-            HyperliquidTriggerPriceType::Last,
-            HyperliquidTriggerPriceType::Mark,
-            HyperliquidTriggerPriceType::Oracle,
-        ];
-
-        for trigger_type in trigger_types {
-            let nautilus_type = TriggerType::from(trigger_type);
-            let back_to_hl = HyperliquidTriggerPriceType::from(nautilus_type);
-            assert_eq!(trigger_type, back_to_hl, "Trigger type roundtrip failed");
         }
     }
 }

@@ -41,6 +41,7 @@ use nautilus_model::{
     position::Position,
 };
 use smallvec::SmallVec;
+use ustr::Ustr;
 
 use super::{
     ACCOUNT_STATE_HANDLERS, ANY_HANDLERS, BAR_HANDLERS, BOOK_HANDLERS, DELTAS_HANDLERS,
@@ -618,6 +619,22 @@ pub fn unsubscribe_position_events(pattern: MStr<Pattern>, handler: &TypedHandle
         .unsubscribe(pattern, handler);
 }
 
+/// Removes a specific order event handler by pattern and handler ID.
+pub fn remove_order_event_handler(pattern: MStr<Pattern>, handler_id: Ustr) {
+    get_message_bus()
+        .borrow_mut()
+        .router_order_events
+        .remove_handler(pattern, handler_id);
+}
+
+/// Removes a specific position event handler by pattern and handler ID.
+pub fn remove_position_event_handler(pattern: MStr<Pattern>, handler_id: Ustr) {
+    get_message_bus()
+        .borrow_mut()
+        .router_position_events
+        .remove_handler(pattern, handler_id);
+}
+
 /// Unsubscribes a handler from orders.
 pub fn unsubscribe_orders(pattern: MStr<Pattern>, handler: &TypedHandler<OrderAny>) {
     get_message_bus()
@@ -759,6 +776,15 @@ pub fn subscriber_count_book_snapshots(topic: MStr<Topic>) -> usize {
         .borrow()
         .router_book_snapshots
         .subscriber_count(topic)
+}
+
+/// Returns the exact subscriber count for bars on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_bars(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_bars
+        .exact_subscriber_count(topic)
 }
 
 /// Publishes a message to the topic using runtime type dispatch (Any).

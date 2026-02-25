@@ -19,11 +19,13 @@ use ahash::AHashMap;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use strum::{AsRefStr, Display};
 use ustr::Ustr;
 
 use crate::common::{
     enums::{
-        AxCandleWidth, AxInstrumentState, AxOrderSide, AxOrderStatus, AxOrderType, AxTimeInForce,
+        AxCandleWidth, AxCategory, AxInstrumentState, AxOrderSide, AxOrderStatus, AxOrderType,
+        AxTimeInForce,
     },
     parse::{
         deserialize_decimal_or_zero, deserialize_optional_decimal_from_str,
@@ -92,6 +94,9 @@ pub struct AxInstrument {
     pub quote_currency: Ustr,
     /// Funding settlement currency.
     pub funding_settlement_currency: Ustr,
+    /// Instrument category (e.g. fx, equities, metals).
+    #[serde(default)]
+    pub category: Option<AxCategory>,
     /// Maintenance margin percentage.
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub maintenance_margin_pct: Decimal,
@@ -286,6 +291,210 @@ pub struct AxCancelOrderResponse {
     pub cxl_rx: bool,
 }
 
+/// Individual trade entry from the REST API.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/market-data/get-trades>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxRestTrade {
+    /// Timestamp (Unix epoch seconds).
+    pub ts: i64,
+    /// Nanosecond component of the timestamp.
+    pub tn: i64,
+    /// Trade price (decimal string).
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub p: Decimal,
+    /// Trade quantity.
+    pub q: i64,
+    /// Symbol.
+    pub s: Ustr,
+    /// Trade direction (aggressor side).
+    pub d: AxOrderSide,
+}
+
+/// Response payload returned by `GET /trades`.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/market-data/get-trades>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxTradesResponse {
+    /// List of trades.
+    pub trades: Vec<AxRestTrade>,
+}
+
+/// Individual price level in the order book.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/market-data/get-book>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxBookLevel {
+    /// Price (decimal string).
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub p: Decimal,
+    /// Quantity at this price level.
+    pub q: i64,
+    /// Individual order IDs (Level 3 only).
+    #[serde(default)]
+    pub o: Option<Vec<i64>>,
+}
+
+/// Order book snapshot.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/market-data/get-book>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxBook {
+    /// Timestamp (Unix epoch seconds).
+    pub ts: i64,
+    /// Nanosecond component of the timestamp.
+    pub tn: i64,
+    /// Symbol.
+    pub s: String,
+    /// Bid levels (best to worst).
+    pub b: Vec<AxBookLevel>,
+    /// Ask levels (best to worst).
+    pub a: Vec<AxBookLevel>,
+}
+
+/// Response payload returned by `GET /book`.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/market-data/get-book>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxBookResponse {
+    /// The order book snapshot.
+    pub book: AxBook,
+}
+
+/// Detailed order status from single-order lookup.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/get-order-status>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxOrderStatusDetail {
+    /// Trading symbol.
+    pub symbol: Ustr,
+    /// Order ID.
+    pub order_id: String,
+    /// Current order state.
+    pub state: AxOrderStatus,
+    /// Client order ID.
+    #[serde(default)]
+    pub clord_id: Option<u64>,
+    /// Filled quantity.
+    #[serde(default)]
+    pub filled_quantity: Option<i64>,
+    /// Remaining quantity.
+    #[serde(default)]
+    pub remaining_quantity: Option<i64>,
+}
+
+/// Response payload returned by `GET /order-status`.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/get-order-status>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxOrderStatusQueryResponse {
+    /// The order status detail.
+    pub status: AxOrderStatusDetail,
+}
+
+/// Reason for order rejection from the exchange.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/get-orders>
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq, Hash, AsRefStr, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum AxOrderRejectReason {
+    CloseOnly,
+    InsufficientMargin,
+    MaxOpenOrdersExceeded,
+    UnknownSymbol,
+    ExchangeClosed,
+    IncorrectQuantity,
+    InvalidPriceIncrement,
+    IncorrectOrderType,
+    PriceOutOfBounds,
+    NoLiquidity,
+    InsufficientCreditLimit,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Detailed order entry from historical orders query.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/get-orders>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxOrderDetail {
+    /// Timestamp (Unix epoch seconds).
+    pub ts: i64,
+    /// Nanosecond component.
+    #[serde(default)]
+    pub tn: i64,
+    /// Order ID.
+    pub oid: String,
+    /// User ID.
+    pub u: String,
+    /// Symbol.
+    pub s: Ustr,
+    /// Price.
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub p: Decimal,
+    /// Order quantity.
+    pub q: u64,
+    /// Executed quantity.
+    pub xq: u64,
+    /// Remaining quantity.
+    pub rq: u64,
+    /// Order state.
+    pub o: AxOrderStatus,
+    /// Order side.
+    pub d: AxOrderSide,
+    /// Time in force.
+    pub tif: AxTimeInForce,
+    /// Client order ID.
+    #[serde(default)]
+    pub cid: Option<u64>,
+    /// Reject reason.
+    #[serde(default)]
+    pub r: Option<AxOrderRejectReason>,
+    /// Order tag.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Text note.
+    #[serde(default)]
+    pub txt: Option<String>,
+}
+
+/// Response payload returned by `GET /orders`.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/get-orders>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxOrdersResponse {
+    /// List of order details.
+    pub orders: Vec<AxOrderDetail>,
+    /// Total matching records (for pagination).
+    pub total_count: i64,
+    /// Applied limit.
+    pub limit: i32,
+    /// Applied offset.
+    pub offset: i32,
+}
+
+/// Response payload returned by `POST /initial-margin-requirement`.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/portfolio-management/post-initial-margin-requirement>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxInitialMarginRequirementResponse {
+    /// Initial margin requirement.
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub im: Decimal,
+}
+
 /// Individual open order entry.
 ///
 /// # References
@@ -386,8 +595,8 @@ pub struct AxFillsResponse {
 pub struct AxCandle {
     /// Instrument symbol.
     pub symbol: Ustr,
-    /// Candle timestamp.
-    pub tn: DateTime<Utc>,
+    /// Candle timestamp (Unix epoch seconds).
+    pub ts: i64,
     /// Open price.
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub open: Decimal,
@@ -601,9 +810,6 @@ pub struct AuthenticateApiKeyRequest {
     pub api_secret: String,
     /// Token expiration in seconds.
     pub expiration_seconds: i32,
-    /// Optional 2FA code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub totp: Option<String>,
 }
 
 impl AuthenticateApiKeyRequest {
@@ -618,15 +824,7 @@ impl AuthenticateApiKeyRequest {
             api_key: api_key.into(),
             api_secret: api_secret.into(),
             expiration_seconds,
-            totp: None,
         }
-    }
-
-    /// Sets the optional 2FA code.
-    #[must_use]
-    pub fn with_totp(mut self, totp: impl Into<String>) -> Self {
-        self.totp = Some(totp.into());
-        self
     }
 }
 
@@ -643,9 +841,6 @@ pub struct AuthenticateUserRequest {
     pub password: String,
     /// Token expiration in seconds.
     pub expiration_seconds: i32,
-    /// Optional 2FA code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub totp: Option<String>,
 }
 
 impl AuthenticateUserRequest {
@@ -660,22 +855,14 @@ impl AuthenticateUserRequest {
             username: username.into(),
             password: password.into(),
             expiration_seconds,
-            totp: None,
         }
-    }
-
-    /// Sets the optional 2FA code.
-    #[must_use]
-    pub fn with_totp(mut self, totp: impl Into<String>) -> Self {
-        self.totp = Some(totp.into());
-        self
     }
 }
 
 /// Request body for `POST /place_order`.
 ///
 /// # References
-/// - <https://docs.architect.co/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlaceOrderRequest {
     /// Order side: "B" (buy) or "S" (sell).
@@ -841,7 +1028,7 @@ impl CancelOrderRequest {
 /// Request body for `POST /cancel_all_orders`.
 ///
 /// # References
-/// - <https://docs.architect.co/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CancelAllOrdersRequest {
     /// Optional symbol filter - only cancel orders for this symbol.
@@ -877,7 +1064,7 @@ impl CancelAllOrdersRequest {
 /// Response payload returned by `POST /cancel_all_orders`.
 ///
 /// # References
-/// - <https://docs.architect.co/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxCancelAllOrdersResponse {
     /// Number of orders canceled.
@@ -888,7 +1075,7 @@ pub struct AxCancelAllOrdersResponse {
 /// Request body for batch cancel orders.
 ///
 /// # References
-/// - <https://docs.architect.co/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchCancelOrdersRequest {
     /// List of order IDs to cancel.
@@ -906,7 +1093,7 @@ impl BatchCancelOrdersRequest {
 /// Response payload returned by batch cancel orders.
 ///
 /// # References
-/// - <https://docs.architect.co/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxBatchCancelOrdersResponse {
     /// Number of orders successfully canceled.
@@ -915,4 +1102,225 @@ pub struct AxBatchCancelOrdersResponse {
     /// Order IDs that failed to cancel.
     #[serde(default)]
     pub failed_order_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_deserialize_authenticate_response() {
+        let json = include_str!("../../test_data/http_authenticate.json");
+        let response: AxAuthenticateResponse = serde_json::from_str(json).unwrap();
+        assert!(response.token.starts_with("test-token"));
+    }
+
+    #[rstest]
+    fn test_deserialize_whoami_response() {
+        let json = include_str!("../../test_data/http_get_whoami.json");
+        let response: AxWhoAmI = serde_json::from_str(json).unwrap();
+        assert_eq!(response.username, "test_user");
+        assert!(response.enabled_2fa);
+    }
+
+    #[rstest]
+    fn test_deserialize_instruments_response() {
+        let json = include_str!("../../test_data/http_get_instruments.json");
+        let response: AxInstrumentsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.instruments.len(), 3);
+        assert_eq!(response.instruments[0].symbol, "EURUSD-PERP");
+    }
+
+    #[rstest]
+    fn test_deserialize_balances_response() {
+        let json = include_str!("../../test_data/http_get_balances.json");
+        let response: AxBalancesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.balances.len(), 3);
+        assert_eq!(response.balances[0].symbol, "USD");
+    }
+
+    #[rstest]
+    fn test_deserialize_positions_response() {
+        let json = include_str!("../../test_data/http_get_positions.json");
+        let response: AxPositionsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.positions.len(), 2);
+        assert_eq!(response.positions[0].symbol, "BTC-PERP");
+        assert_eq!(response.positions[1].signed_quantity, -5);
+    }
+
+    #[rstest]
+    fn test_deserialize_tickers_response() {
+        let json = include_str!("../../test_data/http_get_tickers.json");
+        let response: AxTickersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.tickers.len(), 3);
+        assert_eq!(response.tickers[0].symbol, "EURUSD-PERP");
+        assert!(response.tickers[0].bid.is_some());
+        assert!(response.tickers[2].bid.is_none());
+    }
+
+    #[rstest]
+    fn test_deserialize_funding_rates_response() {
+        let json = include_str!("../../test_data/http_get_funding_rates.json");
+        let response: AxFundingRatesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.funding_rates.len(), 2);
+        assert_eq!(response.funding_rates[0].symbol, "JPYUSD-PERP");
+    }
+
+    #[rstest]
+    fn test_deserialize_open_orders_response() {
+        let json = include_str!("../../test_data/http_get_open_orders.json");
+        let response: AxOpenOrdersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.orders.len(), 2);
+        assert_eq!(response.orders[0].oid, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(response.orders[0].d, AxOrderSide::Buy);
+        assert_eq!(response.orders[0].o, AxOrderStatus::Accepted);
+        assert_eq!(response.orders[1].xq, 300);
+    }
+
+    #[rstest]
+    fn test_deserialize_fills_response() {
+        let json = include_str!("../../test_data/http_get_fills.json");
+        let response: AxFillsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.fills.len(), 2);
+        assert_eq!(response.fills[0].side, AxOrderSide::Buy);
+        assert!(response.fills[0].is_taker);
+        assert!(!response.fills[1].is_taker);
+    }
+
+    #[rstest]
+    fn test_deserialize_candles_response() {
+        let json = include_str!("../../test_data/http_get_candles.json");
+        let response: AxCandlesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.candles.len(), 2);
+        assert_eq!(response.candles[0].symbol, "EURUSD-PERP");
+        assert_eq!(response.candles[0].width, AxCandleWidth::Minutes1);
+    }
+
+    #[rstest]
+    fn test_deserialize_candle_response() {
+        let json = include_str!("../../test_data/http_get_candle.json");
+        let response: AxCandleResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.candle.symbol, "EURUSD-PERP");
+        assert_eq!(response.candle.width, AxCandleWidth::Minutes1);
+    }
+
+    #[rstest]
+    fn test_deserialize_risk_snapshot_response() {
+        let json = include_str!("../../test_data/http_get_risk_snapshot.json");
+        let response: AxRiskSnapshotResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            response.risk_snapshot.user_id,
+            "3c90c3cc-0d44-4b50-8888-8dd25736052a"
+        );
+        assert_eq!(response.risk_snapshot.per_symbol.len(), 2);
+        assert!(
+            response
+                .risk_snapshot
+                .per_symbol
+                .contains_key("EURUSD-PERP")
+        );
+    }
+
+    #[rstest]
+    fn test_deserialize_transactions_response() {
+        let json = include_str!("../../test_data/http_get_transactions.json");
+        let response: AxTransactionsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.transactions.len(), 2);
+        assert_eq!(response.transactions[0].transaction_type, "deposit");
+        assert!(response.transactions[1].reference_id.is_none());
+    }
+
+    #[rstest]
+    fn test_deserialize_preview_aggressive_limit_order_response() {
+        let json = include_str!("../../test_data/http_preview_aggressive_limit_order.json");
+        let response: AxPreviewAggressiveLimitOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.filled_quantity, 1000);
+        assert_eq!(response.remaining_quantity, 0);
+        assert!(response.limit_price.is_some());
+        assert!(response.vwap.is_some());
+    }
+
+    #[rstest]
+    fn test_deserialize_place_order_response() {
+        let json = include_str!("../../test_data/http_place_order.json");
+        let response: AxPlaceOrderResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.oid, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
+
+    #[rstest]
+    fn test_deserialize_cancel_order_response() {
+        let json = include_str!("../../test_data/http_cancel_order.json");
+        let response: AxCancelOrderResponse = serde_json::from_str(json).unwrap();
+        assert!(response.cxl_rx);
+    }
+
+    #[rstest]
+    fn test_deserialize_cancel_all_orders_response() {
+        let json = include_str!("../../test_data/http_cancel_all_orders.json");
+        let response: AxCancelAllOrdersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.canceled_count, 3);
+    }
+
+    #[rstest]
+    fn test_deserialize_batch_cancel_orders_response() {
+        let json = include_str!("../../test_data/http_batch_cancel_orders.json");
+        let response: AxBatchCancelOrdersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.canceled_count, 2);
+        assert_eq!(response.failed_order_ids.len(), 1);
+    }
+
+    #[rstest]
+    fn test_deserialize_trades_response() {
+        let json = include_str!("../../test_data/http_get_trades.json");
+        let response: AxTradesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.trades.len(), 2);
+        assert_eq!(response.trades[0].s, "EURUSD-PERP");
+        assert_eq!(response.trades[0].d, AxOrderSide::Buy);
+        assert_eq!(response.trades[0].q, 100);
+        assert_eq!(response.trades[1].d, AxOrderSide::Sell);
+    }
+
+    #[rstest]
+    fn test_deserialize_book_response() {
+        let json = include_str!("../../test_data/http_get_book.json");
+        let response: AxBookResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.book.s, "EURUSD-PERP");
+        assert_eq!(response.book.b.len(), 3);
+        assert_eq!(response.book.a.len(), 3);
+        assert_eq!(response.book.b[0].q, 500);
+        assert_eq!(response.book.a[0].q, 400);
+    }
+
+    #[rstest]
+    fn test_deserialize_order_status_query_response() {
+        let json = include_str!("../../test_data/http_get_order_status.json");
+        let response: AxOrderStatusQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status.symbol, "EURUSD-PERP");
+        assert_eq!(response.status.order_id, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(response.status.state, AxOrderStatus::PartiallyFilled);
+        assert_eq!(response.status.clord_id, Some(12345));
+        assert_eq!(response.status.filled_quantity, Some(300));
+        assert_eq!(response.status.remaining_quantity, Some(700));
+    }
+
+    #[rstest]
+    fn test_deserialize_orders_response() {
+        let json = include_str!("../../test_data/http_get_orders.json");
+        let response: AxOrdersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.orders.len(), 2);
+        assert_eq!(response.total_count, 2);
+        assert_eq!(response.orders[0].o, AxOrderStatus::PartiallyFilled);
+        assert_eq!(response.orders[0].xq, 300);
+        assert_eq!(response.orders[1].o, AxOrderStatus::Filled);
+        assert_eq!(response.orders[1].d, AxOrderSide::Sell);
+    }
+
+    #[rstest]
+    fn test_deserialize_initial_margin_requirement_response() {
+        let json = include_str!("../../test_data/http_initial_margin_requirement.json");
+        let response: AxInitialMarginRequirementResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.im, Decimal::new(125050, 2));
+    }
 }

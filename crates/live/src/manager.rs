@@ -26,7 +26,7 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     clock::Clock,
-    enums::LogColor,
+    enums::{LogColor, LogLevel},
     log_info,
     messages::execution::report::{GenerateOrderStatusReports, GeneratePositionStatusReports},
 };
@@ -902,12 +902,13 @@ impl ExecutionManager {
 
         let filtered_orders: Vec<OrderAny> = {
             let cache = self.cache.borrow();
-            let open_orders = cache.orders_open(None, None, None, None, None);
+            let mut orders = cache.orders_open(None, None, None, None, None);
+            orders.extend(cache.orders_inflight(None, None, None, None, None));
 
             if self.config.reconciliation_instrument_ids.is_empty() {
-                open_orders.iter().map(|o| (*o).clone()).collect()
+                orders.iter().map(|o| (*o).clone()).collect()
             } else {
-                open_orders
+                orders
                     .iter()
                     .filter(|o| {
                         self.config
@@ -929,7 +930,7 @@ impl ExecutionManager {
         let mut venue_reported_ids = AHashSet::new();
 
         for client in clients {
-            let cmd = GenerateOrderStatusReports::new(
+            let mut cmd = GenerateOrderStatusReports::new(
                 UUID4::new(),
                 self.clock.borrow().timestamp_ns(),
                 true, // open_only
@@ -939,6 +940,7 @@ impl ExecutionManager {
                 None, // params
                 None, // correlation_id
             );
+            cmd.log_receipt_level = LogLevel::Debug;
 
             match client.generate_order_status_reports(&cmd).await {
                 Ok(reports) => {
@@ -1051,7 +1053,7 @@ impl ExecutionManager {
         let mut venue_positions = AHashMap::new();
 
         for client in clients {
-            let cmd = GeneratePositionStatusReports::new(
+            let mut cmd = GeneratePositionStatusReports::new(
                 UUID4::new(),
                 self.clock.borrow().timestamp_ns(),
                 None, // instrument_id - query all
@@ -1060,6 +1062,7 @@ impl ExecutionManager {
                 None, // params
                 None, // correlation_id
             );
+            cmd.log_receipt_level = LogLevel::Debug;
 
             match client.generate_position_status_reports(&cmd).await {
                 Ok(reports) => {
@@ -1656,8 +1659,7 @@ impl ExecutionManager {
             return None;
         }
 
-        log::info!(
-            color = LogColor::Blue as u8;
+        log::debug!(
             "Reconciling HEDGE position for {}, venue_position_id={}",
             report.instrument_id,
             venue_position_id
@@ -1806,10 +1808,7 @@ impl ExecutionManager {
     ) -> Option<Vec<OrderEventAny>> {
         let instrument_id = report.instrument_id;
 
-        log::info!(
-            color = LogColor::Blue as u8;
-            "Reconciling NET position for {instrument_id}",
-        );
+        log::debug!("Reconciling NET position for {instrument_id}");
 
         let instrument = self.get_instrument(&instrument_id)?;
 
@@ -1848,10 +1847,7 @@ impl ExecutionManager {
 
         let venue_signed_qty = report.signed_decimal_qty;
 
-        log::info!(
-            color = LogColor::Blue as u8;
-            "venue_signed_qty={venue_signed_qty}, cached_signed_qty={cached_signed_qty}",
-        );
+        log::debug!("venue_signed_qty={venue_signed_qty}, cached_signed_qty={cached_signed_qty}");
 
         let tolerance = Decimal::from_str("0.00000001").unwrap_or(Decimal::ZERO);
         if (cached_signed_qty - venue_signed_qty).abs() <= tolerance {

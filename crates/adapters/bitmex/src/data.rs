@@ -35,9 +35,10 @@ use nautilus_common::{
             BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
             SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
-            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeInstrument, SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes,
+            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+            UnsubscribeBookDepth10, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -228,6 +229,7 @@ impl BitmexDataClient {
             }
             NautilusWsMessage::OrderStatusReports(_)
             | NautilusWsMessage::OrderUpdated(_)
+            | NautilusWsMessage::OrderUpdates(_)
             | NautilusWsMessage::FillReports(_)
             | NautilusWsMessage::PositionStatusReports(_)
             | NautilusWsMessage::AccountStates(_) => {
@@ -264,6 +266,15 @@ impl BitmexDataClient {
 
         for instrument in &instruments {
             self.http_client.cache_instrument(instrument.clone());
+            if let Err(e) = self
+                .data_sender
+                .send(DataEvent::Instrument(instrument.clone()))
+            {
+                log::warn!(
+                    "Failed to send instrument event for {}: {e}",
+                    instrument.id()
+                );
+            }
         }
 
         Ok(instruments)
@@ -396,12 +407,13 @@ impl DataClient for BitmexDataClient {
         }
 
         if self.ws_client.is_none() {
-            let ws = BitmexWebSocketClient::new(
+            let ws = BitmexWebSocketClient::new_with_env(
                 Some(self.config.ws_url()),
                 self.config.api_key.clone(),
                 self.config.api_secret.clone(),
                 None,
                 self.config.heartbeat_interval_secs,
+                self.config.use_testnet,
             )
             .context("failed to construct BitMEX websocket client")?;
             self.ws_client = Some(ws);
@@ -466,6 +478,51 @@ impl DataClient for BitmexDataClient {
 
     fn is_disconnected(&self) -> bool {
         self.is_disconnected()
+    }
+
+    fn subscribe_instruments(&mut self, _cmd: &SubscribeInstruments) -> anyhow::Result<()> {
+        let ws = self.ws_client()?.clone();
+
+        self.spawn_ws(
+            async move {
+                ws.subscribe_instruments()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+            },
+            "BitMEX instruments subscription",
+        );
+        Ok(())
+    }
+
+    fn subscribe_instrument(&mut self, cmd: &SubscribeInstrument) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+
+        if let Some(instrument) = self
+            .instruments
+            .read()
+            .expect("instrument cache lock poisoned")
+            .get(&instrument_id)
+            .cloned()
+        {
+            if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
+                log::error!("Failed to send instrument event for {instrument_id}: {e}");
+            }
+            return Ok(());
+        }
+
+        log::warn!("Instrument {instrument_id} not found in BitMEX cache");
+
+        let ws = self.ws_client()?.clone();
+        self.spawn_ws(
+            async move {
+                ws.subscribe_instrument(instrument_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+            },
+            "BitMEX instrument subscription",
+        );
+
+        Ok(())
     }
 
     fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
@@ -646,7 +703,11 @@ impl DataClient for BitmexDataClient {
                         .unsubscribe_book_25(instrument_id)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?,
-                    Some(BitmexBookChannel::OrderBook10) | None => ws
+                    Some(BitmexBookChannel::OrderBook10) => ws
+                        .unsubscribe_book_depth10(instrument_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    None => ws
                         .unsubscribe_book(instrument_id)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?,

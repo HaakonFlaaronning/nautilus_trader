@@ -15,10 +15,12 @@
 
 //! Python bindings for the Ax HTTP client.
 
-use nautilus_core::python::to_pyvalue_err;
+use chrono::{DateTime, Utc};
+use nautilus_core::{datetime::datetime_to_unix_nanos, python::to_pyvalue_err};
 use nautilus_model::{
-    enums::OrderSide,
-    identifiers::{AccountId, ClientOrderId, InstrumentId},
+    data::BarType,
+    enums::{OrderSide, OrderType, TimeInForce},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
@@ -26,7 +28,10 @@ use pyo3::{IntoPyObjectExt, prelude::*, types::PyList};
 use rust_decimal::Decimal;
 
 use crate::{
-    common::{enums::AxOrderSide, parse::quantity_to_contracts},
+    common::{
+        enums::{AxCandleWidth, AxOrderSide},
+        parse::quantity_to_contracts,
+    },
     http::{client::AxHttpClient, error::AxHttpError, models::PreviewAggressiveLimitOrderRequest},
 };
 
@@ -124,7 +129,7 @@ impl AxHttpClient {
 
     /// # Errors
     ///
-    /// Returns an error if the instrument cannot be converted from Python.
+    /// Returns a `PyErr` if the instrument cannot be converted from Python.
     #[pyo3(name = "cache_instrument")]
     pub fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         self.cache_instrument(pyobject_to_instrument_any(py, instrument)?);
@@ -188,10 +193,95 @@ impl AxHttpClient {
                     .into_iter()
                     .map(|inst| instrument_any_to_pyobject(py, inst))
                     .collect();
-                let pylist = PyList::new(py, py_instruments?)
-                    .unwrap()
-                    .into_any()
-                    .unbind();
+                let pylist = PyList::new(py, py_instruments?)?.into_any().unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    #[pyo3(name = "request_trade_ticks")]
+    #[pyo3(signature = (instrument_id, limit=None, start=None, end=None))]
+    fn py_request_trade_ticks<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        limit: Option<i32>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let symbol = instrument_id.symbol.inner();
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let trades = client
+                .request_trade_ticks(symbol, limit, start_nanos, end_nanos)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_trades: PyResult<Vec<_>> = trades
+                    .into_iter()
+                    .map(|trade| trade.into_py_any(py))
+                    .collect();
+                let pylist = PyList::new(py, py_trades?)?.into_any().unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    #[pyo3(name = "request_bars")]
+    #[pyo3(signature = (bar_type, start=None, end=None))]
+    fn py_request_bars<'py>(
+        &self,
+        py: Python<'py>,
+        bar_type: BarType,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let symbol = bar_type.instrument_id().symbol.inner();
+        let width = AxCandleWidth::try_from(&bar_type.spec()).map_err(to_pyvalue_err)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bars = client
+                .request_bars(symbol, start, end, width)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_bars: PyResult<Vec<_>> =
+                    bars.into_iter().map(|bar| bar.into_py_any(py)).collect();
+                let pylist = PyList::new(py, py_bars?)?.into_any().unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    #[pyo3(name = "request_funding_rates")]
+    #[pyo3(signature = (instrument_id, start=None, end=None))]
+    fn py_request_funding_rates<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let funding_rates = client
+                .request_funding_rates(instrument_id, start, end)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_rates: PyResult<Vec<_>> = funding_rates
+                    .into_iter()
+                    .map(|rate| rate.into_py_any(py))
+                    .collect();
+                let pylist = PyList::new(py, py_rates?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
@@ -215,6 +305,48 @@ impl AxHttpClient {
         })
     }
 
+    #[pyo3(name = "request_order_status")]
+    #[pyo3(signature = (
+        account_id,
+        instrument_id,
+        order_side,
+        order_type,
+        time_in_force,
+        client_order_id=None,
+        venue_order_id=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_request_order_status<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        time_in_force: TimeInForce,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = client
+                .request_order_status(
+                    account_id,
+                    instrument_id,
+                    client_order_id,
+                    venue_order_id,
+                    order_side,
+                    order_type,
+                    time_in_force,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| report.into_py_any(py))
+        })
+    }
+
     #[pyo3(name = "request_order_status_reports")]
     fn py_request_order_status_reports<'py>(
         &self,
@@ -234,7 +366,7 @@ impl AxHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
@@ -259,7 +391,7 @@ impl AxHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
@@ -284,7 +416,7 @@ impl AxHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })

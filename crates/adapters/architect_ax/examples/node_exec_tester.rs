@@ -20,7 +20,6 @@
 //! Environment variables:
 //! - `AX_API_KEY`: Your API key
 //! - `AX_API_SECRET`: Your API secret
-//! - `AX_TOTP_SECRET`: Base32 TOTP secret (if 2FA enabled)
 
 use nautilus_architect_ax::{
     config::{AxDataClientConfig, AxExecClientConfig},
@@ -33,7 +32,6 @@ use nautilus_model::{
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
-use rust_decimal::Decimal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,10 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exec_config = AxExecClientConfig {
         trader_id,
         account_id,
-        api_key: None,     // Will use 'AX_API_KEY' env var
-        api_secret: None,  // Will use 'AX_API_SECRET' env var
-        totp_secret: None, // Will use 'AX_TOTP_SECRET' env var
-        is_sandbox: true,  // Use sandbox environment for testing
+        api_key: None,    // Will use 'AX_API_KEY' env var
+        api_secret: None, // Will use 'AX_API_SECRET' env var
+        is_sandbox: true, // Use sandbox environment for testing
         ..Default::default()
     };
 
@@ -74,13 +71,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
+    let order_qty = Quantity::from(1);
+
     let mut tester_config = ExecTesterConfig::new(
         StrategyId::from("EXEC_TESTER-001"),
         instrument_id,
         client_id,
-        Quantity::from("1000"), // Minor units for AX
+        order_qty,
     )
-    .with_open_position_on_start(Some(Decimal::from(1)))
+    .with_open_position_on_start(order_qty.as_decimal())
     .with_log_data(false)
     .with_use_post_only(true)
     .with_cancel_orders_on_stop(true)

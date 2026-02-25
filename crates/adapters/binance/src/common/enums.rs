@@ -28,7 +28,12 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", eq)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        eq,
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
 )]
 pub enum BinanceProductType {
     /// Spot trading (api.binance.com).
@@ -110,7 +115,12 @@ impl Display for BinanceProductType {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", eq)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        eq,
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
 )]
 pub enum BinanceEnvironment {
     /// Production/mainnet environment.
@@ -118,6 +128,8 @@ pub enum BinanceEnvironment {
     Mainnet,
     /// Testnet environment.
     Testnet,
+    /// Demo trading environment.
+    Demo,
 }
 
 impl BinanceEnvironment {
@@ -125,6 +137,12 @@ impl BinanceEnvironment {
     #[must_use]
     pub const fn is_testnet(self) -> bool {
         matches!(self, Self::Testnet)
+    }
+
+    /// Returns true for any non-production environment.
+    #[must_use]
+    pub const fn is_sandbox(self) -> bool {
+        matches!(self, Self::Testnet | Self::Demo)
     }
 }
 
@@ -164,7 +182,11 @@ impl From<BinanceSide> for OrderSide {
 #[serde(rename_all = "UPPERCASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", eq)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        eq,
+        from_py_object
+    )
 )]
 pub enum BinancePositionSide {
     /// Single position mode (both).
@@ -585,6 +607,7 @@ impl Display for BinanceEnvironment {
         match self {
             Self::Mainnet => write!(f, "Mainnet"),
             Self::Testnet => write!(f, "Testnet"),
+            Self::Demo => write!(f, "Demo"),
         }
     }
 }

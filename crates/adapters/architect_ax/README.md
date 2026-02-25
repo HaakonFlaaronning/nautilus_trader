@@ -44,15 +44,15 @@ This crate provides feature flags to control source code inclusion during compil
 
 AX Exchange uses bearer token authentication via HTTP headers:
 
-1. API key and secret (with optional TOTP) obtain a session token via `/authenticate`.
+1. API key and secret obtain a session token via `/authenticate`.
 2. The session token is used as a bearer token for subsequent REST and WebSocket requests.
 
 ## API endpoints
 
-| Environment | HTTP API                                         | Market Data WebSocket                            | Orders WebSocket                                     |
-|-------------|--------------------------------------------------|--------------------------------------------------|------------------------------------------------------|
-| Sandbox     | `https://gateway.sandbox.architect.exchange/api` | `wss://gateway.sandbox.architect.exchange/md/ws` | `wss://gateway.sandbox.architect.exchange/orders/ws` |
-| Production  | `https://gateway.architect.exchange/api`         | `wss://gateway.architect.exchange/md/ws`         | `wss://gateway.architect.exchange/orders/ws`         |
+| Environment | HTTP API (market data)                           | HTTP API (orders)                                   | Market Data WS                                   | Orders WS                                            |
+|-------------|--------------------------------------------------|-----------------------------------------------------|--------------------------------------------------|------------------------------------------------------|
+| Sandbox     | `https://gateway.sandbox.architect.exchange/api` | `https://gateway.sandbox.architect.exchange/orders` | `wss://gateway.sandbox.architect.exchange/md/ws` | `wss://gateway.sandbox.architect.exchange/orders/ws` |
+| Production  | `https://gateway.architect.exchange/api`         | `https://gateway.architect.exchange/orders`         | `wss://gateway.architect.exchange/md/ws`         | `wss://gateway.architect.exchange/orders/ws`         |
 
 ## Usage
 

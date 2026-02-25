@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.sandbox")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.sandbox", from_py_object)
 )]
 pub struct SandboxExecutionClientConfig {
     /// The trader ID for this client.
@@ -109,6 +109,7 @@ impl SandboxExecutionClientConfig {
     pub fn to_matching_engine_config(&self) -> OrderMatchingEngineConfig {
         OrderMatchingEngineConfig::new(
             self.bar_execution,
+            false, // bar_adaptive_high_low_ordering
             self.trade_execution,
             false, // liquidity_consumption
             self.reject_stop_orders,

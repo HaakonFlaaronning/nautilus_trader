@@ -45,10 +45,13 @@ use rust_decimal_macros::dec;
 use ustr::Ustr;
 #[cfg(feature = "defi")]
 use {
-    alloy_primitives::Address,
-    nautilus_model::defi::{
-        Block, Blockchain, Dex, DexType, Pool, PoolIdentifier, PoolLiquidityUpdate, PoolSwap,
-        Token, chain::chains, dex::AmmType,
+    alloy_primitives::{Address, I256, U160},
+    nautilus_model::{
+        defi::{
+            Block, Blockchain, Dex, DexType, Pool, PoolIdentifier, PoolLiquidityUpdate, PoolSwap,
+            Token, chain::chains, dex::AmmType,
+        },
+        identifiers::InstrumentId,
     },
 };
 
@@ -341,8 +344,7 @@ fn register_data_actor(
     trader_id: TraderId,
 ) -> Ustr {
     // Set up sync data command sender for tests
-    let sender = SyncDataCommandSender;
-    set_data_cmd_sender(Arc::new(sender));
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
 
     let config = DataActorConfig::default();
     // Ensure clean message bus state for this actor's subscriptions
@@ -772,7 +774,7 @@ fn test_request_instrument(
         .unwrap();
 
     let client_id = ClientId::new("TestClient");
-    let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim.clone());
     let data = instrument.clone();
     let ts_init = UnixNanos::default();
     let response = InstrumentResponse::new(
@@ -1195,9 +1197,9 @@ fn test_unsubscribe_instruments(
     actor.subscribe_instruments(venue, None, None);
 
     let topic = get_instruments_topic(venue);
-    let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
+    let inst1 = InstrumentAny::CurrencyPair(audusd_sim.clone());
     msgbus::publish_any(topic, &inst1);
-    let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
+    let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
     msgbus::publish_any(topic, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
@@ -1223,14 +1225,13 @@ fn test_unsubscribe_instrument(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-
     actor.subscribe_instrument(audusd_sim.id, None, None);
 
     let topic = get_instrument_topic(audusd_sim.id);
-    let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish_any(topic, &inst1);
-    let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic, &inst2);
+    let inst3 = InstrumentAny::CurrencyPair(audusd_sim.clone());
+    msgbus::publish_any(topic, &inst3);
+    let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
+    msgbus::publish_any(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
@@ -1510,10 +1511,6 @@ fn test_request_data(
     assert_eq!(actor.received_data[0], "Any { .. }");
 }
 
-// ------------------------------------------------------------------------------------------------
-// DeFi Tests
-// ------------------------------------------------------------------------------------------------
-
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_subscribe_and_receive_blocks(
@@ -1662,12 +1659,6 @@ fn test_subscribe_and_receive_pool_swaps(
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
-    use alloy_primitives::{I256, U160};
-    use nautilus_model::{
-        defi::{AmmType, Dex, DexType, chain::chains},
-        identifiers::InstrumentId,
-    };
-
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
@@ -1726,9 +1717,6 @@ fn test_unsubscribe_pool_swaps(
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
-    use alloy_primitives::{I256, U160};
-    use nautilus_model::defi::{Dex, DexType, Pool, chain::chains, dex::AmmType};
-
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
@@ -1848,10 +1836,6 @@ fn test_unsubscribe_before_subscribe_custom_data(
 
     assert!(actor.received_data.is_empty());
 }
-
-// ---------------------------------------------------------------------------------------------
-// save / load round-trip
-// ---------------------------------------------------------------------------------------------
 
 #[derive(Debug)]
 struct SaveLoadActor {
