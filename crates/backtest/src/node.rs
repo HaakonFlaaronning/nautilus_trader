@@ -34,7 +34,8 @@ use rust_decimal::{Decimal, prelude::FromPrimitive};
 
 use crate::{
     config::{BacktestDataConfig, BacktestRunConfig, NautilusDataType},
-    engine::{BacktestEngine, BacktestResult},
+    engine::BacktestEngine,
+    result::BacktestResult,
 };
 
 /// Orchestrates catalog-driven backtests from run configurations.
@@ -126,6 +127,7 @@ impl BacktestNode {
                     venue_config.base_currency(),
                     default_leverage,
                     leverages,
+                    None, // margin_model
                     Vec::new(),
                     FillModelAny::default(),
                     FeeModelAny::default(),
@@ -318,6 +320,7 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
                 venue_config.book_type(),
                 BookType::L2_MBP | BookType::L3_MBO
             );
+
             if needs_book_data {
                 let venue_name = venue_config.name().to_string();
                 let has_book_data = config.data().iter().any(|dc| {
@@ -325,6 +328,7 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
                         dc.data_type(),
                         NautilusDataType::OrderBookDelta | NautilusDataType::OrderBookDepth10
                     );
+
                     if !is_book_type {
                         return false;
                     }

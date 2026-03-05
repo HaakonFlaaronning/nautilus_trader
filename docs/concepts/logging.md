@@ -91,7 +91,7 @@ The following log levels are supported:
 You can set `TRACE` as a filter level to capture trace logs from Rust components, even though Python code cannot emit them directly.
 :::
 
-See the `LoggingConfig` [API Reference](../api_reference/config.md#class-loggingconfig) for further details.
+See the `LoggingConfig` [API Reference](/docs/python-api-latest/config.html#nautilus_trader.common.config.LoggingConfig) for further details.
 
 Logging can be configured in the following ways:
 
@@ -262,7 +262,7 @@ export NAUTILUS_LOG="stdout=Info;nautilus_okx=Warn;nautilus_okx::websocket=Debug
 The longest matching prefix takes precedence. In the example above, `nautilus_okx::websocket::handler` would use the `Debug` level (longer prefix), while `nautilus_okx::data` would use `Warn`.
 
 :::tip
-Rust log macros automatically capture the module path when no explicit component is provided. This enables module-level filtering to work seamlessly with standard logging calls.
+Rust log macros automatically capture the module path when no explicit component is provided. This enables module-level filtering to work with standard logging calls.
 :::
 
 :::note
@@ -275,14 +275,13 @@ If `log_components_only=True` (or `log_components_only` is present in the spec s
 
 ### Log Colors
 
-ANSI color codes are utilized to enhance the readability of logs when viewed in a terminal.
-These color codes can make it easier to distinguish different parts of log messages.
+ANSI color codes improve log readability in terminals.
 In environments that do not support ANSI color rendering (such as some cloud environments or text editors),
 these color codes may not be appropriate as they can appear as raw text.
 
 To accommodate for such scenarios, the `LoggingConfig.log_colors` option can be set to `false`.
-Disabling `log_colors` will prevent the addition of ANSI color codes to the log messages, ensuring
-compatibility across different environments where color rendering is not supported.
+Disabling `log_colors` will prevent the addition of ANSI color codes to the log messages,
+which avoids raw escape codes in environments without color support.
 
 ## Using a logger directly
 
@@ -299,9 +298,7 @@ log_guard = init_logging()
 logger = Logger("MyLogger")
 ```
 
-:::info
-See the `init_logging` [API Reference](../api_reference/common.md) for further details.
-:::
+See the [`init_logging` API Reference](/docs/python-api-latest/common.html) for further details.
 
 :::warning
 Only one logging subsystem can be initialized per process with an `init_logging` call. Multiple `LogGuard` instances (up to 255) can exist concurrently, and the logging thread will remain active until all guards are dropped.
@@ -338,12 +335,12 @@ Error sending log event: [INFO] ...
 This occurs because the logging subsystem's underlying channel and Rust `Logger` are closed when the first engine is disposed.
 As a result, subsequent engines lose access to the logging subsystem, leading to these errors.
 
-By leveraging a `LogGuard`, you can ensure robust logging behavior across multiple backtests or engine runs in the same process.
+By using a `LogGuard`, you can ensure consistent logging behavior across multiple backtests or engine runs in the same process.
 The `LogGuard` retains the resources of the logging subsystem and ensures that logs continue to function correctly,
 even as engines are disposed and initialized.
 
 :::note
-Using `LogGuard` is critical to maintain consistent logging behavior throughout a process with multiple engines.
+Using `LogGuard` is required to maintain consistent logging behavior throughout a process with multiple engines.
 :::
 
 ## Running multiple engines

@@ -1552,6 +1552,63 @@ fn test_book_filtered_with_own_orders_larger_size() {
 }
 
 #[rstest]
+fn test_book_get_worst_price_for_quantity() {
+    let instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    let ask2 = BookOrder::new(
+        OrderSide::Sell,
+        Price::from("2.010"),
+        Quantity::from("2.0"),
+        1,
+    );
+    let ask1 = BookOrder::new(
+        OrderSide::Sell,
+        Price::from("2.000"),
+        Quantity::from("1.0"),
+        2,
+    );
+    let bid1 = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("1.000"),
+        Quantity::from("1.0"),
+        3,
+    );
+    let bid2 = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("0.990"),
+        Quantity::from("2.0"),
+        4,
+    );
+    book.add(bid1, 0, 1, 2.into());
+    book.add(bid2, 0, 1, 2.into());
+    book.add(ask1, 0, 1, 2.into());
+    book.add(ask2, 0, 1, 2.into());
+
+    let qty = Quantity::from("1.5");
+
+    assert_eq!(
+        book.get_worst_px_for_quantity(qty, OrderSide::Buy),
+        Some(Price::from("2.010"))
+    );
+    assert_eq!(
+        book.get_worst_px_for_quantity(qty, OrderSide::Sell),
+        Some(Price::from("0.990"))
+    );
+}
+
+#[rstest]
+fn test_book_get_worst_price_for_quantity_no_market() {
+    let instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE");
+    let book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    let qty = Quantity::from(1);
+
+    assert_eq!(book.get_worst_px_for_quantity(qty, OrderSide::Buy), None);
+    assert_eq!(book.get_worst_px_for_quantity(qty, OrderSide::Sell), None);
+}
+
+#[rstest]
 fn test_book_filtered_with_own_orders_different_level() {
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -6085,9 +6142,11 @@ fn test_sanitize_operations_l1_id_normalization() {
     if let OrderBookOperation::Add(order, _, _) = &sanitized[0] {
         assert_eq!(order.order_id, 1, "L1 Buy Add should use order_id 1");
     }
+
     if let OrderBookOperation::Update(order, _, _) = &sanitized[1] {
         assert_eq!(order.order_id, 1, "L1 Buy Update should use order_id 1");
     }
+
     if let OrderBookOperation::Delete(order, _, _) = &sanitized[2] {
         assert_eq!(order.order_id, 1, "L1 Buy Delete should use order_id 1");
     }
@@ -7226,4 +7285,132 @@ fn test_deltas_to_quotes_aggregates_level_sizes_for_l3() {
     assert_eq!(quotes.len(), 1);
     assert_eq!(quotes[0].bid_size, Quantity::from("30"));
     assert_eq!(quotes[0].ask_size, Quantity::from("5"));
+}
+
+fn create_book_with_levels(bids: &[(&str, i64, u64)], asks: &[(&str, i64, u64)]) -> OrderBook {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    for &(price, size, id) in bids {
+        let order = BookOrder::new(OrderSide::Buy, Price::from(price), Quantity::from(size), id);
+        book.add(order, 0, id, id.into());
+    }
+
+    for &(price, size, id) in asks {
+        let order = BookOrder::new(
+            OrderSide::Sell,
+            Price::from(price),
+            Quantity::from(size),
+            id,
+        );
+        book.add(order, 0, id, id.into());
+    }
+
+    book
+}
+
+#[rstest]
+fn test_bids_range_down_to_returns_levels_at_or_above_price() {
+    let book = create_book_with_levels(
+        &[
+            ("100.00", 10, 1),
+            ("99.00", 20, 2),
+            ("98.00", 30, 3),
+            ("97.00", 40, 4),
+        ],
+        &[],
+    );
+
+    let bound = BookPrice::new(Price::from("98.00"), OrderSideSpecified::Buy);
+
+    assert_eq!(book.bids.levels.range(..=bound).count(), 3);
+}
+
+#[rstest]
+fn test_asks_range_up_to_returns_levels_at_or_below_price() {
+    let book = create_book_with_levels(
+        &[],
+        &[
+            ("101.00", 10, 1),
+            ("102.00", 20, 2),
+            ("103.00", 30, 3),
+            ("104.00", 40, 4),
+        ],
+    );
+
+    let bound = BookPrice::new(Price::from("103.00"), OrderSideSpecified::Sell);
+
+    assert_eq!(book.asks.levels.range(..=bound).count(), 3);
+}
+
+#[rstest]
+fn test_bids_range_down_to_empty_when_price_above_all_bids() {
+    let book = create_book_with_levels(&[("100.00", 10, 1), ("99.00", 20, 2)], &[]);
+
+    // Buy-side BTreeMap sorts descending, so BookPrice(101, Buy) sorts
+    // before all existing entries making the range empty
+    let bound = BookPrice::new(Price::from("101.00"), OrderSideSpecified::Buy);
+
+    assert_eq!(book.bids.levels.range(..=bound).count(), 0);
+}
+
+#[rstest]
+fn test_asks_range_up_to_empty_when_price_below_all_asks() {
+    let book = create_book_with_levels(&[], &[("101.00", 10, 1), ("102.00", 20, 2)]);
+
+    let bound = BookPrice::new(Price::from("100.00"), OrderSideSpecified::Sell);
+
+    assert_eq!(book.asks.levels.range(..=bound).count(), 0);
+}
+
+#[rstest]
+fn test_bids_range_down_to_returns_all_at_lowest_bid() {
+    let book = create_book_with_levels(
+        &[("100.00", 10, 1), ("99.00", 20, 2), ("98.00", 30, 3)],
+        &[],
+    );
+
+    let bound = BookPrice::new(Price::from("98.00"), OrderSideSpecified::Buy);
+
+    assert_eq!(book.bids.levels.range(..=bound).count(), 3);
+}
+
+#[rstest]
+fn test_asks_range_up_to_returns_all_at_highest_ask() {
+    let book = create_book_with_levels(
+        &[],
+        &[("101.00", 10, 1), ("102.00", 20, 2), ("103.00", 30, 3)],
+    );
+
+    let bound = BookPrice::new(Price::from("103.00"), OrderSideSpecified::Sell);
+
+    assert_eq!(book.asks.levels.range(..=bound).count(), 3);
+}
+
+#[rstest]
+fn test_bids_range_down_to_single_exact_top() {
+    let book = create_book_with_levels(
+        &[("100.00", 10, 1), ("99.00", 20, 2), ("98.00", 30, 3)],
+        &[],
+    );
+
+    let bound = BookPrice::new(Price::from("100.00"), OrderSideSpecified::Buy);
+    let levels: Vec<_> = book.bids.levels.range(..=bound).collect();
+
+    assert_eq!(levels.len(), 1);
+    assert_eq!(levels[0].0.value, Price::from("100.00"));
+}
+
+#[rstest]
+fn test_asks_range_up_to_single_exact_bottom() {
+    let book = create_book_with_levels(
+        &[],
+        &[("101.00", 10, 1), ("102.00", 20, 2), ("103.00", 30, 3)],
+    );
+
+    let bound = BookPrice::new(Price::from("101.00"), OrderSideSpecified::Sell);
+    let levels: Vec<_> = book.asks.levels.range(..=bound).collect();
+
+    assert_eq!(levels.len(), 1);
+    assert_eq!(levels[0].0.value, Price::from("101.00"));
 }

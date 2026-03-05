@@ -18,6 +18,7 @@
 use std::{
     any::Any,
     cell::{RefCell, UnsafeCell},
+    collections::HashMap,
     fmt::Debug,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
@@ -50,12 +51,14 @@ use nautilus_model::{
     },
     enums::{BookType, OmsType, OrderSide, PositionSide, TimeInForce},
     events::{
-        OrderAccepted, OrderCancelRejected, OrderDenied, OrderEmulated, OrderExpired,
-        OrderInitialized, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
-        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
-        PositionChanged, PositionClosed, PositionOpened,
+        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
+        OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
+        OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
+        OrderUpdated, PositionChanged, PositionClosed, PositionOpened,
     },
-    identifiers::{AccountId, ClientId, InstrumentId, PositionId, StrategyId, TraderId, Venue},
+    identifiers::{
+        AccountId, ActorId, ClientId, InstrumentId, PositionId, StrategyId, TraderId, Venue,
+    },
     instruments::InstrumentAny,
     orderbook::OrderBook,
     orders::OrderAny,
@@ -67,7 +70,7 @@ use nautilus_portfolio::portfolio::Portfolio;
 use pyo3::{prelude::*, types::PyDict};
 use ustr::Ustr;
 
-use crate::strategy::{Strategy, StrategyConfig, StrategyCore};
+use crate::strategy::{ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore};
 
 #[pyo3::pymethods]
 impl StrategyConfig {
@@ -177,6 +180,56 @@ impl StrategyConfig {
     #[getter]
     fn log_rejected_due_post_only_as_warning(&self) -> bool {
         self.log_rejected_due_post_only_as_warning
+    }
+}
+
+#[pyo3::pymethods]
+impl ImportableStrategyConfig {
+    #[new]
+    fn py_new(strategy_path: String, config_path: String, config: Py<PyDict>) -> PyResult<Self> {
+        let json_config = Python::attach(|py| -> PyResult<HashMap<String, serde_json::Value>> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("default", py.eval(pyo3::ffi::c_str!("str"), None, None)?)?;
+            let json_str: String = PyModule::import(py, "json")?
+                .call_method("dumps", (config.bind(py),), Some(&kwargs))?
+                .extract()?;
+
+            let json_value: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(to_pyvalue_err)?;
+
+            if let serde_json::Value::Object(map) = json_value {
+                Ok(map.into_iter().collect())
+            } else {
+                Err(to_pyvalue_err("Config must be a dictionary"))
+            }
+        })?;
+
+        Ok(Self {
+            strategy_path,
+            config_path,
+            config: json_config,
+        })
+    }
+
+    #[getter]
+    fn strategy_path(&self) -> &String {
+        &self.strategy_path
+    }
+
+    #[getter]
+    fn config_path(&self) -> &String {
+        &self.config_path
+    }
+
+    #[getter]
+    fn config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let py_dict = PyDict::new(py);
+        for (key, value) in &self.config {
+            let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
+            let py_value = PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+            py_dict.set_item(key, py_value)?;
+        }
+        Ok(py_dict.unbind())
     }
 }
 
@@ -400,16 +453,48 @@ impl PyStrategyInner {
         Ok(())
     }
 
-    // TODO: Position events don't have PyO3 bindings yet, so these are stubbed
-    fn dispatch_on_position_opened(&self, _event: PositionOpened) -> PyResult<()> {
+    fn dispatch_on_order_canceled(&self, event: OrderCanceled) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_order_canceled", (event.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
-    fn dispatch_on_position_changed(&self, _event: PositionChanged) -> PyResult<()> {
+    fn dispatch_on_order_filled(&self, event: OrderFilled) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_order_filled", (event.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
-    fn dispatch_on_position_closed(&self, _event: PositionClosed) -> PyResult<()> {
+    fn dispatch_on_position_opened(&self, event: PositionOpened) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_position_opened", (event.into_py_any_unwrap(py),))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_position_changed(&self, event: PositionChanged) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_position_changed", (event.into_py_any_unwrap(py),))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_position_closed(&self, event: PositionClosed) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_position_closed", (event.into_py_any_unwrap(py),))
+            })?;
+        }
         Ok(())
     }
 
@@ -736,6 +821,16 @@ impl DataActor for PyStrategyInner {
         self.dispatch_on_instrument_close(*update)
             .map_err(|e| anyhow::anyhow!("Python on_instrument_close failed: {e}"))
     }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
+        self.dispatch_on_order_filled(*event)
+            .map_err(|e| anyhow::anyhow!("Python on_order_filled failed: {e}"))
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
+        self.dispatch_on_order_canceled(*event)
+            .map_err(|e| anyhow::anyhow!("Python on_order_canceled failed: {e}"))
+    }
 }
 
 /// Python-facing wrapper for Strategy.
@@ -762,12 +857,16 @@ impl PyStrategy {
     #[inline]
     #[allow(unsafe_code)]
     pub(crate) fn inner(&self) -> &PyStrategyInner {
+        // SAFETY: `PyStrategy` is `unsendable` so access is single-threaded, and
+        // callers never hold a mutable and shared reference simultaneously.
         unsafe { &*self.inner.get() }
     }
 
     #[inline]
     #[allow(unsafe_code, clippy::mut_from_ref)]
     pub(crate) fn inner_mut(&self) -> &mut PyStrategyInner {
+        // SAFETY: `PyStrategy` is `unsendable` so access is single-threaded, and
+        // callers never hold a mutable and shared reference simultaneously.
         unsafe { &mut *self.inner.get() }
     }
 }
@@ -795,6 +894,36 @@ impl PyStrategy {
     /// Sets the Python instance reference for method dispatch.
     pub fn set_python_instance(&mut self, py_obj: Py<PyAny>) {
         self.inner_mut().py_self = Some(py_obj);
+    }
+
+    /// Updates the strategy_id (actor_id) in both the core config and the actor_id field.
+    ///
+    /// Must only be called before registration. See `PyDataActor::set_actor_id`.
+    pub fn set_strategy_id(&mut self, strategy_id: StrategyId) {
+        let actor_id = ActorId::from(strategy_id.inner().as_str());
+        let inner = self.inner_mut();
+        inner.core.config.strategy_id = Some(strategy_id);
+        inner.core.actor.config.actor_id = Some(actor_id);
+        inner.core.actor.actor_id = actor_id;
+    }
+
+    /// Updates the log_events setting in the core config.
+    pub fn set_log_events(&mut self, log_events: bool) {
+        let inner = self.inner_mut();
+        inner.core.config.log_events = log_events;
+        inner.core.actor.config.log_events = log_events;
+    }
+
+    /// Updates the log_commands setting in the core config.
+    pub fn set_log_commands(&mut self, log_commands: bool) {
+        let inner = self.inner_mut();
+        inner.core.config.log_commands = log_commands;
+        inner.core.actor.config.log_commands = log_commands;
+    }
+
+    /// Returns the strategy ID.
+    pub fn strategy_id(&self) -> StrategyId {
+        StrategyId::from(self.inner().core.actor.actor_id.inner().as_str())
     }
 
     /// Returns a value indicating whether the strategy has been registered with a trader.
@@ -853,16 +982,28 @@ impl PyStrategy {
 
 #[pyo3::pymethods]
 impl PyStrategy {
+    /// Creates a new [`PyStrategy`] instance.
+    ///
+    /// Accepts `None` or any Python object. If the object is a [`StrategyConfig`]
+    /// (or can be extracted as one via `from_py_object`), its values are used;
+    /// otherwise the strategy falls back to [`StrategyConfig::default()`].
+    ///
+    /// This permissive signature is required so that Python subclasses can pass
+    /// a **custom** config dataclass to their `__init__`; the Rust
+    /// `add_strategy_from_config` then extracts `strategy_id`, `log_events`, etc.
+    /// via `getattr` and calls the corresponding setters separately.
     #[new]
     #[pyo3(signature = (config=None))]
-    fn py_new(config: Option<StrategyConfig>) -> Self {
-        Self::new(config)
+    fn py_new(config: Option<Py<PyAny>>) -> Self {
+        let strategy_config =
+            config.and_then(|obj| Python::attach(|py| obj.extract::<StrategyConfig>(py).ok()));
+        Self::new(strategy_config)
     }
 
     /// Captures the Python self reference for Rust→Python event dispatch.
     #[pyo3(signature = (config=None))]
     #[allow(unused_variables)]
-    fn __init__(slf: &Bound<'_, Self>, config: Option<StrategyConfig>) {
+    fn __init__(slf: &Bound<'_, Self>, config: Option<Py<PyAny>>) {
         let py_self: Py<PyAny> = slf.clone().unbind().into_any();
         slf.borrow_mut().set_python_instance(py_self);
     }

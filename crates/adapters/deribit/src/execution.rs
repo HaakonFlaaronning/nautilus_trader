@@ -1121,7 +1121,9 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
         NautilusWsMessage::Data(_)
         | NautilusWsMessage::Deltas(_)
         | NautilusWsMessage::Instrument(_)
+        | NautilusWsMessage::InstrumentStatus(_)
         | NautilusWsMessage::FundingRates(_)
+        | NautilusWsMessage::OptionGreeks(_)
         | NautilusWsMessage::Raw(_) => {
             // Data messages are handled by the data client, not execution
             log::trace!("Ignoring data message in execution client");

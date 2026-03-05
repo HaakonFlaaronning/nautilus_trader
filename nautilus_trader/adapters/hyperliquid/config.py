@@ -62,6 +62,12 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         The vault address for vault trading.
         If ``None`` then will source the `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT`
         environment variable (depending on the `testnet` setting).
+    account_address : str, optional
+        The main account address when using an agent wallet (API sub-key).
+        When set, this address is used for balance queries, position reports,
+        and WebSocket subscriptions instead of the address derived from the private key.
+        Signing still uses the agent wallet's private key.
+        If ``None`` then will source the `HYPERLIQUID_ACCOUNT_ADDRESS` environment variable.
     base_url_ws : str, optional
         The WebSocket client custom endpoint override.
     http_proxy_url : str, optional
@@ -86,10 +92,6 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         dynamic constraint that depends on the price magnitude and cannot be fully encoded
         in the static instrument tick size. When enabled, prices are automatically rounded
         to comply with this rule. Disable if you want full control over price formatting.
-    builder_fee_refresh_mins : PositiveInt or None, default 60
-        Interval in minutes for refreshing the builder fee tier from Hyperliquid.
-        The builder maker fee scales down with volume.
-        Set to ``None`` to disable.
 
     Warnings
     --------
@@ -99,6 +101,7 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
 
     private_key: str | None = None
     vault_address: str | None = None
+    account_address: str | None = None
     base_url_ws: str | None = None
     http_proxy_url: str | None = None
     ws_proxy_url: str | None = None
@@ -108,4 +111,3 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     retry_delay_max_ms: PositiveInt | None = None
     http_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
-    builder_fee_refresh_mins: PositiveInt | None = 60

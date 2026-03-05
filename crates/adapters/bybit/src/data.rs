@@ -25,6 +25,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
+use dashmap::DashSet;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::DataClient,
@@ -32,12 +33,14 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
-            RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices,
-            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            BarsResponse, BookResponse, DataResponse, ForwardPricesResponse, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, RequestBars, RequestBookSnapshot,
+            RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeFundingRates,
+            SubscribeIndexPrices, SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes,
+            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeMarkPrices,
+            UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -47,11 +50,13 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Data, OrderBookDeltas_API},
+    data::{Data, ForwardPrice, OrderBookDeltas_API},
     enums::BookType,
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
+    orderbook::book::OrderBook,
 };
+use rust_decimal::Decimal;
 use tokio::{task::JoinHandle, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -60,6 +65,7 @@ use crate::{
         consts::{BYBIT_DEFAULT_ORDERBOOK_DEPTH, BYBIT_VENUE},
         enums::BybitProductType,
         parse::extract_raw_symbol,
+        symbol::BybitSymbol,
     },
     config::BybitDataClientConfig,
     http::client::BybitHttpClient,
@@ -81,6 +87,7 @@ pub struct BybitDataClient {
     book_depths: Arc<RwLock<AHashMap<InstrumentId, u32>>>,
     quote_depths: Arc<RwLock<AHashMap<InstrumentId, u32>>>,
     ticker_subs: Arc<RwLock<AHashMap<InstrumentId, AHashSet<&'static str>>>>,
+    option_greeks_subs: Arc<DashSet<InstrumentId>>,
     clock: &'static AtomicTime,
 }
 
@@ -152,6 +159,7 @@ impl BybitDataClient {
             book_depths: Arc::new(RwLock::new(AHashMap::new())),
             quote_depths: Arc::new(RwLock::new(AHashMap::new())),
             ticker_subs: Arc::new(RwLock::new(AHashMap::new())),
+            option_greeks_subs: Arc::new(DashSet::new()),
             clock,
         })
     }
@@ -174,19 +182,9 @@ impl BybitDataClient {
         instrument_id: InstrumentId,
     ) -> Option<BybitProductType> {
         let guard = self.instruments.read().expect(MUTEX_POISONED);
-        guard.get(&instrument_id).map(|inst| {
-            // Determine product type based on instrument characteristics
-            let symbol_str = instrument_id.symbol.as_str();
-            if symbol_str.ends_with("-SPOT") || !symbol_str.contains('-') {
-                BybitProductType::Spot
-            } else if symbol_str.ends_with("-OPTION") {
-                BybitProductType::Option
-            } else if inst.is_inverse() {
-                BybitProductType::Inverse
-            } else {
-                BybitProductType::Linear
-            }
-        })
+        guard
+            .get(&instrument_id)
+            .and_then(|_| BybitProductType::from_suffix(instrument_id.symbol.as_str()))
     }
 
     fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
@@ -247,6 +245,7 @@ impl BybitDataClient {
                     {
                         continue;
                     }
+
                     if let Err(e) = data_sender.send(DataEvent::FundingRate(update)) {
                         log::error!("Failed to emit funding rate event: {e}");
                     }
@@ -272,6 +271,11 @@ impl BybitDataClient {
                     {
                         Self::send_data(data_sender, Data::IndexPriceUpdate(update));
                     }
+                }
+            }
+            NautilusWsMessage::OptionGreeks(greeks) => {
+                if let Err(e) = data_sender.send(DataEvent::OptionGreeks(greeks)) {
+                    log::error!("Failed to send option greeks: {e}");
                 }
             }
             NautilusWsMessage::OrderStatusReports(_)
@@ -345,6 +349,7 @@ impl DataClient for BybitDataClient {
         self.book_depths.write().expect(MUTEX_POISONED).clear();
         self.quote_depths.write().expect(MUTEX_POISONED).clear();
         self.ticker_subs.write().expect(MUTEX_POISONED).clear();
+        self.option_greeks_subs.clear();
         Ok(())
     }
 
@@ -392,6 +397,9 @@ impl DataClient for BybitDataClient {
         }
 
         for ws_client in &mut self.ws_clients {
+            // Share option greeks subscription set with each WS client
+            ws_client.set_option_greeks_subs(self.option_greeks_subs.clone());
+
             // Cache instruments before connecting so parser has price/size precision
             let instruments: Vec<_> = self
                 .instruments
@@ -469,6 +477,7 @@ impl DataClient for BybitDataClient {
         self.book_depths.write().expect(MUTEX_POISONED).clear();
         self.quote_depths.write().expect(MUTEX_POISONED).clear();
         self.ticker_subs.write().expect(MUTEX_POISONED).clear();
+        self.option_greeks_subs.clear();
         self.is_connected.store(false, Ordering::Release);
         log::info!("Disconnected: client_id={}", self.client_id);
         Ok(())
@@ -490,6 +499,7 @@ impl DataClient for BybitDataClient {
         let depth = cmd
             .depth
             .map_or(BYBIT_DEFAULT_ORDERBOOK_DEPTH, |d| d.get() as u32);
+
         if !matches!(depth, 1 | 50 | 200 | 500) {
             anyhow::bail!("invalid depth {depth}; valid values are 1, 50, 200, or 500");
         }
@@ -996,6 +1006,81 @@ impl DataClient for BybitDataClient {
         Ok(())
     }
 
+    fn subscribe_option_greeks(&mut self, cmd: &SubscribeOptionGreeks) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        self.option_greeks_subs.insert(instrument_id);
+
+        let should_subscribe = {
+            let mut subs = self.ticker_subs.write().expect(MUTEX_POISONED);
+            let entry = subs.entry(instrument_id).or_default();
+            let first = entry.is_empty();
+            entry.insert("option_greeks");
+            first
+        };
+
+        if should_subscribe {
+            let product_type = self
+                .get_product_type_for_instrument(instrument_id)
+                .unwrap_or(BybitProductType::Option);
+
+            let ws = self
+                .get_ws_client_for_product(product_type)
+                .context("no WebSocket client for product type")?
+                .clone();
+
+            self.spawn_ws(
+                async move {
+                    ws.subscribe_ticker(instrument_id)
+                        .await
+                        .context("ticker subscription for option greeks")
+                },
+                "option greeks subscription",
+            );
+        }
+        Ok(())
+    }
+
+    fn unsubscribe_option_greeks(&mut self, cmd: &UnsubscribeOptionGreeks) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        self.option_greeks_subs.remove(&instrument_id);
+
+        let should_unsubscribe = {
+            let mut subs = self.ticker_subs.write().expect(MUTEX_POISONED);
+            if let Some(entry) = subs.get_mut(&instrument_id) {
+                entry.remove("option_greeks");
+                if entry.is_empty() {
+                    subs.remove(&instrument_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if should_unsubscribe {
+            let product_type = self
+                .get_product_type_for_instrument(instrument_id)
+                .unwrap_or(BybitProductType::Option);
+
+            let ws = self
+                .get_ws_client_for_product(product_type)
+                .context("no WebSocket client for product type")?
+                .clone();
+
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe_ticker(instrument_id)
+                        .await
+                        .context("ticker unsubscribe for option greeks")
+                },
+                "option greeks unsubscribe",
+            );
+        }
+        Ok(())
+    }
+
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1065,21 +1150,9 @@ impl DataClient for BybitDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        // Determine product type from symbol
-        let symbol_str = instrument_id.symbol.as_str();
-        let product_type = if symbol_str.ends_with("-SPOT") || !symbol_str.contains('-') {
-            BybitProductType::Spot
-        } else if symbol_str.ends_with("-OPTION") {
-            BybitProductType::Option
-        } else if symbol_str.contains("USD")
-            && !symbol_str.contains("USDT")
-            && !symbol_str.contains("USDC")
-        {
-            BybitProductType::Inverse
-        } else {
-            BybitProductType::Linear
-        };
-        let raw_symbol = extract_raw_symbol(symbol_str).to_string();
+        let product_type = BybitProductType::from_suffix(instrument_id.symbol.as_str())
+            .unwrap_or(BybitProductType::Linear);
+        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str()).to_string();
 
         get_runtime().spawn(async move {
             match http
@@ -1117,6 +1190,54 @@ impl DataClient for BybitDataClient {
         Ok(())
     }
 
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let depth = request.depth.map(|n| n.get() as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+
+        let product_type = BybitProductType::from_suffix(instrument_id.symbol.as_str())
+            .unwrap_or(BybitProductType::Linear);
+
+        get_runtime().spawn(async move {
+            match http
+                .request_orderbook_snapshot(product_type, instrument_id, depth)
+                .await
+                .context("failed to request book snapshot from Bybit")
+            {
+                Ok(deltas) => {
+                    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+                    if let Err(e) = book.apply_deltas(&deltas) {
+                        log::error!("Failed to apply book deltas for {instrument_id}: {e}");
+                        return;
+                    }
+
+                    let response = DataResponse::Book(BookResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send book snapshot response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Book snapshot request failed for {instrument_id}: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1131,20 +1252,8 @@ impl DataClient for BybitDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        // Determine product type from symbol
-        let symbol_str = instrument_id.symbol.as_str();
-        let product_type = if symbol_str.ends_with("-SPOT") || !symbol_str.contains('-') {
-            BybitProductType::Spot
-        } else if symbol_str.ends_with("-OPTION") {
-            BybitProductType::Option
-        } else if symbol_str.contains("USD")
-            && !symbol_str.contains("USDT")
-            && !symbol_str.contains("USDC")
-        {
-            BybitProductType::Inverse
-        } else {
-            BybitProductType::Linear
-        };
+        let product_type = BybitProductType::from_suffix(instrument_id.symbol.as_str())
+            .unwrap_or(BybitProductType::Linear);
 
         get_runtime().spawn(async move {
             match http
@@ -1163,6 +1272,7 @@ impl DataClient for BybitDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send trades response: {e}");
                     }
@@ -1188,21 +1298,9 @@ impl DataClient for BybitDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        // Determine product type from symbol
         let instrument_id = bar_type.instrument_id();
-        let symbol_str = instrument_id.symbol.as_str();
-        let product_type = if symbol_str.ends_with("-SPOT") || !symbol_str.contains('-') {
-            BybitProductType::Spot
-        } else if symbol_str.ends_with("-OPTION") {
-            BybitProductType::Option
-        } else if symbol_str.contains("USD")
-            && !symbol_str.contains("USDT")
-            && !symbol_str.contains("USDC")
-        {
-            BybitProductType::Inverse
-        } else {
-            BybitProductType::Linear
-        };
+        let product_type = BybitProductType::from_suffix(instrument_id.symbol.as_str())
+            .unwrap_or(BybitProductType::Linear);
 
         get_runtime().spawn(async move {
             match http
@@ -1221,11 +1319,184 @@ impl DataClient for BybitDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send bars response: {e}");
                     }
                 }
                 Err(e) => log::error!("Bar request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get() as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+
+        let product_type = BybitProductType::from_suffix(instrument_id.symbol.as_str())
+            .unwrap_or(BybitProductType::Linear);
+
+        if product_type == BybitProductType::Spot || product_type == BybitProductType::Option {
+            anyhow::bail!("Funding rates not available for {product_type} instruments");
+        }
+
+        get_runtime().spawn(async move {
+            match http
+                .request_funding_rates(product_type, instrument_id, start, end, limit)
+                .await
+                .context("failed to request funding rates from Bybit")
+            {
+                Ok(funding_rates) => {
+                    let response = DataResponse::FundingRates(FundingRatesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        funding_rates,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send funding rates response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Funding rates request failed for {instrument_id}: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_forward_prices(&self, request: RequestForwardPrices) -> anyhow::Result<()> {
+        let underlying = request.underlying.to_string();
+        let instrument_id = request.instrument_id;
+        let http_client = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let request_id = request.request_id;
+        let client_id = self.client_id();
+        let params = request.params;
+        let clock = self.clock;
+        let venue = *BYBIT_VENUE;
+
+        get_runtime().spawn(async move {
+            let result = if let Some(inst_id) = instrument_id {
+                // Single-instrument path: fetch ticker for one symbol
+                let raw_symbol = extract_raw_symbol(inst_id.symbol.as_str()).to_string();
+                log::info!(
+                    "Requesting forward price for {underlying} (single instrument: {raw_symbol})"
+                );
+
+                let params = crate::http::query::BybitTickersParams {
+                    category: BybitProductType::Option,
+                    symbol: Some(raw_symbol.clone()),
+                    base_coin: None,
+                    exp_date: None,
+                };
+                match http_client.request_option_tickers_raw_with_params(&params).await {
+                    Ok(tickers) => {
+                        let ts = clock.get_time_ns();
+                        let forward_prices: Vec<ForwardPrice> = tickers
+                            .into_iter()
+                            .filter_map(|t| {
+                                let up: Decimal = t.underlying_price.parse().ok()?;
+                                if up.is_zero() {
+                                    return None;
+                                }
+                                Some(ForwardPrice::new(inst_id, up, None, ts, ts))
+                            })
+                            .collect();
+
+                        log::info!(
+                            "Fetched {} forward price for {underlying} (single instrument: {raw_symbol})",
+                            forward_prices.len(),
+                        );
+                        Ok((forward_prices, ts))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                // Bulk path: fetch all option tickers
+                log::info!("Requesting option forward prices for base_coin={underlying} (bulk)");
+
+                match http_client.request_option_tickers_raw(&underlying).await {
+                    Ok(tickers) => {
+                        let ts = clock.get_time_ns();
+
+                        // Deduplicate: all options at the same expiry share the same
+                        // forward price. Extract expiry prefix (e.g. "BTC-28FEB26" from
+                        // "BTC-28FEB26-65000-C") and keep only one entry per expiry.
+                        let mut seen_expiries = std::collections::HashSet::new();
+                        let forward_prices: Vec<ForwardPrice> = tickers
+                            .into_iter()
+                            .filter_map(|t| {
+                                let up: Decimal = t.underlying_price.parse().ok()?;
+                                if up.is_zero() {
+                                    return None;
+                                }
+                                let parts: Vec<&str> = t.symbol.splitn(3, '-').collect();
+                                let expiry_key = if parts.len() >= 2 {
+                                    format!("{}-{}", parts[0], parts[1])
+                                } else {
+                                    t.symbol.to_string()
+                                };
+
+                                if !seen_expiries.insert(expiry_key) {
+                                    return None;
+                                }
+                                Some(ForwardPrice::new(
+                                    BybitSymbol::new(format!("{}-OPTION", t.symbol))
+                                        .map(|s| s.to_instrument_id())
+                                        .ok()?,
+                                    up,
+                                    None,
+                                    ts,
+                                    ts,
+                                ))
+                            })
+                            .collect();
+
+                        log::info!(
+                            "Fetched {} forward prices (per-expiry) for {underlying}",
+                            forward_prices.len(),
+                        );
+                        Ok((forward_prices, ts))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            match result {
+                Ok((forward_prices, ts)) => {
+                    let response = DataResponse::ForwardPrices(ForwardPricesResponse::new(
+                        request_id,
+                        client_id,
+                        venue,
+                        forward_prices,
+                        ts,
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send forward prices response: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Forward prices request failed for {underlying}: {e:?}");
+                }
             }
         });
 

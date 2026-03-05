@@ -227,6 +227,7 @@ impl OrderManager {
             .borrow()
             .order(&rejected.client_order_id)
             .cloned();
+
         if let Some(order) = cloned_order {
             if order.contingency_type() != Some(ContingencyType::NoContingency) {
                 self.handle_contingencies(order);
@@ -246,6 +247,7 @@ impl OrderManager {
             .borrow()
             .order(&canceled.client_order_id)
             .cloned();
+
         if let Some(order) = cloned_order {
             if order.contingency_type() != Some(ContingencyType::NoContingency) {
                 self.handle_contingencies(order);
@@ -401,6 +403,7 @@ impl OrderManager {
                     {
                         continue;
                     }
+
                     if contingent_order.client_order_id() != order.client_order_id() {
                         self.cancel_order(&contingent_order);
                     }
@@ -471,10 +474,11 @@ impl OrderManager {
                         self.modify_order_quantity(&contingent_order, filled_qty);
                     }
                 }
-                Some(ContingencyType::Oco) => {
-                    if order.is_closed() && (order.exec_spawn_id().is_none() || !is_spawn_active) {
-                        self.cancel_order(&contingent_order);
-                    }
+                Some(ContingencyType::Oco)
+                    if order.is_closed()
+                        && (order.exec_spawn_id().is_none() || !is_spawn_active) =>
+                {
+                    self.cancel_order(&contingent_order);
                 }
                 Some(ContingencyType::Ouo) => {
                     if (leaves_qty.raw == 0 && order.exec_spawn_id().is_some())

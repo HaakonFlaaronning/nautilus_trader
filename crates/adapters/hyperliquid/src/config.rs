@@ -15,10 +15,17 @@
 
 //! Configuration structures for the Hyperliquid adapter.
 
-use crate::common::consts::{BUILDER_FEE_REFRESH_DEFAULT_MINS, info_url, ws_url};
+use crate::common::consts::{info_url, ws_url};
 
 /// Configuration for the Hyperliquid data client.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object
+    )
+)]
 pub struct HyperliquidDataClientConfig {
     /// Optional private key for authenticated endpoints.
     pub private_key: Option<String>,
@@ -93,6 +100,13 @@ impl HyperliquidDataClientConfig {
 
 /// Configuration for the Hyperliquid execution client.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object
+    )
+)]
 pub struct HyperliquidExecClientConfig {
     /// Private key for signing transactions.
     ///
@@ -102,6 +116,10 @@ pub struct HyperliquidExecClientConfig {
     pub private_key: Option<String>,
     /// Optional vault address for vault operations.
     pub vault_address: Option<String>,
+    /// Optional main account address when using an agent wallet (API sub-key).
+    /// When set, used for balance queries, position reports, and WS subscriptions
+    /// instead of the address derived from the private key.
+    pub account_address: Option<String>,
     /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Override for the HTTP info URL.
@@ -128,9 +146,6 @@ pub struct HyperliquidExecClientConfig {
     /// When true, normalize order prices to 5 significant figures
     /// before submission (Hyperliquid requirement).
     pub normalize_prices: bool,
-    /// Interval in minutes for refreshing the builder fee tier from HL.
-    /// Set to `None` to disable periodic refresh.
-    pub builder_fee_refresh_mins: Option<u64>,
 }
 
 impl Default for HyperliquidExecClientConfig {
@@ -138,6 +153,7 @@ impl Default for HyperliquidExecClientConfig {
         Self {
             private_key: None,
             vault_address: None,
+            account_address: None,
             base_url_ws: None,
             base_url_http: None,
             base_url_exchange: None,
@@ -149,7 +165,6 @@ impl Default for HyperliquidExecClientConfig {
             retry_delay_initial_ms: 100,
             retry_delay_max_ms: 5000,
             normalize_prices: true,
-            builder_fee_refresh_mins: Some(BUILDER_FEE_REFRESH_DEFAULT_MINS),
         }
     }
 }
@@ -186,5 +201,27 @@ impl HyperliquidExecClientConfig {
         self.base_url_http
             .clone()
             .unwrap_or_else(|| info_url(self.is_testnet).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_exec_config_default_account_address_is_none() {
+        let config = HyperliquidExecClientConfig::default();
+        assert!(config.account_address.is_none());
+    }
+
+    #[rstest]
+    fn test_exec_config_with_account_address() {
+        let config = HyperliquidExecClientConfig {
+            account_address: Some("0x1234".to_string()),
+            ..HyperliquidExecClientConfig::default()
+        };
+        assert_eq!(config.account_address.as_deref(), Some("0x1234"));
     }
 }

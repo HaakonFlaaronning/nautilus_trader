@@ -51,14 +51,16 @@ use ustr::Ustr;
 use super::{
     error::DeribitHttpError,
     models::{
-        DeribitAccountSummariesResponse, DeribitCurrency, DeribitInstrument, DeribitJsonRpcRequest,
-        DeribitJsonRpcResponse, DeribitPosition, DeribitProductType, DeribitUserTradesResponse,
+        DeribitAccountSummariesResponse, DeribitBookSummary, DeribitCurrency, DeribitInstrument,
+        DeribitJsonRpcRequest, DeribitJsonRpcResponse, DeribitPosition, DeribitProductType,
+        DeribitTicker, DeribitUserTradesResponse,
     },
     query::{
-        GetAccountSummariesParams, GetInstrumentParams, GetInstrumentsParams,
-        GetOpenOrdersByInstrumentParams, GetOpenOrdersParams, GetOrderHistoryByCurrencyParams,
-        GetOrderHistoryByInstrumentParams, GetOrderStateParams, GetPositionsParams,
-        GetUserTradesByCurrencyAndTimeParams, GetUserTradesByInstrumentAndTimeParams,
+        GetAccountSummariesParams, GetBookSummaryByCurrencyParams, GetInstrumentParams,
+        GetInstrumentsParams, GetOpenOrdersByInstrumentParams, GetOpenOrdersParams,
+        GetOrderHistoryByCurrencyParams, GetOrderHistoryByInstrumentParams, GetOrderStateParams,
+        GetPositionsParams, GetTickerParams, GetUserTradesByCurrencyAndTimeParams,
+        GetUserTradesByInstrumentAndTimeParams,
     },
 };
 use crate::{
@@ -725,6 +727,31 @@ impl DeribitRawHttpClient {
             .await
     }
 
+    /// Gets book summaries for all instruments of a given currency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_book_summary_by_currency(
+        &self,
+        params: GetBookSummaryByCurrencyParams,
+    ) -> Result<DeribitJsonRpcResponse<Vec<DeribitBookSummary>>, DeribitHttpError> {
+        self.send_request("public/get_book_summary_by_currency", params, false)
+            .await
+    }
+
+    /// Gets ticker data for a single instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_ticker(
+        &self,
+        params: GetTickerParams,
+    ) -> Result<DeribitJsonRpcResponse<DeribitTicker>, DeribitHttpError> {
+        self.send_request("public/ticker", params, false).await
+    }
+
     /// Gets positions for a specific currency.
     ///
     /// # Errors
@@ -1141,6 +1168,7 @@ impl DeribitHttpClient {
         let supported_resolutions = [
             "1", "3", "5", "10", "15", "30", "60", "120", "180", "360", "720", "1D",
         ];
+
         if !supported_resolutions.contains(&resolution.as_str()) {
             anyhow::bail!(
                 "Deribit does not support resolution '{resolution}'. Supported: {supported_resolutions:?}"
@@ -1383,6 +1411,7 @@ impl DeribitHttpClient {
                 instrument_name: instrument_name.clone(),
                 r#type: None,
             };
+
             if let Some(orders) = self
                 .inner
                 .get_open_orders_by_instrument(open_params)
@@ -1557,6 +1586,7 @@ impl DeribitHttpClient {
                 let Some(last_trade) = data.trades.last() else {
                     break;
                 };
+
                 if !data.has_more {
                     break;
                 }
@@ -1601,6 +1631,7 @@ impl DeribitHttpClient {
                     let Some(last_trade) = data.trades.last() else {
                         break;
                     };
+
                     if !data.has_more {
                         break;
                     }
@@ -1618,6 +1649,50 @@ impl DeribitHttpClient {
 
         log::debug!("Generated {} fill reports", reports.len());
         Ok(reports)
+    }
+
+    /// Requests ticker data for a single instrument.
+    ///
+    /// Returns the `DeribitTicker` which includes `underlying_price` (forward price).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn request_ticker(&self, instrument_name: &str) -> anyhow::Result<DeribitTicker> {
+        let params = GetTickerParams {
+            instrument_name: instrument_name.to_string(),
+        };
+        let response = self
+            .inner
+            .get_ticker(params)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("No result in ticker response"))
+    }
+
+    /// Requests book summaries for options of a given currency.
+    ///
+    /// Returns raw `DeribitBookSummary` items which include `underlying_price`
+    /// (the forward price) for each option instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn request_book_summaries(
+        &self,
+        currency: &str,
+    ) -> anyhow::Result<Vec<DeribitBookSummary>> {
+        let params = GetBookSummaryByCurrencyParams::options(currency);
+        let full_response = self
+            .inner
+            .get_book_summary_by_currency(params)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        full_response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("No result in book summary response"))
     }
 
     /// Requests position status reports for reconciliation.
@@ -1644,6 +1719,7 @@ impl DeribitHttpClient {
             currency: DeribitCurrency::ANY,
             kind: None,
         };
+
         if let Some(positions) = self.inner.get_positions(params).await?.result {
             for position in &positions {
                 // Skip flat positions (size == 0)

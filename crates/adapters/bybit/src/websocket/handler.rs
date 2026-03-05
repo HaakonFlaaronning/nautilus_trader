@@ -24,7 +24,7 @@ use std::{
 };
 
 use ahash::AHashMap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use nautilus_common::cache::quote::QuoteCache;
 use nautilus_core::{
     UUID4,
@@ -54,10 +54,10 @@ use super::{
     parse::{
         parse_millis_i64, parse_orderbook_deltas, parse_orderbook_quote,
         parse_ticker_linear_funding, parse_ticker_linear_index_price,
-        parse_ticker_linear_mark_price, parse_ticker_option_index_price,
-        parse_ticker_option_mark_price, parse_ws_account_state, parse_ws_fill_report,
-        parse_ws_kline_bar, parse_ws_order_status_report, parse_ws_position_status_report,
-        parse_ws_trade_tick,
+        parse_ticker_linear_mark_price, parse_ticker_option_greeks,
+        parse_ticker_option_index_price, parse_ticker_option_mark_price, parse_ws_account_state,
+        parse_ws_fill_report, parse_ws_kline_bar, parse_ws_order_status_report,
+        parse_ws_position_status_report, parse_ws_trade_tick,
     },
 };
 use crate::{
@@ -185,6 +185,7 @@ pub(super) struct FeedHandler {
     pending_amend_requests: DashMap<String, AmendRequestData>,
     pending_batch_place_requests: DashMap<String, Vec<BatchOrderData>>,
     pending_batch_cancel_requests: DashMap<String, Vec<BatchCancelData>>,
+    option_greeks_subs: Arc<DashSet<InstrumentId>>,
     message_queue: VecDeque<NautilusWsMessage>,
 }
 
@@ -204,6 +205,7 @@ impl FeedHandler {
         subscriptions: SubscriptionState,
         funding_cache: FundingCache,
         bar_types_cache: Arc<DashMap<String, BarType>>,
+        option_greeks_subs: Arc<DashSet<InstrumentId>>,
     ) -> Self {
         Self {
             clock: get_atomic_clock_realtime(),
@@ -228,6 +230,7 @@ impl FeedHandler {
             pending_amend_requests: DashMap::new(),
             pending_batch_place_requests: DashMap::new(),
             pending_batch_cancel_requests: DashMap::new(),
+            option_greeks_subs,
             message_queue: VecDeque::new(),
         }
     }
@@ -533,6 +536,7 @@ impl FeedHandler {
                         }
                         HandlerCommand::Authenticate { payload } => {
                             log::debug!("Authenticate command received");
+
                             if let Err(e) = self.send_with_retry(payload).await {
                                 log::error!("Failed to send authentication after retries: {e}");
                             }
@@ -876,6 +880,7 @@ impl FeedHandler {
                         Err(e) => log::error!("Error parsing kline to bar: {e}"),
                     }
                 }
+
                 if !data_vec.is_empty() {
                     result.push(NautilusWsMessage::Data(data_vec));
                 }
@@ -1099,6 +1104,15 @@ impl FeedHandler {
                             log::debug!("Skipping option index price update: {e}");
                         }
                     }
+
+                    if self.option_greeks_subs.contains(&instrument_id) {
+                        match parse_ticker_option_greeks(&msg, instrument, ts_init) {
+                            Ok(greeks) => {
+                                result.push(NautilusWsMessage::OptionGreeks(greeks));
+                            }
+                            Err(e) => log::debug!("Skipping option greeks: {e}"),
+                        }
+                    }
                 } else {
                     log::debug!(
                         "No instrument found for symbol in TickerOption message: raw_symbol={raw_symbol}, full_symbol={symbol}"
@@ -1125,6 +1139,7 @@ impl FeedHandler {
                             );
                         }
                     }
+
                     if !reports.is_empty() {
                         result.push(NautilusWsMessage::OrderStatusReports(reports));
                     }
@@ -1148,6 +1163,7 @@ impl FeedHandler {
                             );
                         }
                     }
+
                     if !reports.is_empty() {
                         result.push(NautilusWsMessage::FillReports(reports));
                     }
@@ -1213,6 +1229,7 @@ impl FeedHandler {
                     {
                         // Bybit sometimes omits req_id, search by client_order_id instead
                         let client_order_id = ClientOrderId::from(order_link_id);
+
                         if resp.op.contains("create") {
                             self.find_and_remove_place_request_by_client_order_id(&client_order_id);
                         } else if resp.op.contains("cancel") {
@@ -1445,6 +1462,7 @@ impl FeedHandler {
                     }
                     BybitWsOperation::Unsubscribe => {
                         let pending_unsub = self.subscriptions.pending_unsubscribe_topics();
+
                         if sub_msg.success {
                             for topic in pending_unsub {
                                 self.subscriptions.confirm_unsubscribe(&topic);
@@ -1612,6 +1630,7 @@ mod tests {
             subscriptions,
             funding_cache,
             bar_types_cache,
+            Arc::new(DashSet::new()),
         )
     }
 

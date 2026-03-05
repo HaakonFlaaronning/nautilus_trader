@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Databento data integration adapter for the Nautilus trading engine"
+description = "Databento integration adapter for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
@@ -34,6 +34,7 @@ python = [
   "nautilus-core/ffi", # Temporary as python currently relies on the ffi CVec
   "nautilus-core/python",
   "nautilus-model/python",
+  "nautilus-system/python",
   "pyo3",
   "pyo3-async-runtimes",
 ]

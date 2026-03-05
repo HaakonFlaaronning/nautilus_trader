@@ -15,7 +15,7 @@
 
 //! Data engine and market data processing for [NautilusTrader](http://nautilustrader.io).
 //!
-//! The `nautilus-data` crate provides a comprehensive framework for handling market data ingestion,
+//! The `nautilus-data` crate provides a framework for handling market data ingestion,
 //! processing, and aggregation within the NautilusTrader ecosystem. This includes real-time
 //! data streaming, historical data management, and various aggregation methodologies:
 //!
@@ -60,6 +60,7 @@
 pub mod aggregation;
 pub mod client;
 pub mod engine;
+pub mod option_chains;
 
 #[cfg(feature = "defi")]
 pub mod defi;

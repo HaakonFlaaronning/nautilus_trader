@@ -39,7 +39,7 @@
 //! or as part of a Rust only build.
 //!
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds as a Python extension module (used with `python`).
+//! - `extension-module`: Builds as a Python extension module.
 //!
 //! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
 
@@ -68,6 +68,7 @@ pub use crate::{
         enums::{OKXInstrumentType, OKXOrderType, OKXPositionMode, OKXPositionSide, OKXSide},
         models::OKXInstrument,
     },
+    data::OKXDataClient,
     execution::OKXExecutionClient,
     http::{client::OKXHttpClient, error::OKXHttpError},
     websocket::{client::OKXWebSocketClient, error::OKXWsError},

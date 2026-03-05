@@ -361,7 +361,7 @@ impl RedisCacheDatabase {
         }
     }
 
-    /// Delete the given order from the database with comprehensive index cleanup.
+    /// Delete the given order from the database with full index cleanup.
     ///
     /// # Errors
     ///
@@ -409,7 +409,7 @@ impl RedisCacheDatabase {
         Ok(())
     }
 
-    /// Delete the given position from the database with comprehensive index cleanup.
+    /// Delete the given position from the database with full index cleanup.
     ///
     /// # Errors
     ///
@@ -504,6 +504,7 @@ async fn process_commands(
                     &mut con,
                     &trader_key,
                 ).await;
+
                 if result.is_break() {
                     break;
                 }
@@ -548,6 +549,7 @@ async fn handle_command(
             if !buffer.is_empty() {
                 drain_buffer(con, trader_key, buffer).await;
             }
+
             if let Err(e) = redis::cmd(REDIS_FLUSHDB).query_async::<()>(con).await {
                 log::error!("Failed to flush database: {e:?}");
             }
