@@ -9,6 +9,7 @@ Released on TBD (UTC).
 - None
 
 ### Fixes
+- Fix spurious "Timer replaced" warnings for expired timers in `LiveClock` and `TestClock`
 - Fix Binance algo order update (#3665), thanks @qu1zzyboy
 
 ### Internal Improvements
