@@ -4,17 +4,22 @@ Released on TBD (UTC).
 
 ### Enhancements
 - Added option chains and greeks in Rust (#3637), thanks @filipmacek
+- Added Hyperliquid agent wallet support (#3668), thanks @oh92
 
 ### Breaking Changes
 - None
 
 ### Fixes
-- Fix Binance algo order update (#3665), thanks @qu1zzyboy
+- Fixed `RiskEngine` RefCell re-entrancy panic on order denial (#3680), thanks @husariancom
+- Fixed reconciliation when trigger_price is set for non-conditional orders (#3673), thanks @husariancom
+- Fixed Binance algo order update (#3665), thanks @qu1zzyboy
+- Fixed Binance SBE price/quantity precision derivation (#3670), thanks @husariancom
 
 ### Internal Improvements
 - Added Python strategy support to `LiveNode` with `add_strategy_from_config`
 - Added backtest margin models, `FXRolloverInterestModule`, `PerContractFeeModel`, and `SimulationModule` trait in Rust
 - Optimized network client performance and add benchmarks
+- Upgraded Rust (MSRV) to 1.94.0
 - Upgraded `databento` crate to v0.43.0
 - Upgraded `tokio` crate to v1.50.0
 
