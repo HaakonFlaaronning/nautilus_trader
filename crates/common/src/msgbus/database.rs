@@ -48,6 +48,8 @@ pub struct DatabaseConfig {
     pub password: Option<String>,
     /// If the database should use an SSL-enabled connection.
     pub ssl: bool,
+    /// The Redis database number (0-15). If `None`, uses the Redis default (db 0).
+    pub db: Option<u16>,
     /// The timeout (in seconds) to wait for a new connection.
     pub connection_timeout: u16,
     /// The timeout (in seconds) to wait for a response.
@@ -92,6 +94,7 @@ impl Default for DatabaseConfig {
             username: None,
             password: None,
             ssl: false,
+            db: None,
             connection_timeout: 20,
             response_timeout: 20,
             number_of_retries: 100,

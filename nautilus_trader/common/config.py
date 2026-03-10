@@ -336,6 +336,7 @@ class DatabaseConfig(NautilusConfig, frozen=True):
     username: str | None = None
     password: str | None = None
     ssl: bool = False
+    db: int | None = None
     timeout: int | None = 20
 
     def __repr__(self) -> str:

@@ -126,8 +126,9 @@ pub fn get_redis_url(config: DatabaseConfig) -> (String, String) {
 
     let scheme = if ssl { "rediss" } else { "redis" };
 
-    let url = format!("{scheme}://{auth}{host}:{port}");
-    let redacted_url = format!("{scheme}://{auth_redacted}{host}:{port}");
+    let db_suffix = config.db.map_or(String::new(), |db| format!("/{db}"));
+    let url = format!("{scheme}://{auth}{host}:{port}{db_suffix}");
+    let redacted_url = format!("{scheme}://{auth_redacted}{host}:{port}{db_suffix}");
 
     (url, redacted_url)
 }
