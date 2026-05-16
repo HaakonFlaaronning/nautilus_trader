@@ -25,20 +25,20 @@ use std::{
 
 use futures::Stream;
 use nautilus_core::{
-    consts::NAUTILUS_PREFIX, correctness::check_predicate_true, time::get_atomic_clock_realtime,
-    AtomicTime, UnixNanos,
+    AtomicTime, UnixNanos, consts::NAUTILUS_PREFIX, correctness::check_predicate_true,
+    time::get_atomic_clock_realtime,
 };
 use ustr::Ustr;
 
 use super::timer::LiveTimer;
 use crate::{
     clock::{
-        replace_existing_timer, validate_and_prepare_time_alert, validate_and_prepare_timer,
-        CallbackRegistry, Clock,
+        CallbackRegistry, Clock, replace_existing_timer, validate_and_prepare_time_alert,
+        validate_and_prepare_timer,
     },
-    runner::{try_get_time_event_sender, TimeEventSender},
+    runner::{TimeEventSender, try_get_time_event_sender},
     timer::{
-        create_valid_interval, ScheduledTimeEvent, TimeEvent, TimeEventCallback, TimeEventHandler,
+        ScheduledTimeEvent, TimeEvent, TimeEventCallback, TimeEventHandler, create_valid_interval,
     },
 };
 
@@ -330,7 +330,7 @@ mod tests {
         time::Duration,
     };
 
-    use nautilus_core::{time::get_atomic_clock_realtime, UnixNanos, MUTEX_POISONED};
+    use nautilus_core::{MUTEX_POISONED, UnixNanos, time::get_atomic_clock_realtime};
     use rstest::rstest;
     use ustr::Ustr;
 
@@ -429,9 +429,11 @@ mod tests {
             .set_time_alert_ns("alert-callback", alert_time, None, None)
             .unwrap();
 
-        assert!(clock
-            .callbacks
-            .has_any_callback(&Ustr::from("alert-callback")));
+        assert!(
+            clock
+                .callbacks
+                .has_any_callback(&Ustr::from("alert-callback"))
+        );
 
         clock.cancel_timers();
     }

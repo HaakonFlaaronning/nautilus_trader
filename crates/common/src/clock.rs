@@ -20,14 +20,14 @@ use std::{any::Any, collections::BTreeMap, fmt::Debug, ops::Deref, time::Duratio
 use ahash::AHashMap;
 use chrono::{DateTime, Utc};
 use nautilus_core::{
+    AtomicTime, UnixNanos,
     correctness::{check_positive_u64, check_predicate_true, check_valid_string_utf8},
     string::formatting::Separable,
-    AtomicTime, UnixNanos,
 };
 use ustr::Ustr;
 
 use crate::timer::{
-    create_valid_interval, TestTimer, TimeEvent, TimeEventCallback, TimeEventHandler, Timer,
+    TestTimer, TimeEvent, TimeEventCallback, TimeEventHandler, Timer, create_valid_interval,
 };
 
 /// Represents a type of clock.
@@ -730,7 +730,7 @@ mod tests {
         time::Duration,
     };
 
-    use nautilus_core::{UnixNanos, MUTEX_POISONED};
+    use nautilus_core::{MUTEX_POISONED, UnixNanos};
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
@@ -1344,10 +1344,12 @@ mod tests {
 
         // Should fail because next event time (101_000) < current time (102_000)
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("would be in the past"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("would be in the past")
+        );
     }
 
     #[rstest]
@@ -1371,10 +1373,12 @@ mod tests {
 
         // Should fail because next event time (100_000) < current time (100_500)
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("would be in the past"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("would be in the past")
+        );
     }
 
     #[rstest]
