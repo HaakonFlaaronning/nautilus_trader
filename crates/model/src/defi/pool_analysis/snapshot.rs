@@ -32,6 +32,10 @@ use crate::{
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoolSnapshot {
     /// The instrument ID of the pool this snapshot represents.
@@ -50,6 +54,7 @@ pub struct PoolSnapshot {
 
 impl PoolSnapshot {
     /// Creates a new `PoolSnapshot` with the specified parameters.
+    #[must_use]
     pub fn new(
         instrument_id: InstrumentId,
         state: PoolState,
@@ -78,6 +83,10 @@ impl PoolSnapshot {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PoolState {
     /// Current tick position of the pool price.
@@ -100,6 +109,7 @@ pub struct PoolState {
 
 impl PoolState {
     /// Creates a new `PoolState` with the specified parameters.
+    #[must_use]
     pub fn new(protocol_fees_token0: U256, protocol_fees_token1: U256, fee_protocol: u8) -> Self {
         Self {
             current_tick: 0,
@@ -136,6 +146,10 @@ impl Default for PoolState {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PoolAnalytics {

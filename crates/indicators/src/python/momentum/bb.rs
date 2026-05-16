@@ -19,7 +19,9 @@ use pyo3::prelude::*;
 use crate::{average::MovingAverageType, indicator::Indicator, momentum::bb::BollingerBands};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BollingerBands {
+    /// Creates a new `BollingerBands` instance.
     #[new]
     #[pyo3(signature = (period, k, ma_type=None, use_close_only=None))]
     #[must_use]

@@ -22,6 +22,7 @@ use std::{
 };
 
 use nautilus_core::UnixNanos;
+use serde::{Deserialize, Serialize};
 
 use super::HasTsInit;
 use crate::{
@@ -29,12 +30,13 @@ use crate::{
         QuoteTick,
         greeks::{HasGreeks, OptionGreekValues},
     },
+    enums::GreeksConvention,
     identifiers::{InstrumentId, OptionSeriesId},
     types::Price,
 };
 
 /// Defines which strikes to include in an option chain subscription.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StrikeRange {
     /// Subscribe to a fixed set of strike prices.
     Fixed(Vec<Price>),
@@ -129,42 +131,21 @@ impl StrikeRange {
     }
 }
 
-/// Specifies the source instrument for determining the ATM (at-the-money) price.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AtmSource {
-    /// Use the mark price of the given instrument.
-    MarkPrice(InstrumentId),
-    /// Use the index price of the given instrument.
-    IndexPrice(InstrumentId),
-    /// Use the mid-quote of the underlying instrument.
-    UnderlyingQuoteMid(InstrumentId),
-    /// Use the forward/underlying price from the option greeks stream.
-    ///
-    /// Both Deribit and Bybit include `underlying_price` (the exchange-computed forward)
-    /// on every option ticker update. This eliminates the spot-forward basis error
-    /// and removes the need for a separate perpetual subscription.
-    ForwardPrice,
-}
-
-impl AtmSource {
-    /// Returns the instrument ID used as the ATM price source, if applicable.
-    ///
-    /// Returns `None` for `ForwardPrice`, which extracts the ATM price directly
-    /// from the option greeks stream without a separate instrument subscription.
-    #[must_use]
-    pub fn instrument_id(&self) -> Option<InstrumentId> {
-        match self {
-            Self::MarkPrice(id) | Self::IndexPrice(id) | Self::UnderlyingQuoteMid(id) => Some(*id),
-            Self::ForwardPrice => None,
-        }
-    }
-}
-
 /// Exchange-provided option Greeks and implied volatility for a single instrument.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct OptionGreeks {
     /// The instrument ID these Greeks apply to.
     pub instrument_id: InstrumentId,
+    /// The numeraire convention these Greeks are expressed in.
+    pub convention: GreeksConvention,
     /// Core Greek sensitivity values.
     pub greeks: OptionGreekValues,
     /// Mark implied volatility.
@@ -206,6 +187,7 @@ impl Default for OptionGreeks {
     fn default() -> Self {
         Self {
             instrument_id: InstrumentId::from("NULL.NULL"),
+            convention: GreeksConvention::default(),
             greeks: OptionGreekValues::default(),
             mark_iv: None,
             bid_iv: None,
@@ -222,14 +204,28 @@ impl Display for OptionGreeks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "OptionGreeks({}, delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4}, mark_iv={:?})",
-            self.instrument_id, self.delta, self.gamma, self.vega, self.theta, self.mark_iv
+            "OptionGreeks({}, {}, delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4}, mark_iv={:?})",
+            self.instrument_id,
+            self.convention,
+            self.delta,
+            self.gamma,
+            self.vega,
+            self.theta,
+            self.mark_iv
         )
     }
 }
 
 /// Combined quote and Greeks data for a single strike in an option chain.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct OptionStrikeData {
     /// The latest quote for this strike.
     pub quote: QuoteTick,
@@ -239,6 +235,14 @@ pub struct OptionStrikeData {
 
 /// A point-in-time snapshot of an option chain for a single series.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct OptionChainSlice {
     /// The option series identifier.
     pub series_id: OptionSeriesId,
@@ -424,25 +428,10 @@ mod tests {
     }
 
     #[rstest]
-    fn test_atm_source_instrument_id() {
-        let id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
-        let source = AtmSource::MarkPrice(id);
-        assert_eq!(source.instrument_id(), Some(id));
-
-        let source = AtmSource::IndexPrice(id);
-        assert_eq!(source.instrument_id(), Some(id));
-
-        let source = AtmSource::UnderlyingQuoteMid(id);
-        assert_eq!(source.instrument_id(), Some(id));
-
-        let source = AtmSource::ForwardPrice;
-        assert_eq!(source.instrument_id(), None);
-    }
-
-    #[rstest]
     fn test_option_greeks_default_fields() {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            convention: GreeksConvention::BlackScholes,
             greeks: OptionGreekValues::default(),
             mark_iv: None,
             bid_iv: None,
@@ -457,12 +446,20 @@ mod tests {
         assert_eq!(greeks.vega, 0.0);
         assert_eq!(greeks.theta, 0.0);
         assert!(greeks.mark_iv.is_none());
+        assert_eq!(greeks.convention, GreeksConvention::BlackScholes);
+    }
+
+    #[rstest]
+    fn test_option_greeks_default_is_black_scholes() {
+        let greeks = OptionGreeks::default();
+        assert_eq!(greeks.convention, GreeksConvention::BlackScholes);
     }
 
     #[rstest]
     fn test_option_greeks_display() {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            convention: GreeksConvention::PriceAdjusted,
             greeks: OptionGreekValues {
                 delta: 0.55,
                 gamma: 0.001,
@@ -480,6 +477,7 @@ mod tests {
         };
         let display = format!("{greeks}");
         assert!(display.contains("OptionGreeks"));
+        assert!(display.contains("PRICE_ADJUSTED"));
         assert!(display.contains("0.55"));
     }
 

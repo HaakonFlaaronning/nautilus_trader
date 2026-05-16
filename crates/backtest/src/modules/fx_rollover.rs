@@ -26,7 +26,6 @@ use nautilus_model::{
     enums::{AssetClass, PriceType},
     identifiers::InstrumentId,
     instruments::Instrument,
-    position::Position,
     types::{Currency, Money},
 };
 
@@ -50,6 +49,14 @@ const LOCATION_CURRENCY_MAP: &[(&str, &str)] = &[
 
 /// A single interest rate data entry.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.backtest", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
+)]
 pub struct InterestRateRecord {
     /// OECD location code (e.g., "AUS", "USA").
     pub location: String,
@@ -63,7 +70,7 @@ pub struct InterestRateRecord {
 ///
 /// Uses short-term interest rate data (OECD format) to compute the daily
 /// differential between base and quote currency rates.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RolloverInterestCalculator {
     // currency code -> {time_key -> rate_percentage}
     rates: AHashMap<String, AHashMap<String, f64>>,
@@ -151,7 +158,19 @@ impl RolloverInterestCalculator {
 /// When holding FX positions overnight, the interest rate differential
 /// between the two currencies is credited or debited. Wednesday and Friday
 /// rollovers are tripled (Wednesday for T+2 settlement, Friday for the weekend).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.backtest",
+        unsendable,
+        skip_from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
+)]
 pub struct FXRolloverInterestModule {
     calculator: RolloverInterestCalculator,
     rollover_time_ns: Cell<u64>,
@@ -206,7 +225,7 @@ impl FXRolloverInterestModule {
         }
 
         for (instrument_id, &mid) in &mid_prices {
-            let positions: Vec<&Position> =
+            let positions =
                 ctx.cache
                     .positions_open(Some(&ctx.venue), Some(instrument_id), None, None, None);
 

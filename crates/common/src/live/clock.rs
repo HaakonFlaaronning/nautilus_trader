@@ -25,17 +25,20 @@ use std::{
 
 use futures::Stream;
 use nautilus_core::{
-    AtomicTime, UnixNanos, consts::NAUTILUS_PREFIX, correctness::check_predicate_true,
-    time::get_atomic_clock_realtime,
+    consts::NAUTILUS_PREFIX, correctness::check_predicate_true, time::get_atomic_clock_realtime,
+    AtomicTime, UnixNanos,
 };
 use ustr::Ustr;
 
 use super::timer::LiveTimer;
 use crate::{
-    clock::{CallbackRegistry, Clock, validate_and_prepare_time_alert, validate_and_prepare_timer},
-    runner::{TimeEventSender, try_get_time_event_sender},
+    clock::{
+        replace_existing_timer, validate_and_prepare_time_alert, validate_and_prepare_timer,
+        CallbackRegistry, Clock,
+    },
+    runner::{try_get_time_event_sender, TimeEventSender},
     timer::{
-        ScheduledTimeEvent, TimeEvent, TimeEventCallback, TimeEventHandler, create_valid_interval,
+        create_valid_interval, ScheduledTimeEvent, TimeEvent, TimeEventCallback, TimeEventHandler,
     },
 };
 
@@ -76,14 +79,7 @@ impl LiveClock {
     }
 
     fn replace_existing_timer_if_needed(&mut self, name: &Ustr) {
-        if let Some(timer) = self.timers.get(name) {
-            if timer.is_expired() {
-                self.timers.remove(name);
-            } else {
-                self.cancel_timer(name.as_str());
-                log::warn!("Timer '{name}' replaced");
-            }
-        }
+        replace_existing_timer(&mut self.timers, name);
     }
 }
 
@@ -142,6 +138,14 @@ impl Clock for LiveClock {
 
     fn register_default_handler(&mut self, handler: TimeEventCallback) {
         self.callbacks.register_default_handler(handler);
+    }
+
+    fn cancel_default_handler(&mut self) {
+        self.callbacks.cancel_default_handler();
+    }
+
+    fn cancel_callbacks(&mut self) {
+        self.callbacks.clear();
     }
 
     /// # Panics
@@ -261,7 +265,7 @@ impl Clock for LiveClock {
     fn next_time_ns(&self, name: &str) -> Option<UnixNanos> {
         self.timers
             .get(&Ustr::from(name))
-            .map(|timer| timer.next_time_ns())
+            .map(LiveTimer::next_time_ns)
     }
 
     fn cancel_timer(&mut self, name: &str) {
@@ -326,7 +330,7 @@ mod tests {
         time::Duration,
     };
 
-    use nautilus_core::{MUTEX_POISONED, UnixNanos, time::get_atomic_clock_realtime};
+    use nautilus_core::{time::get_atomic_clock_realtime, UnixNanos, MUTEX_POISONED};
     use rstest::rstest;
     use ustr::Ustr;
 
@@ -425,11 +429,9 @@ mod tests {
             .set_time_alert_ns("alert-callback", alert_time, None, None)
             .unwrap();
 
-        assert!(
-            clock
-                .callbacks
-                .has_any_callback(&Ustr::from("alert-callback"))
-        );
+        assert!(clock
+            .callbacks
+            .has_any_callback(&Ustr::from("alert-callback")));
 
         clock.cancel_timers();
     }

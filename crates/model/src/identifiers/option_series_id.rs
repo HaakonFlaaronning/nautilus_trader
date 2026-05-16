@@ -29,6 +29,14 @@ use crate::{identifiers::Venue, instruments::CryptoOption};
 
 /// Identifies a unique option series: a specific venue + underlying + settlement currency + expiration.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct OptionSeriesId {
     /// The trading venue.
     pub venue: Venue,
@@ -179,8 +187,8 @@ impl<'de> Deserialize<'de> for OptionSeriesId {
     where
         D: serde::Deserializer<'de>,
     {
-        let s: &str = Deserialize::deserialize(deserializer)?;
-        Self::from_str(s).map_err(serde::de::Error::custom)
+        let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+        Self::from_str(s.as_ref()).map_err(serde::de::Error::custom)
     }
 }
 
@@ -320,6 +328,15 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let deserialized: OptionSeriesId = serde_json::from_str(&json).unwrap();
 
+        assert_eq!(id, deserialized);
+    }
+
+    #[rstest]
+    fn test_option_series_id_deserialize_from_owned_value() {
+        let id = test_series_id();
+        let value = serde_json::Value::String(id.to_wire_string());
+
+        let deserialized: OptionSeriesId = serde_json::from_value(value).unwrap();
         assert_eq!(id, deserialized);
     }
 

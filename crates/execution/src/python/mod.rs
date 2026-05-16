@@ -15,8 +15,10 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
+pub mod config;
 pub mod fee;
 pub mod fill;
+pub mod latency;
 pub mod reconciliation;
 
 use pyo3::prelude::*;
@@ -29,18 +31,26 @@ use pyo3::prelude::*;
 #[pymodule]
 pub fn execution(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(
-        reconciliation::py_adjust_fills_for_partial_window,
+        reconciliation::py_process_mass_status_for_reconciliation,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
         reconciliation::py_calculate_reconciliation_price,
         m
     )?)?;
-    // Fee models
+    m.add_function(wrap_pyfunction!(
+        reconciliation::py_create_inferred_reconciliation_trade_id,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        reconciliation::py_create_position_reconciliation_venue_order_id,
+        m
+    )?)?;
+    m.add_class::<crate::engine::config::ExecutionEngineConfig>()?;
+    m.add_class::<crate::order_emulator::config::OrderEmulatorConfig>()?;
     m.add_class::<crate::models::fee::FixedFeeModel>()?;
     m.add_class::<crate::models::fee::MakerTakerFeeModel>()?;
     m.add_class::<crate::models::fee::PerContractFeeModel>()?;
-    // Fill models
     m.add_class::<crate::models::fill::DefaultFillModel>()?;
     m.add_class::<crate::models::fill::BestPriceFillModel>()?;
     m.add_class::<crate::models::fill::OneTickSlippageFillModel>()?;
@@ -52,5 +62,6 @@ pub fn execution(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::models::fill::CompetitionAwareFillModel>()?;
     m.add_class::<crate::models::fill::VolumeSensitiveFillModel>()?;
     m.add_class::<crate::models::fill::MarketHoursFillModel>()?;
+    m.add_class::<crate::models::latency::StaticLatencyModel>()?;
     Ok(())
 }

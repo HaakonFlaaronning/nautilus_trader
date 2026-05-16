@@ -49,6 +49,7 @@ use tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest, stream::M
 use super::{SocketConfig, TcpMessageHandler, TcpReader, TcpWriter, WriterCommand};
 use crate::{
     backoff::ExponentialBackoff,
+    dst,
     error::SendError,
     logging::{log_task_aborted, log_task_started, log_task_stopped},
     mode::ConnectionMode,
@@ -153,7 +154,7 @@ impl SocketClientInner {
 
         let mut backoff = ExponentialBackoff::new(
             Duration::from_millis(500),
-            Duration::from_millis(5000),
+            Duration::from_secs(5),
             2.0,
             250,
             false,
@@ -165,7 +166,7 @@ impl SocketClientInner {
         let (reader, writer) = loop {
             attempt += 1;
 
-            match tokio::time::timeout(
+            match dst::time::timeout(
                 Duration::from_secs(CONNECTION_TIMEOUT_SECS),
                 Self::tls_connect_with_server(url, *mode, connector.clone()),
             )
@@ -213,7 +214,7 @@ impl SocketClientInner {
                 attempt + 1,
                 max_retries
             );
-            tokio::time::sleep(delay).await;
+            dst::time::sleep(delay).await;
         };
 
         log::debug!("Connected");
@@ -373,7 +374,7 @@ impl SocketClientInner {
             return Ok(());
         }
 
-        tokio::time::timeout(self.reconnect_timeout, async {
+        dst::time::timeout(self.reconnect_timeout, async {
             let SocketConfig {
                 url,
                 mode,
@@ -433,7 +434,7 @@ impl SocketClientInner {
             }
 
             // Delay before closing connection
-            tokio::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
+            dst::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
 
             if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
                 log::debug!("Reconnect aborted mid-flight (after delay)");
@@ -512,14 +513,14 @@ impl SocketClientInner {
 
         tokio::task::spawn(async move {
             let mut buf = Vec::new();
-            let mut last_data_time = tokio::time::Instant::now();
+            let mut last_data_time = dst::time::Instant::now();
 
             loop {
                 if !ConnectionMode::from_atomic(&connection_state).is_active() {
                     break;
                 }
 
-                match tokio::time::timeout(check_interval, reader.read_buf(&mut buf)).await {
+                match dst::time::timeout(check_interval, reader.read_buf(&mut buf)).await {
                     // Connection has been terminated or vector buffer is complete
                     Ok(Ok(0)) => {
                         log::debug!("Connection closed by server");
@@ -532,7 +533,7 @@ impl SocketClientInner {
                     // Received bytes of data
                     Ok(Ok(bytes)) => {
                         log::trace!("Received <binary> {bytes} bytes");
-                        last_data_time = tokio::time::Instant::now();
+                        last_data_time = dst::time::Instant::now();
 
                         while let Some((i, _)) = &buf
                             .windows(suffix.len())
@@ -635,6 +636,7 @@ impl SocketClientInner {
         tokio::task::spawn(async move {
             let mut active_writer = writer;
             let mut reconnect_buffer: VecDeque<Bytes> = VecDeque::new();
+            let mut write_buf: Vec<u8> = Vec::new();
 
             loop {
                 if matches!(
@@ -644,7 +646,7 @@ impl SocketClientInner {
                     break;
                 }
 
-                match tokio::time::timeout(check_interval, writer_rx.recv()).await {
+                match dst::time::timeout(check_interval, writer_rx.recv()).await {
                     Ok(Some(msg)) => {
                         // Re-check connection mode after receiving a message
                         let mode = ConnectionMode::from_atomic(&connection_state);
@@ -657,11 +659,11 @@ impl SocketClientInner {
                                 log::debug!("Received new writer");
 
                                 // Delay before closing connection
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                dst::time::sleep(Duration::from_millis(100)).await;
 
                                 // Attempt to shutdown the writer gracefully before updating,
                                 // we ignore any error as the writer may already be closed.
-                                _ = tokio::time::timeout(
+                                _ = dst::time::timeout(
                                     Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
                                     active_writer.shutdown(),
                                 )
@@ -693,19 +695,14 @@ impl SocketClientInner {
                                 }
                             }
                             WriterCommand::Send(msg) => {
-                                if let Err(e) = active_writer.write_all(&msg).await {
+                                write_buf.clear();
+                                write_buf.extend_from_slice(&msg);
+                                write_buf.extend_from_slice(&suffix);
+
+                                if let Err(e) = active_writer.write_all(&write_buf).await {
                                     log::error!("Failed to send message: {e}");
                                     log::warn!("Writer triggering reconnect");
-                                    reconnect_buffer.push_back(msg);
-                                    connection_state
-                                        .store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
-                                    state_notify.notify_one();
-                                    continue;
-                                }
 
-                                if let Err(e) = active_writer.write_all(&suffix).await {
-                                    log::error!("Failed to send suffix: {e}");
-                                    log::warn!("Writer triggering reconnect");
                                     reconnect_buffer.push_back(msg);
                                     connection_state
                                         .store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
@@ -727,7 +724,7 @@ impl SocketClientInner {
 
             // Attempt to shutdown the writer gracefully before exiting,
             // we ignore any error as the writer may already be closed.
-            _ = tokio::time::timeout(
+            _ = dst::time::timeout(
                 Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
                 active_writer.shutdown(),
             )
@@ -749,7 +746,7 @@ impl SocketClientInner {
             let interval = Duration::from_secs(interval_secs);
 
             loop {
-                tokio::time::sleep(interval).await;
+                dst::time::sleep(interval).await;
 
                 match ConnectionMode::from_u8(connection_state.load(Ordering::SeqCst)) {
                     ConnectionMode::Active => {
@@ -810,6 +807,10 @@ impl CleanDrop for SocketClientInner {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.network")
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.network")
 )]
 pub struct SocketClient {
     pub(crate) controller_task: tokio::task::JoinHandle<()>,
@@ -918,11 +919,11 @@ impl SocketClient {
     pub async fn close(&self) {
         self.connection_mode
             .store(ConnectionMode::Disconnect.as_u8(), Ordering::SeqCst);
-        self.state_notify.notify_one();
+        self.state_notify.notify_waiters();
 
-        if tokio::time::timeout(Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS), async {
+        if dst::time::timeout(Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS), async {
             while !self.is_closed() {
-                tokio::time::sleep(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
+                dst::time::sleep(Duration::from_millis(CONNECTION_STATE_CHECK_INTERVAL_MS)).await;
             }
 
             if !self.controller_task.is_finished() {
@@ -978,7 +979,7 @@ impl SocketClient {
 
         let fallback_interval = Duration::from_millis(FALLBACK_INTERVAL_MS);
 
-        tokio::time::timeout(self.reconnect_timeout, async {
+        dst::time::timeout(self.reconnect_timeout, async {
             loop {
                 let notified = self.state_notify.notified();
 
@@ -992,8 +993,9 @@ impl SocketClient {
                 }
 
                 tokio::select! {
+                    biased;
                     () = notified => {}
-                    () = tokio::time::sleep(fallback_interval) => {}
+                    () = dst::time::sleep(fallback_interval) => {}
                 }
             }
         })
@@ -1003,6 +1005,10 @@ impl SocketClient {
     }
 
     /// Sends a message of the given `data`.
+    ///
+    /// Returns `Ok(())` when the message is enqueued to the writer channel. This does NOT
+    /// guarantee delivery: if a disconnect occurs concurrently, the writer task may drop the
+    /// message. During reconnection, messages are buffered and replayed on the new connection.
     ///
     /// # Errors
     ///
@@ -1033,8 +1039,9 @@ impl SocketClient {
 
             loop {
                 tokio::select! {
+                    biased;
                     () = state_notify.notified() => {}
-                    () = tokio::time::sleep(fallback_interval) => {}
+                    () = dst::time::sleep(fallback_interval) => {}
                 }
 
                 let mut mode = ConnectionMode::from_atomic(&connection_mode);
@@ -1043,9 +1050,9 @@ impl SocketClient {
                     log::debug!("Disconnecting");
 
                     let timeout = Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
-                    if tokio::time::timeout(timeout, async {
+                    if dst::time::timeout(timeout, async {
                         // Delay awaiting graceful shutdown
-                        tokio::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
+                        dst::time::sleep(Duration::from_millis(GRACEFUL_SHUTDOWN_DELAY_MS)).await;
 
                         if !inner.read_task.is_finished() {
                             inner.read_task.abort();
@@ -1108,8 +1115,27 @@ impl SocketClient {
                     }
 
                     inner.reconnect_attempt_count += 1;
-                    match inner.reconnect().await {
-                        Ok(()) => {
+
+                    // Race reconnect against disconnect notification
+                    let reconnect_result = tokio::select! {
+                        biased;
+                        result = inner.reconnect() => Some(result),
+                        () = async {
+                            loop {
+                                state_notify.notified().await;
+
+                                if ConnectionMode::from_atomic(&connection_mode).is_disconnect() {
+                                    break;
+                                }
+                            }
+                        } => None,
+                    };
+
+                    match reconnect_result {
+                        None => {
+                            log::debug!("Reconnect interrupted by disconnect");
+                        }
+                        Some(Ok(())) => {
                             log::debug!("Reconnected successfully");
                             inner.backoff.reset();
                             inner.reconnect_attempt_count = 0;
@@ -1127,7 +1153,7 @@ impl SocketClient {
                                 );
                             }
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             let duration = inner.backoff.next_duration();
                             log::warn!(
                                 "Reconnect attempt {} failed: {e}",
@@ -1136,8 +1162,23 @@ impl SocketClient {
 
                             if !duration.is_zero() {
                                 log::warn!("Backing off for {}s...", duration.as_secs_f64());
+                                // Race backoff sleep against disconnect
+                                tokio::select! {
+                                    biased;
+                                    () = dst::time::sleep(duration) => {}
+                                    () = async {
+                                        loop {
+                                            state_notify.notified().await;
+
+                                            if ConnectionMode::from_atomic(&connection_mode).is_disconnect() {
+                                                break;
+                                            }
+                                        }
+                                    } => {
+                                        log::debug!("Backoff interrupted by disconnect");
+                                    }
+                                }
                             }
-                            tokio::time::sleep(duration).await;
                         }
                     }
                 }
@@ -1163,6 +1204,7 @@ impl Drop for SocketClient {
 
 #[cfg(test)]
 #[cfg(feature = "python")]
+#[cfg(not(all(feature = "simulation", madsim)))] // transport-layer I/O not simulated
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
     use nautilus_common::testing::wait_until_async;
@@ -1480,6 +1522,7 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(not(feature = "turmoil"))]
+#[cfg(not(all(feature = "simulation", madsim)))] // transport-layer I/O not simulated
 mod rust_tests {
     use nautilus_common::testing::wait_until_async;
     use rstest::rstest;
@@ -1920,7 +1963,7 @@ mod rust_tests {
             }
             // Drop listener entirely so reconnection fails completely
             drop(listener);
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_mins(1)).await;
         });
 
         let config = SocketConfig {
@@ -2078,6 +2121,70 @@ mod rust_tests {
         );
 
         client.close().await;
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_close_during_backoff_exits_promptly() {
+        // Verify that close() interrupts backoff sleep (Finding 1).
+        // Server accepts then drops, no second listener -> reconnect fails -> enters backoff.
+        // We close while backing off and assert the client shuts down quickly.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            // Accept first connection, close immediately
+            if let Ok((mut sock, _)) = listener.accept().await {
+                drop(sock.shutdown());
+            }
+            // Don't accept again so reconnect fails and enters backoff
+            sleep(Duration::from_mins(1)).await;
+        });
+
+        let config = SocketConfig {
+            url: format!("127.0.0.1:{port}"),
+            mode: Mode::Plain,
+            suffix: b"\r\n".to_vec(),
+            message_handler: None,
+            heartbeat: None,
+            reconnect_timeout_ms: Some(1_000),
+            reconnect_delay_initial_ms: Some(10_000), // 10s backoff to ensure we're sleeping
+            reconnect_delay_max_ms: Some(10_000),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            connection_max_retries: None,
+            reconnect_max_attempts: None,
+            idle_timeout_ms: None,
+            certs_dir: None,
+        };
+
+        let client = SocketClient::connect(config, None, None, None)
+            .await
+            .unwrap();
+
+        // Wait for client to enter reconnect
+        wait_until_async(
+            || async { client.is_reconnecting() },
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // Wait for the reconnect attempt to fail and enter backoff sleep
+        sleep(Duration::from_millis(1_500)).await;
+
+        // Close while backing off
+        let start = std::time::Instant::now();
+        client.close().await;
+        let elapsed = start.elapsed();
+
+        assert!(client.is_closed(), "Client should be closed");
+        // Should exit well before the 10s backoff sleep completes
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Close should interrupt backoff sleep, took {elapsed:?}"
+        );
+
         server.abort();
     }
 

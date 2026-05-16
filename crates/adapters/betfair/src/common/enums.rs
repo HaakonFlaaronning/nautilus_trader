@@ -704,6 +704,77 @@ pub enum RollupModel {
     None,
 }
 
+/// Certificate-based login response status.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    Display,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum CertLoginStatus {
+    Success,
+    NoError,
+    Fail,
+    AccountAlreadyLocked,
+    AccountNowLocked,
+    AccountPendingPasswordChange,
+    ActionsRequired,
+    AgentClientMaster,
+    AgentClientMasterSuspended,
+    AuthorizedOnlyForDomainRo,
+    AuthorizedOnlyForDomainSe,
+    BettingRestrictedLocation,
+    CertAuthRequired,
+    ChangePasswordRequired,
+    Closed,
+    DanishAuthorizationRequired,
+    DenmarkMigrationRequired,
+    DuplicateCards,
+    EmailLoginNotAllowed,
+    InputValidationError,
+    InternalError,
+    InternationalTermsAcceptanceRequired,
+    InvalidConnectivityToRegulatorDk,
+    InvalidConnectivityToRegulatorIt,
+    InvalidUsernameOrPassword,
+    ItalianContractAcceptanceRequired,
+    ItalianProfilingAcceptanceRequired,
+    KycSuspend,
+    LoginRestricted,
+    MultipleUsersWithSameCredential,
+    NotAuthorizedByRegulatorDk,
+    NotAuthorizedByRegulatorIt,
+    PendingAuth,
+    PersonalMessageRequired,
+    #[serde(rename = "SECURITY_QUESTION_WRONG_3X")]
+    #[strum(serialize = "SECURITY_QUESTION_WRONG_3X")]
+    SecurityQuestionWrong3x,
+    SecurityRestrictedLocation,
+    SelfExcluded,
+    SpainMigrationRequired,
+    SpanishTermsAcceptanceRequired,
+    StrongAuthCodeRequired,
+    Suspended,
+    SwedenBankIdVerificationRequired,
+    SwedenNationalIdentifierRequired,
+    TelbetTermsConditionsNa,
+    TemporaryBanTooManyRequests,
+    TradingMaster,
+    TradingMasterSuspended,
+    #[serde(other)]
+    Other,
+}
+
 /// Streaming order side (shorthand: B=Back, L=Lay).
 #[derive(
     Clone,
@@ -838,6 +909,22 @@ pub enum StatusErrorCode {
     UnexpectedError,
     ConnectionFailed,
     InvalidRequest,
+}
+
+impl StatusErrorCode {
+    /// Returns `true` for errors that will never succeed on retry and should
+    /// permanently disable the race stream.
+    #[must_use]
+    pub fn is_race_stream_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::NoAppKey
+                | Self::InvalidAppKey
+                | Self::NotAuthorized
+                | Self::SubscriptionLimitExceeded
+                | Self::MaxConnectionLimitExceeded
+        )
+    }
 }
 
 /// Streaming change type.
@@ -1301,5 +1388,19 @@ mod tests {
             ),
             OrderStatus::Canceled,
         );
+    }
+
+    #[rstest]
+    #[case(StatusErrorCode::NoAppKey, true)]
+    #[case(StatusErrorCode::InvalidAppKey, true)]
+    #[case(StatusErrorCode::NotAuthorized, true)]
+    #[case(StatusErrorCode::SubscriptionLimitExceeded, true)]
+    #[case(StatusErrorCode::MaxConnectionLimitExceeded, true)]
+    #[case(StatusErrorCode::InvalidClock, false)]
+    #[case(StatusErrorCode::Timeout, false)]
+    #[case(StatusErrorCode::InvalidInput, false)]
+    #[case(StatusErrorCode::TooManyRequests, false)]
+    fn test_is_race_stream_fatal(#[case] code: StatusErrorCode, #[case] expected: bool) {
+        assert_eq!(code.is_race_stream_fatal(), expected);
     }
 }

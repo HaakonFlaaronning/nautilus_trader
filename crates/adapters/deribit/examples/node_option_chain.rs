@@ -23,26 +23,29 @@
 //! 5. Uses the BTC index price as the ATM source
 //! 6. Logs received `OptionChainSlice` snapshots in the `on_option_chain` handler
 //!
-//! Run with: `cargo run --example deribit-option-chain-tester --package nautilus-deribit`
+//! Run with: `cargo run --example deribit-option-chain-tester --package nautilus-deribit --features examples`
 
-use std::{
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use std::fmt::Debug;
 
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     enums::Environment,
+    nautilus_actor,
     timer::TimeEvent,
 };
 use nautilus_deribit::{
-    config::DeribitDataClientConfig, factories::DeribitDataClientFactory,
+    common::{
+        consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
+        enums::DeribitEnvironment,
+    },
+    config::DeribitDataClientConfig,
+    factories::DeribitDataClientFactory,
     http::models::DeribitProductType,
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::{OptionChainSlice, StrikeRange},
-    identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
+    identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId},
     instruments::{Instrument, any::InstrumentAny},
     stubs::TestDefault,
 };
@@ -59,18 +62,7 @@ struct OptionChainTester {
     series_id: Option<OptionSeriesId>,
 }
 
-impl Deref for OptionChainTester {
-    type Target = DataActorCore;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-
-impl DerefMut for OptionChainTester {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
-    }
-}
+nautilus_actor!(OptionChainTester);
 
 impl OptionChainTester {
     fn new(client_id: ClientId) -> Self {
@@ -87,11 +79,13 @@ impl OptionChainTester {
 
 impl DataActor for OptionChainTester {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        let venue = Venue::new("DERIBIT");
+        let venue = *DERIBIT_VENUE;
         let underlying_filter = Ustr::from("BTC");
 
         // Collect option instrument data from cache (owned copies to release borrow)
         // Each entry: (instrument_id, underlying, settlement_currency, expiry_ns)
+        // Filter out already-expired options.
+        let now_ns = self.clock().timestamp_ns().as_u64();
         let options: Vec<(InstrumentId, Ustr, Ustr, u64)> = {
             let cache = self.cache();
             let instruments = cache.instruments(&venue, Some(&underlying_filter));
@@ -102,6 +96,9 @@ impl DataActor for OptionChainTester {
                     // Only consider CryptoOption instruments
                     if let InstrumentAny::CryptoOption(opt) = inst {
                         let expiry = inst.expiration_ns()?.as_u64();
+                        if expiry <= now_ns {
+                            return None;
+                        }
                         Some((
                             inst.id(),
                             underlying_filter,
@@ -120,7 +117,7 @@ impl DataActor for OptionChainTester {
             return Ok(());
         }
 
-        // Find the nearest (soonest) expiry
+        // Find the nearest (soonest) future expiry
         let nearest_expiry = options.iter().map(|(_, _, _, exp)| *exp).min().unwrap();
 
         // Find settlement currency for nearest expiry (use BTC-settled by default)
@@ -169,9 +166,9 @@ impl DataActor for OptionChainTester {
         self.subscribe_option_chain(
             series_id,
             strike_range,
-            None, // auto-resolved to ForwardPrice (from option ticker underlying_price)
             snapshot_interval_ms,
             Some(client_id),
+            None,
         );
 
         self.series_id = Some(series_id);
@@ -258,13 +255,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let environment = Environment::Live;
     let trader_id = TraderId::test_default();
-    let client_id = ClientId::new("DERIBIT");
+    let client_id = *DERIBIT_CLIENT_ID;
 
     let deribit_config = DeribitDataClientConfig {
         api_key: None,    // Will use 'DERIBIT_API_KEY' env var
         api_secret: None, // Will use 'DERIBIT_API_SECRET' env var
         product_types: vec![DeribitProductType::Option, DeribitProductType::Future],
-        use_testnet: false,
+        environment: DeribitEnvironment::Mainnet,
         ..Default::default()
     };
 

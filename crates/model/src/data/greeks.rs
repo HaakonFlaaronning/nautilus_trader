@@ -20,10 +20,35 @@ use std::{
     ops::{Add, Deref, Mul},
 };
 
+use implied_vol::{DefaultSpecialFn, ImpliedBlackVolatility, SpecialFn};
+use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, math::quadratic_interpolation};
+
+use crate::{
+    data::{
+        HasTsInit,
+        black_scholes::{compute_greeks, compute_iv_and_greeks},
+    },
+    identifiers::InstrumentId,
+};
+
+const FRAC_SQRT_2_PI: f64 = f64::from_bits(0x3fd9_8845_33d4_3651);
+/// used to convert theta to per-calendar-day change when building `BlackScholesGreeksResult`.
+const THETA_DAILY_FACTOR: f64 = 1.0 / 365.25;
+/// Scale for vega to express as absolute percent change when building `BlackScholesGreeksResult`.
+const VEGA_PERCENT_FACTOR: f64 = 0.01;
+
 /// Core option Greek sensitivity values (the 5 standard sensitivities).
 /// Designed as a composable building block embedded in all Greeks-carrying types.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Default)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct OptionGreekValues {
     pub delta: f64,
     pub gamma: f64,
@@ -83,23 +108,6 @@ pub trait HasGreeks {
     fn greeks(&self) -> OptionGreekValues;
 }
 
-use implied_vol::{DefaultSpecialFn, ImpliedBlackVolatility, SpecialFn};
-use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, math::quadratic_interpolation};
-
-use crate::{
-    data::{
-        HasTsInit,
-        black_scholes::{compute_greeks, compute_iv_and_greeks},
-    },
-    identifiers::InstrumentId,
-};
-
-const FRAC_SQRT_2_PI: f64 = f64::from_bits(0x3fd9884533d43651);
-/// used to convert theta to per-calendar-day change when building BlackScholesGreeksResult.
-const THETA_DAILY_FACTOR: f64 = 1.0 / 365.25;
-/// Scale for vega to express as absolute percent change when building BlackScholesGreeksResult.
-const VEGA_PERCENT_FACTOR: f64 = 0.01;
-
 #[inline(always)]
 fn norm_pdf(x: f64) -> f64 {
     FRAC_SQRT_2_PI * (-0.5 * x * x).exp()
@@ -113,6 +121,10 @@ fn norm_pdf(x: f64) -> f64 {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct BlackScholesGreeksResult {
     pub price: f64,
     pub vol: f64,
@@ -123,9 +135,10 @@ pub struct BlackScholesGreeksResult {
     pub itm_prob: f64,
 }
 
+// Standardized Generalized Black-Scholes Greeks implementation
 // dS_t = S_t * (b * dt + vol * dW_t) (stock)
 // dC_t = r * C_t * dt (cash numeraire)
-#[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn black_scholes_greeks_exact(
     s: f64,
     r: f64,
@@ -136,24 +149,33 @@ pub fn black_scholes_greeks_exact(
     t: f64,
 ) -> BlackScholesGreeksResult {
     let phi = if is_call { 1.0 } else { -1.0 };
-    let scaled_vol = vol * t.sqrt();
+    let sqrt_t = t.sqrt();
+    let scaled_vol = vol * sqrt_t;
+
+    // d1 and d2 calculations
     let d1 = ((s / k).ln() + (b + 0.5 * vol.powi(2)) * t) / scaled_vol;
     let d2 = d1 - scaled_vol;
+
+    // Probabilities and PDF
     let cdf_phi_d1 = DefaultSpecialFn::norm_cdf(phi * d1);
     let cdf_phi_d2 = DefaultSpecialFn::norm_cdf(phi * d2);
-    let dist_d1 = norm_pdf(d1);
-    let df = ((b - r) * t).exp();
-    let s_t = s * df;
-    let k_t = k * (-r * t).exp();
+    let pdf_d1 = norm_pdf(d1);
 
-    let price = phi * (s_t * cdf_phi_d1 - k_t * cdf_phi_d2);
-    let delta = phi * df * cdf_phi_d1;
-    let gamma = df * dist_d1 / (s * scaled_vol);
-    let vega = s_t * t.sqrt() * dist_d1 * VEGA_PERCENT_FACTOR;
-    let theta = (s_t * (-dist_d1 * vol / (2.0 * t.sqrt()) - phi * (b - r) * cdf_phi_d1)
-        - phi * r * k_t * cdf_phi_d2)
-        * THETA_DAILY_FACTOR;
-    let itm_prob = cdf_phi_d2;
+    // Discounting factors
+    let df_b = ((b - r) * t).exp();
+    let df_r = (-r * t).exp();
+
+    // Price and common Greeks
+    let price = phi * (s * df_b * cdf_phi_d1 - k * df_r * cdf_phi_d2);
+    let delta = phi * df_b * cdf_phi_d1;
+    let gamma = (df_b * pdf_d1) / (s * scaled_vol);
+    let vega = s * df_b * sqrt_t * pdf_d1 * VEGA_PERCENT_FACTOR;
+
+    // Decay due to volatility, Drift/Cost of Carry component, Interest rate component on strike
+    let theta_v = -(s * df_b * pdf_d1 * vol) / (2.0 * sqrt_t);
+    let theta_b = -phi * (b - r) * s * df_b * cdf_phi_d1;
+    let theta_r = -phi * r * k * df_r * cdf_phi_d2;
+    let theta = (theta_v + theta_b + theta_r) * THETA_DAILY_FACTOR;
 
     BlackScholesGreeksResult {
         price,
@@ -162,10 +184,11 @@ pub fn black_scholes_greeks_exact(
         gamma,
         vega,
         theta,
-        itm_prob,
+        itm_prob: cdf_phi_d2,
     }
 }
 
+#[must_use]
 pub fn imply_vol(s: f64, r: f64, b: f64, is_call: bool, k: f64, t: f64, price: f64) -> f64 {
     let forward = s * (b * t).exp();
     let forward_price = price * (r * t).exp();
@@ -181,9 +204,9 @@ pub fn imply_vol(s: f64, r: f64, b: f64, is_call: bool, k: f64, t: f64, price: f
         .unwrap_or(0.0)
 }
 
-/// Computes Black-Scholes greeks using the fast compute_greeks implementation.
-/// This function uses compute_greeks from black_scholes.rs which is optimized for performance.
-#[allow(clippy::too_many_arguments)]
+/// Computes Black-Scholes greeks using the fast `compute_greeks` implementation.
+/// This function uses `compute_greeks` from `black_scholes.rs` which is optimized for performance.
+#[must_use]
 pub fn black_scholes_greeks(
     s: f64,
     r: f64,
@@ -199,19 +222,19 @@ pub fn black_scholes_greeks(
     );
 
     BlackScholesGreeksResult {
-        price: (greeks.price as f64),
+        price: f64::from(greeks.price),
         vol,
-        delta: (greeks.delta as f64),
-        gamma: (greeks.gamma as f64),
-        vega: (greeks.vega as f64) * VEGA_PERCENT_FACTOR,
-        theta: (greeks.theta as f64) * THETA_DAILY_FACTOR,
-        itm_prob: greeks.itm_prob as f64,
+        delta: f64::from(greeks.delta),
+        gamma: f64::from(greeks.gamma),
+        vega: f64::from(greeks.vega) * VEGA_PERCENT_FACTOR,
+        theta: f64::from(greeks.theta) * THETA_DAILY_FACTOR,
+        itm_prob: f64::from(greeks.itm_prob),
     }
 }
 
 /// Computes implied volatility and greeks using the fast implementations.
-/// This function uses compute_greeks after implying volatility.
-#[allow(clippy::too_many_arguments)]
+/// This function uses `compute_greeks` after implying volatility.
+#[must_use]
 pub fn imply_vol_and_greeks(
     s: f64,
     r: f64,
@@ -230,9 +253,10 @@ pub fn imply_vol_and_greeks(
 }
 
 /// Refines implied volatility using an initial guess and computes greeks.
-/// This function uses compute_iv_and_greeks which performs a Halley iteration
+/// This function uses `compute_iv_and_greeks` which performs a Halley iteration
 /// to refine the volatility estimate from an initial guess.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
+#[must_use]
 pub fn refine_vol_and_greeks(
     s: f64,
     r: f64,
@@ -256,17 +280,25 @@ pub fn refine_vol_and_greeks(
     );
 
     BlackScholesGreeksResult {
-        price: (greeks.price as f64),
-        vol: greeks.vol as f64,
-        delta: (greeks.delta as f64),
-        gamma: (greeks.gamma as f64),
-        vega: (greeks.vega as f64) * VEGA_PERCENT_FACTOR,
-        theta: (greeks.theta as f64) * THETA_DAILY_FACTOR,
-        itm_prob: greeks.itm_prob as f64,
+        price: f64::from(greeks.price),
+        vol: f64::from(greeks.vol),
+        delta: f64::from(greeks.delta),
+        gamma: f64::from(greeks.gamma),
+        vega: f64::from(greeks.vega) * VEGA_PERCENT_FACTOR,
+        theta: f64::from(greeks.theta) * THETA_DAILY_FACTOR,
+        itm_prob: f64::from(greeks.itm_prob),
     }
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct GreeksData {
     pub ts_init: UnixNanos,
     pub ts_event: UnixNanos,
@@ -291,7 +323,8 @@ pub struct GreeksData {
 }
 
 impl GreeksData {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         ts_init: UnixNanos,
         ts_event: UnixNanos,
@@ -334,6 +367,7 @@ impl GreeksData {
         }
     }
 
+    #[must_use]
     pub fn from_delta(
         instrument_id: InstrumentId,
         delta: f64,
@@ -460,6 +494,14 @@ impl HasTsInit for GreeksData {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct PortfolioGreeks {
     pub ts_init: UnixNanos,
     pub ts_event: UnixNanos,
@@ -469,7 +511,8 @@ pub struct PortfolioGreeks {
 }
 
 impl PortfolioGreeks {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         ts_init: UnixNanos,
         ts_event: UnixNanos,
@@ -592,6 +635,7 @@ pub struct YieldCurveData {
 }
 
 impl YieldCurveData {
+    #[must_use]
     pub fn new(
         ts_init: UnixNanos,
         ts_event: UnixNanos,
@@ -609,6 +653,7 @@ impl YieldCurveData {
     }
 
     // Interpolate the yield curve for a given expiry time
+    #[must_use]
     pub fn get_rate(&self, expiry_in_years: f64) -> f64 {
         if self.interest_rates.len() == 1 {
             return self.interest_rates[0];
@@ -662,7 +707,7 @@ mod tests {
             InstrumentId::from("SPY240315C00500000.OPRA"),
             true,
             500.0,
-            20240315,
+            20_240_315,
             91, // expiry_in_days (approximately 3 months)
             0.25,
             100.0,
@@ -912,7 +957,7 @@ mod tests {
         );
         assert!(greeks.is_call);
         assert_eq!(greeks.strike, 500.0);
-        assert_eq!(greeks.expiry, 20240315);
+        assert_eq!(greeks.expiry, 20_240_315);
         assert_eq!(greeks.expiry_in_years, 0.25);
         assert_eq!(greeks.multiplier, 100.0);
         assert_eq!(greeks.quantity, 1.0);
@@ -1254,7 +1299,7 @@ mod tests {
             InstrumentId::from("SPY240315P00480000.OPRA"),
             false, // Put option
             480.0,
-            20240315,
+            20_240_315,
             91, // expiry_in_days (approximately 3 months)
             0.25,
             100.0,
