@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,11 +13,13 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from nautilus_trader.examples.strategies.demo_strategy_cy import DemoStrategyCy
-from nautilus_trader.examples.strategies.demo_strategy_cy import DemoStrategyCyConfig
+from nautilus_trader.indicators.averages cimport MovingAverage
 
 
-__all__ = [
-    "DemoStrategyCy",
-    "DemoStrategyCyConfig",
-]
+cdef class ZeroLagExponentialMovingAverage(MovingAverage):
+    cdef readonly double alpha
+    """The moving average alpha value.\n\n:returns: `double`"""
+    cdef readonly int lag
+    """The lag period used for zero-lag calculation.\n\n:returns: `int`"""
+    cdef object _inputs
+    """The input values buffer for lag calculation.\n\n:returns: `deque`"""

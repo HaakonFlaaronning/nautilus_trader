@@ -23,10 +23,15 @@ use crate::{average::MovingAverageType, indicator::Indicator, momentum::bb::Boll
 impl BollingerBands {
     /// Creates a new `BollingerBands` instance.
     #[new]
-    #[pyo3(signature = (period, k, ma_type=None))]
+    #[pyo3(signature = (period, k, ma_type=None, use_close_only=None))]
     #[must_use]
-    pub fn py_new(period: usize, k: f64, ma_type: Option<MovingAverageType>) -> Self {
-        Self::new(period, k, ma_type)
+    pub fn py_new(
+        period: usize,
+        k: f64,
+        ma_type: Option<MovingAverageType>,
+        use_close_only: Option<bool>,
+    ) -> Self {
+        Self::new(period, k, ma_type, use_close_only)
     }
 
     fn __repr__(&self) -> String {
@@ -55,6 +60,12 @@ impl BollingerBands {
     #[pyo3(name = "k")]
     const fn py_k(&self) -> f64 {
         self.k
+    }
+
+    #[getter]
+    #[pyo3(name = "use_close_only")]
+    const fn py_use_close_only(&self) -> bool {
+        self.use_close_only
     }
 
     #[getter]

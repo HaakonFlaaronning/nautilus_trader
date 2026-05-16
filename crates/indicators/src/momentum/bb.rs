@@ -39,6 +39,7 @@ pub struct BollingerBands {
     pub period: usize,
     pub k: f64,
     pub ma_type: MovingAverageType,
+    pub use_close_only: bool,
     pub upper: f64,
     pub middle: f64,
     pub lower: f64,
@@ -52,11 +53,12 @@ impl Display for BollingerBands {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}({},{},{})",
+            "{}({},{},{},{})",
             self.name(),
             self.period,
             self.k,
             self.ma_type,
+            self.use_close_only,
         )
     }
 }
@@ -109,7 +111,12 @@ impl BollingerBands {
     /// - If `period` is `0` or greater than `MAX_PERIOD`.
     /// - If `k` is *not finite* or *≤ 0*.
     #[must_use]
-    pub fn new(period: usize, k: f64, ma_type: Option<MovingAverageType>) -> Self {
+    pub fn new(
+        period: usize,
+        k: f64,
+        ma_type: Option<MovingAverageType>,
+        use_close_only: Option<bool>,
+    ) -> Self {
         assert!(
             (1..=MAX_PERIOD).contains(&period),
             "BollingerBands: period {period} out of range (1..={MAX_PERIOD})"
@@ -123,6 +130,7 @@ impl BollingerBands {
             period,
             k,
             ma_type: ma_type.unwrap_or(MovingAverageType::Simple),
+            use_close_only: use_close_only.unwrap_or(false),
             ma: MovingAverageFactory::create(ma_type.unwrap_or(MovingAverageType::Simple), period),
             prices: ArrayDeque::new(),
             has_inputs: false,
@@ -134,7 +142,11 @@ impl BollingerBands {
     }
 
     pub fn update_raw(&mut self, high: f64, low: f64, close: f64) {
-        let typical = (high + low + close) / 3.0;
+        let typical = if self.use_close_only {
+            close
+        } else {
+            (high + low + close) / 3.0
+        };
 
         if self.prices.len() == self.period {
             let _ = self.prices.pop_front();
@@ -197,7 +209,7 @@ mod tests {
 
     #[rstest]
     fn test_str_repr_returns_expected_string(bb_10: BollingerBands) {
-        assert_eq!(format!("{bb_10}"), "BollingerBands(10,0.1,SIMPLE)");
+        assert_eq!(format!("{bb_10}"), "BollingerBands(10,0.1,SIMPLE,false)");
     }
 
     #[rstest]
@@ -252,24 +264,24 @@ mod tests {
     #[rstest]
     #[should_panic(expected = "k must be positive")]
     fn test_new_panics_on_zero_k() {
-        let _ = BollingerBands::new(10, 0.0, None);
+        let _ = BollingerBands::new(10, 0.0, None, None);
     }
 
     #[rstest]
     #[should_panic(expected = "k must be positive")]
     fn test_new_panics_on_negative_k() {
-        let _ = BollingerBands::new(10, -2.0, None);
+        let _ = BollingerBands::new(10, -2.0, None, None);
     }
 
     #[rstest]
     #[should_panic(expected = "k must be positive")]
     fn test_new_panics_on_nan_k() {
-        let _ = BollingerBands::new(10, f64::NAN, None);
+        let _ = BollingerBands::new(10, f64::NAN, None, None);
     }
 
     #[rstest]
     fn test_std_dev_uses_sliding_window() {
-        let mut bb = BollingerBands::new(3, 1.0, None);
+        let mut bb = BollingerBands::new(3, 1.0, None, None);
 
         for v in 1..=6 {
             bb.update_raw(f64::from(v), f64::from(v), f64::from(v));
