@@ -255,7 +255,8 @@ class NautilusKernel:
                     )
             elif self._environment == Environment.LIVE:
                 raise InvalidConfiguration(
-                    "`LoggingConfig.bypass_logging` was set `True` when not safe to bypass logging in a LIVE context",
+                    "`LoggingConfig.bypass_logging` was set `True` "
+                    "when not safe to bypass logging in a LIVE context",
                 )
 
         if logging.use_tracing and not nautilus_pyo3.tracing_is_initialized():
@@ -1238,7 +1239,8 @@ class NautilusKernel:
             except RuntimeError as e:
                 if "Event loop stopped before Future completed" in str(e):
                     self._log.warning(
-                        "Loop stopped during cleanup; some tasks may not be properly canceled or awaited",
+                        "Loop stopped during cleanup; some tasks may not "
+                        "be properly canceled or awaited",
                     )
                 else:
                     raise
@@ -1294,7 +1296,8 @@ class NautilusKernel:
 
     async def _await_engines_connected(self) -> bool:
         self._log.info(
-            f"Awaiting engine connections and initializations ({self._config.timeout_connection}s timeout)...",
+            f"Awaiting engine connections and initializations "
+            f"({self._config.timeout_connection}s timeout)...",
             color=LogColor.BLUE,
         )
 
@@ -1327,7 +1330,8 @@ class NautilusKernel:
 
     async def _await_execution_reconciliation(self) -> bool:
         self._log.info(
-            f"Awaiting execution state reconciliation ({self._config.timeout_reconciliation}s timeout)...",
+            f"Awaiting execution state reconciliation "
+            f"({self._config.timeout_reconciliation}s timeout)...",
             color=LogColor.BLUE,
         )
 
