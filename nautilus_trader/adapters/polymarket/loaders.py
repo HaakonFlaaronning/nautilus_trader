@@ -76,6 +76,13 @@ class PolymarketDataLoader:
     def _create_http_client() -> nautilus_pyo3.HttpClient:
         return nautilus_pyo3.HttpClient(
             default_quota=nautilus_pyo3.Quota.rate_per_minute(POLYMARKET_HTTP_RATE_LIMIT),
+            # Cloudflare 403s the default UA; send a browser-like User-Agent.
+            default_headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+            },
         )
 
     @staticmethod

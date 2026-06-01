@@ -1753,6 +1753,21 @@ class PolymarketExecutionClient(LiveExecutionClient):
                     color=LogColor.MAGENTA,
                 )
 
+            # auto_redeem is an off-book settlement notification (winning shares
+            # auto-cashed on-chain) not modelled by the user-message decoder.
+            # Peek the event_type and republish it on the msgbus so downstream
+            # consumers (e.g. trade loggers) get broker-truth settlement payout,
+            # instead of letting the decoder raise a ValidationError every window.
+            peek = msgspec.json.decode(raw)
+            if isinstance(peek, dict) and peek.get("event_type") == "auto_redeem":
+                self._msgbus.publish(topic="polymarket.auto_redeem", msg=peek)
+                self._log.info(
+                    f"auto_redeem condition={peek.get('condition_id')} "
+                    f"amount={peek.get('amount')} slug={peek.get('slug')}",
+                    LogColor.GREEN,
+                )
+                return
+
             msg = self._decoder_user_msg.decode(raw)
             if isinstance(msg, PolymarketUserOrder):
                 self._handle_ws_order_msg(msg, wait_for_ack=True)

@@ -48,10 +48,12 @@ from nautilus_trader.data.messages import RequestInstruments
 from nautilus_trader.data.messages import RequestQuoteTicks
 from nautilus_trader.data.messages import RequestTradeTicks
 from nautilus_trader.data.messages import SubscribeBars
+from nautilus_trader.data.messages import SubscribeInstruments
 from nautilus_trader.data.messages import SubscribeOrderBook
 from nautilus_trader.data.messages import SubscribeQuoteTicks
 from nautilus_trader.data.messages import SubscribeTradeTicks
 from nautilus_trader.data.messages import UnsubscribeBars
+from nautilus_trader.data.messages import UnsubscribeInstruments
 from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeTradeTicks
@@ -382,6 +384,15 @@ class PolymarketDataClient(LiveMarketDataClient):
         else:
             self._ws_client.add_subscription(token_id)
             self._schedule_delayed_connect()
+
+    async def _subscribe_instruments(self, command: SubscribeInstruments) -> None:
+        # No per-venue instrument stream: instruments are published to the data
+        # engine by the periodic refresh (`_send_all_instruments_to_data_engine`),
+        # which is what delivers newly-minted markets to subscribed actors.
+        pass
+
+    async def _unsubscribe_instruments(self, command: UnsubscribeInstruments) -> None:
+        pass
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         self._log.error(

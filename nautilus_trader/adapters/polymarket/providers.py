@@ -41,6 +41,14 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import BinaryOption
 
 
+# Cloudflare in front of gamma-api.polymarket.com 403s the HttpClient's default
+# User-Agent; a browser-like UA is allowed through.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
 class PolymarketInstrumentProviderConfig(InstrumentProviderConfig, frozen=True, kw_only=True):
     """
     Configuration for ``PolymarketInstrumentProvider`` instances.
@@ -94,7 +102,10 @@ class PolymarketInstrumentProvider(InstrumentProvider):
         super().__init__(config=config)
         self._clock = clock
         self._client = client
-        self._http_client = http_client or HttpClient(timeout_secs=30)
+        self._http_client = http_client or HttpClient(
+            timeout_secs=30,
+            default_headers={"User-Agent": _BROWSER_USER_AGENT},
+        )
 
         self._log_warnings = config.log_warnings if config else True
         self._decoder = msgspec.json.Decoder()
