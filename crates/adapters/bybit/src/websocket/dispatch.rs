@@ -43,15 +43,23 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::{
-    messages::{BybitWsAccountExecution, BybitWsAccountOrder, BybitWsMessage},
-    parse::{parse_millis_i64, parse_ws_account_state, parse_ws_position_status_report},
-};
-use crate::common::{
-    enums::BybitOrderStatus,
-    parse::{
-        make_bybit_symbol, parse_millis_timestamp, parse_price_with_precision,
-        parse_quantity_with_precision,
+    messages::{
+        BybitWsAccountExecution, BybitWsAccountExecutionFast, BybitWsAccountOrder, BybitWsMessage,
     },
+    parse::{
+        parse_millis_i64, parse_ws_account_state, parse_ws_fill_report_fast,
+        parse_ws_position_status_report,
+    },
+};
+use crate::{
+    common::{
+        enums::BybitOrderStatus,
+        parse::{
+            make_bybit_symbol, parse_millis_timestamp, parse_price_with_precision,
+            parse_quantity_with_precision,
+        },
+    },
+    http::error::is_bybit_ambiguous_order_error_code,
 };
 
 const DEDUP_CAPACITY: usize = 10_000;
@@ -59,6 +67,9 @@ const DEDUP_CAPACITY: usize = 10_000;
 const BYBIT_OP_ORDER_CREATE: &str = "order.create";
 const BYBIT_OP_ORDER_AMEND: &str = "order.amend";
 const BYBIT_OP_ORDER_CANCEL: &str = "order.cancel";
+const BYBIT_OP_ORDER_CREATE_BATCH: &str = "order.create-batch";
+const BYBIT_OP_ORDER_AMEND_BATCH: &str = "order.amend-batch";
+const BYBIT_OP_ORDER_CANCEL_BATCH: &str = "order.cancel-batch";
 
 /// Order identity context stored at submission time, used by the WS dispatch
 /// task to produce proper order events without Cache access.
@@ -188,6 +199,18 @@ pub fn dispatch_ws_message(
                     continue;
                 };
                 dispatch_execution_fill(exec, instrument, emitter, state, account_id, ts_init);
+            }
+        }
+        BybitWsMessage::AccountExecutionFast(msg) => {
+            let ts_init = clock.get_time_ns();
+
+            for exec in &msg.data {
+                let symbol = make_bybit_symbol(exec.symbol, exec.category);
+                let Some(instrument) = instruments.get(&symbol) else {
+                    log::warn!("No instrument for fast-execution update: {symbol}");
+                    continue;
+                };
+                dispatch_execution_fill_fast(exec, instrument, emitter, state, account_id, ts_init);
             }
         }
         BybitWsMessage::AccountWallet(msg) => {
@@ -628,6 +651,50 @@ fn dispatch_execution_fill(
     }
 }
 
+/// Dispatches a single fast-execution (fill) message.
+///
+/// The fast channel lacks fee and exec-type fields, so all fills route to
+/// [`FillReport`] with zero commission; liquidity side is derived from the
+/// payload's `isMaker` flag. Subscribe to the standard `execution` channel
+/// for full fill metadata (e.g. fees).
+fn dispatch_execution_fill_fast(
+    exec: &BybitWsAccountExecutionFast,
+    instrument: &InstrumentAny,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+) {
+    let client_order_id = if exec.order_link_id.is_empty() {
+        None
+    } else {
+        Some(ClientOrderId::new(exec.order_link_id.as_str()))
+    };
+
+    let mut venue_position_id = None;
+
+    if let Some(cid) = client_order_id.as_ref()
+        && let Some(identity) = state.order_identities.get(cid).map(|r| r.clone())
+    {
+        venue_position_id = identity.venue_position_id;
+        let venue_order_id = VenueOrderId::new(exec.order_id.as_str());
+        ensure_accepted_emitted(
+            *cid,
+            account_id,
+            venue_order_id,
+            &identity,
+            emitter,
+            state,
+            ts_init,
+        );
+    }
+
+    match parse_ws_fill_report_fast(exec, account_id, instrument, venue_position_id, ts_init) {
+        Ok(report) => emitter.send_fill_report(report),
+        Err(e) => log::error!("Failed to parse fast fill report: {e}"),
+    }
+}
+
 /// Parses a Bybit execution message directly into an [`OrderFilled`] event.
 fn parse_order_filled(
     exec: &BybitWsAccountExecution,
@@ -696,7 +763,7 @@ fn parse_order_filled(
     ))
 }
 
-/// Handles a Bybit WS order response, emitting rejection events for failures.
+/// Handles a Bybit WS order command response.
 fn dispatch_order_response(
     resp: &super::messages::BybitWsOrderResponse,
     emitter: &ExecutionEventEmitter,
@@ -717,6 +784,15 @@ fn dispatch_order_response(
 
             for (idx, error) in batch_errors.iter().enumerate() {
                 if error.code == 0 {
+                    continue;
+                }
+
+                if is_bybit_ambiguous_order_error_code(error.code) {
+                    log::error!(
+                        "Ambiguous batch order item failure at index {idx}: code={}, msg={}; awaiting reconciliation",
+                        error.code,
+                        error.msg,
+                    );
                     continue;
                 }
 
@@ -767,6 +843,30 @@ fn dispatch_order_response(
         .and_then(|rid| state.pending_requests.remove(rid))
         .map(|(_, v)| v);
 
+    let is_batch_response = is_batch_order_op(resp.op.as_str())
+        || pending.as_ref().is_some_and(|(cids, _, _)| cids.len() > 1);
+
+    if is_batch_response {
+        let order_count = pending.as_ref().map_or(0, |(cids, _, _)| cids.len());
+        log::error!(
+            "Ambiguous batch order response failure for {order_count} orders: op={}, ret_code={}, ret_msg={}; awaiting reconciliation",
+            resp.op,
+            resp.ret_code,
+            resp.ret_msg,
+        );
+        return;
+    }
+
+    if is_bybit_ambiguous_order_error_code(resp.ret_code) {
+        log::error!(
+            "Ambiguous order response failure: op={}, ret_code={}, ret_msg={}; awaiting reconciliation",
+            resp.op,
+            resp.ret_code,
+            resp.ret_msg,
+        );
+        return;
+    }
+
     let effective_op = pending
         .as_ref()
         .map(|(_, _, op)| *op)
@@ -775,33 +875,6 @@ fn dispatch_order_response(
             log::warn!("Unknown order operation '{}', defaulting to Place", resp.op);
             PendingOperation::Place
         });
-
-    // For batch rejections (ret_code != 0), emit rejections for ALL orders
-    if let Some((cids, voids, _)) = &pending
-        && cids.len() > 1
-    {
-        for (idx, cid) in cids.iter().enumerate() {
-            let Some(identity) = state.order_identities.get(cid).map(|r| r.clone()) else {
-                log::warn!(
-                    "Batch reject for untracked order: client_order_id={cid}, ret_msg={}",
-                    resp.ret_msg,
-                );
-                continue;
-            };
-            let void = voids.get(idx).and_then(|v| *v);
-            emit_rejection_for_op(
-                &effective_op,
-                *cid,
-                &identity,
-                void,
-                &resp.ret_msg,
-                emitter,
-                state,
-                ts_init,
-            );
-        }
-        return;
-    }
 
     // Single-order rejection path
     let client_order_id = extract_order_link_id_from_data(&resp.data).or_else(|| {
@@ -908,6 +981,13 @@ fn pending_op_from_str(op: &str) -> Option<PendingOperation> {
         BYBIT_OP_ORDER_AMEND => Some(PendingOperation::Amend),
         _ => None,
     }
+}
+
+fn is_batch_order_op(op: &str) -> bool {
+    matches!(
+        op,
+        BYBIT_OP_ORDER_CREATE_BATCH | BYBIT_OP_ORDER_AMEND_BATCH | BYBIT_OP_ORDER_CANCEL_BATCH
+    )
 }
 
 /// Parses an order snapshot from a WS order message for modification detection.
@@ -1035,7 +1115,9 @@ mod tests {
     use nautilus_model::{
         enums::{AccountType, OrderSide, OrderType},
         events::OrderEventAny,
-        identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId, VenueOrderId,
+        },
         instruments::{Instrument, InstrumentAny},
     };
     use rstest::rstest;
@@ -1043,9 +1125,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::{parse::parse_linear_instrument, testing::load_test_json},
+        common::{
+            enums::{BybitOrderSide, BybitProductType},
+            parse::parse_linear_instrument,
+            testing::load_test_json,
+        },
         http::models::{BybitFeeRate, BybitInstrumentLinearResponse},
-        websocket::messages::BybitWsMessage,
+        websocket::messages::{
+            BybitWsAccountExecutionFastMsg, BybitWsMessage, BybitWsOrderResponse,
+        },
     };
 
     fn sample_fee_rate(
@@ -1274,6 +1362,108 @@ mod tests {
                 assert_eq!(filled.position_id, Some(venue_position_id));
             }
             other => panic!("Expected Filled event, found {other:?}"),
+        }
+    }
+
+    fn fast_execution_msg(is_maker: bool, order_link_id: &str) -> BybitWsAccountExecutionFastMsg {
+        BybitWsAccountExecutionFastMsg {
+            topic: Ustr::from("execution.fast"),
+            id: String::new(),
+            creation_time: 1_716_800_399_338,
+            data: vec![BybitWsAccountExecutionFast {
+                category: BybitProductType::Linear,
+                symbol: Ustr::from("BTCUSDT"),
+                exec_id: "fast-1".to_string(),
+                exec_price: "50000.0".to_string(),
+                exec_qty: "0.5".to_string(),
+                order_id: Ustr::from("ord-1"),
+                order_link_id: Ustr::from(order_link_id),
+                side: BybitOrderSide::Buy,
+                exec_time: "1716800399334".to_string(),
+                is_maker,
+                seq: 42,
+            }],
+        }
+    }
+
+    #[rstest]
+    fn test_dispatch_tracked_fast_execution_preserves_venue_position_id() {
+        let instrument = linear_instrument();
+        let instruments = build_instruments(std::slice::from_ref(&instrument));
+        let (emitter, mut rx) = create_emitter();
+        let clock = get_atomic_clock_realtime();
+        let state = WsDispatchState::default();
+        let venue_position_id = PositionId::from("BTCUSDT-LINEAR.BYBIT-LONG");
+
+        // Taker fast fill (orderLinkId populated) so the identity lookup hits.
+        let msg = fast_execution_msg(false, "link-1");
+        let cid = ClientOrderId::new(msg.data[0].order_link_id.as_str());
+        state.order_identities.insert(
+            cid,
+            OrderIdentity {
+                venue_position_id: Some(venue_position_id),
+                ..default_identity()
+            },
+        );
+
+        let ws_msg = BybitWsMessage::AccountExecutionFast(msg);
+        dispatch_ws_message(
+            &ws_msg,
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            clock,
+        );
+
+        // First event: synthesized OrderAccepted from the identity hit.
+        let event1 = rx.try_recv().unwrap();
+        assert!(
+            matches!(event1, ExecutionEvent::Order(OrderEventAny::Accepted(_))),
+            "Expected Accepted, found {event1:?}",
+        );
+
+        // Second event: FillReport carrying the hedge venue_position_id.
+        let event2 = rx.try_recv().unwrap();
+        match event2 {
+            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+                assert_eq!(report.venue_position_id, Some(venue_position_id));
+                assert_eq!(report.client_order_id, Some(cid));
+            }
+            other => panic!("Expected FillReport, found {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_dispatch_untracked_fast_execution_emits_fill_report_without_position() {
+        let instrument = linear_instrument();
+        let instruments = build_instruments(std::slice::from_ref(&instrument));
+        let (emitter, mut rx) = create_emitter();
+        let clock = get_atomic_clock_realtime();
+        let state = WsDispatchState::default();
+
+        // Maker fast fill: orderLinkId is empty per venue docs, so no identity lookup.
+        let msg = fast_execution_msg(true, "");
+        let ws_msg = BybitWsMessage::AccountExecutionFast(msg);
+        dispatch_ws_message(
+            &ws_msg,
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            clock,
+        );
+
+        // No OrderAccepted is synthesized for untracked fills.
+        let event = rx.try_recv().unwrap();
+        match event {
+            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+                assert_eq!(report.client_order_id, None);
+                assert_eq!(report.venue_position_id, None);
+                assert_eq!(report.liquidity_side, LiquiditySide::Maker);
+                assert_eq!(report.commission.as_f64(), 0.0);
+            }
+            other => panic!("Expected FillReport, found {other:?}"),
         }
     }
 
@@ -1625,6 +1815,340 @@ mod tests {
 
         assert!(!ctx.state.order_identities.contains_key(&cid));
         assert!(!ctx.state.order_snapshots.contains_key(&cid));
+    }
+
+    fn order_response(
+        op: &str,
+        ret_code: i64,
+        ret_msg: &str,
+        req_id: &str,
+        data: serde_json::Value,
+        ret_ext_info: Option<serde_json::Value>,
+    ) -> BybitWsOrderResponse {
+        BybitWsOrderResponse {
+            op: Ustr::from(op),
+            conn_id: Some("test-conn-id".to_string()),
+            ret_code,
+            ret_msg: ret_msg.to_string(),
+            data,
+            req_id: Some(req_id.to_string()),
+            header: None,
+            ret_ext_info,
+        }
+    }
+
+    #[rstest]
+    fn test_dispatch_single_cancel_rejection_emits_cancel_rejected() {
+        let mut ctx = DispatchTestContext::new();
+        let cid = ClientOrderId::from("cancel-reject-1");
+        let venue_order_id = VenueOrderId::from("venue-cancel-1");
+        ctx.state.order_identities.insert(cid, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-cancel".to_string(),
+            (
+                vec![cid],
+                vec![Some(venue_order_id)],
+                PendingOperation::Cancel,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_CANCEL,
+            110001,
+            "Order does not exist.",
+            "req-cancel",
+            serde_json::json!({
+                "orderId": venue_order_id.to_string(),
+                "orderLinkId": cid.to_string(),
+            }),
+            None,
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        let event = ctx.rx.try_recv().expect("expected CancelRejected event");
+        assert!(
+            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected)) if rejected.client_order_id == cid),
+            "Expected CancelRejected for {cid}, found {event:?}"
+        );
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no extra events for single cancel rejection"
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_single_modify_rejection_emits_modify_rejected() {
+        let mut ctx = DispatchTestContext::new();
+        let cid = ClientOrderId::from("modify-reject-1");
+        let venue_order_id = VenueOrderId::from("venue-modify-1");
+        ctx.state.order_identities.insert(cid, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-modify".to_string(),
+            (
+                vec![cid],
+                vec![Some(venue_order_id)],
+                PendingOperation::Amend,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_AMEND,
+            110003,
+            "Order price exceeds allowable range.",
+            "req-modify",
+            serde_json::json!({
+                "orderId": venue_order_id.to_string(),
+                "orderLinkId": cid.to_string(),
+            }),
+            None,
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        let event = ctx.rx.try_recv().expect("expected ModifyRejected event");
+        assert!(
+            matches!(event, ExecutionEvent::Order(OrderEventAny::ModifyRejected(ref rejected)) if rejected.client_order_id == cid),
+            "Expected ModifyRejected for {cid}, found {event:?}"
+        );
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no extra events for single modify rejection"
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_single_cancel_rate_limit_keeps_outcome_unresolved() {
+        let mut ctx = DispatchTestContext::new();
+        let cid = ClientOrderId::from("cancel-rate-limit-1");
+        let venue_order_id = VenueOrderId::from("venue-cancel-rate-limit-1");
+        ctx.state.order_identities.insert(cid, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-cancel-rate-limit".to_string(),
+            (
+                vec![cid],
+                vec![Some(venue_order_id)],
+                PendingOperation::Cancel,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_CANCEL,
+            10429,
+            "System level frequency protection.",
+            "req-cancel-rate-limit",
+            serde_json::json!({
+                "orderId": venue_order_id.to_string(),
+                "orderLinkId": cid.to_string(),
+            }),
+            None,
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no CancelRejected event for rate-limit response"
+        );
+        assert!(ctx.state.order_identities.contains_key(&cid));
+    }
+
+    #[rstest]
+    fn test_dispatch_single_modify_server_error_keeps_outcome_unresolved() {
+        let mut ctx = DispatchTestContext::new();
+        let cid = ClientOrderId::from("modify-server-error-1");
+        let venue_order_id = VenueOrderId::from("venue-modify-server-error-1");
+        ctx.state.order_identities.insert(cid, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-modify-server-error".to_string(),
+            (
+                vec![cid],
+                vec![Some(venue_order_id)],
+                PendingOperation::Amend,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_AMEND,
+            10016,
+            "Internal server error.",
+            "req-modify-server-error",
+            serde_json::json!({
+                "orderId": venue_order_id.to_string(),
+                "orderLinkId": cid.to_string(),
+            }),
+            None,
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no ModifyRejected event for server error response"
+        );
+        assert!(ctx.state.order_identities.contains_key(&cid));
+    }
+
+    #[rstest]
+    fn test_dispatch_batch_cancel_top_level_failure_does_not_emit_cancel_rejected() {
+        let mut ctx = DispatchTestContext::new();
+        let cid_1 = ClientOrderId::from("batch-cancel-1");
+        let cid_2 = ClientOrderId::from("batch-cancel-2");
+        ctx.state.order_identities.insert(cid_1, default_identity());
+        ctx.state.order_identities.insert(cid_2, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-batch-cancel".to_string(),
+            (
+                vec![cid_1, cid_2],
+                vec![
+                    Some(VenueOrderId::from("venue-batch-1")),
+                    Some(VenueOrderId::from("venue-batch-2")),
+                ],
+                PendingOperation::Cancel,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_CANCEL_BATCH,
+            10016,
+            "Internal server error.",
+            "req-batch-cancel",
+            serde_json::json!({}),
+            None,
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no CancelRejected events for ambiguous batch failure"
+        );
+        assert!(ctx.state.order_identities.contains_key(&cid_1));
+        assert!(ctx.state.order_identities.contains_key(&cid_2));
+    }
+
+    #[rstest]
+    fn test_dispatch_single_item_batch_cancel_top_level_failure_does_not_emit_cancel_rejected() {
+        let mut ctx = DispatchTestContext::new();
+        let cid = ClientOrderId::from("batch-cancel-single");
+        ctx.state.order_identities.insert(cid, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-batch-cancel-single".to_string(),
+            (
+                vec![cid],
+                vec![Some(VenueOrderId::from("venue-batch-single"))],
+                PendingOperation::Cancel,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_CANCEL_BATCH,
+            10016,
+            "Internal server error.",
+            "req-batch-cancel-single",
+            serde_json::json!({}),
+            None,
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no CancelRejected event for ambiguous one-item batch failure"
+        );
+        assert!(ctx.state.order_identities.contains_key(&cid));
+    }
+
+    #[rstest]
+    fn test_dispatch_batch_cancel_per_item_error_emits_only_failed_item() {
+        let mut ctx = DispatchTestContext::new();
+        let cid_1 = ClientOrderId::from("batch-cancel-ok");
+        let cid_2 = ClientOrderId::from("batch-cancel-reject");
+        ctx.state.order_identities.insert(cid_1, default_identity());
+        ctx.state.order_identities.insert(cid_2, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-batch-mixed".to_string(),
+            (
+                vec![cid_1, cid_2],
+                vec![
+                    Some(VenueOrderId::from("venue-batch-ok")),
+                    Some(VenueOrderId::from("venue-batch-reject")),
+                ],
+                PendingOperation::Cancel,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_CANCEL_BATCH,
+            0,
+            "OK",
+            "req-batch-mixed",
+            serde_json::json!({
+                "list": [
+                    {"orderId": "venue-batch-ok", "orderLinkId": cid_1.to_string()},
+                    {"orderId": "venue-batch-reject", "orderLinkId": cid_2.to_string()}
+                ]
+            }),
+            Some(serde_json::json!({
+                "list": [
+                    {"code": 0, "msg": "OK"},
+                    {"code": 170213, "msg": "Order does not exist."}
+                ]
+            })),
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        let event = ctx.rx.try_recv().expect("expected CancelRejected event");
+        assert!(
+            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected)) if rejected.client_order_id == cid_2),
+            "Expected CancelRejected for failed batch item {cid_2}, found {event:?}"
+        );
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no CancelRejected event for successful batch item"
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_batch_cancel_per_item_rate_limit_keeps_outcome_unresolved() {
+        let mut ctx = DispatchTestContext::new();
+        let cid = ClientOrderId::from("batch-cancel-rate-limit");
+        let venue_order_id = VenueOrderId::from("venue-batch-rate-limit");
+        ctx.state.order_identities.insert(cid, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-batch-rate-limit".to_string(),
+            (
+                vec![cid],
+                vec![Some(venue_order_id)],
+                PendingOperation::Cancel,
+            ),
+        );
+
+        let response = order_response(
+            BYBIT_OP_ORDER_CANCEL_BATCH,
+            0,
+            "OK",
+            "req-batch-rate-limit",
+            serde_json::json!({
+                "list": [
+                    {"orderId": venue_order_id.to_string(), "orderLinkId": cid.to_string()}
+                ]
+            }),
+            Some(serde_json::json!({
+                "list": [
+                    {"code": 10006, "msg": "Too many visits."}
+                ]
+            })),
+        );
+
+        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
+
+        assert!(
+            ctx.rx.try_recv().is_err(),
+            "Expected no CancelRejected event for per-item rate-limit response"
+        );
+        assert!(ctx.state.order_identities.contains_key(&cid));
     }
 
     #[rstest]

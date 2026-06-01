@@ -13,9 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    str::FromStr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ahash::AHashMap;
@@ -39,12 +42,12 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, Params, UnixNanos,
+    AtomicMap, MUTEX_POISONED, Params, UnixNanos,
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Bar, BarType, BookOrder, Data, FundingRateUpdate, OrderBookDeltas_API},
+    data::{Bar, BarType, BookOrder, Data, DataType, FundingRateUpdate, OrderBookDeltas_API},
     enums::{BarAggregation, BookType, OrderSide},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -66,28 +69,22 @@ use crate::{
     data_types::register_hyperliquid_custom_data,
     http::{
         client::HyperliquidHttpClient,
-        models::{HyperliquidCandle, HyperliquidFundingHistoryEntry},
+        models::{HyperliquidCandle, HyperliquidFundingHistoryEntry, HyperliquidL2Book},
     },
-    websocket::{
-        client::HyperliquidWebSocketClient,
-        messages::{HyperliquidWsMessage, NautilusWsMessage},
-        parse::{
-            parse_ws_candle, parse_ws_order_book_deltas, parse_ws_quote_tick, parse_ws_trade_tick,
-        },
-    },
+    websocket::{client::HyperliquidWebSocketClient, messages::NautilusWsMessage},
 };
 
 #[derive(Debug)]
 pub struct HyperliquidDataClient {
     clock: &'static AtomicTime,
     client_id: ClientId,
-    #[allow(dead_code)]
     config: HyperliquidDataClientConfig,
     http_client: HyperliquidHttpClient,
     ws_client: HyperliquidWebSocketClient,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     coin_to_instrument_id: Arc<AtomicMap<Ustr, InstrumentId>>,
@@ -145,15 +142,56 @@ impl HyperliquidDataClient {
             ws_client,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
-            tasks: Vec::new(),
+            ws_stream_handle: Mutex::new(None),
+            pending_tasks: Mutex::new(Vec::new()),
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
             coin_to_instrument_id: Arc::new(AtomicMap::new()),
         })
     }
 
+    fn spawn_task<F>(&self, description: &'static str, fut: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let runtime = get_runtime();
+        let handle = runtime.spawn(async move {
+            if let Err(e) = fut.await {
+                log::warn!("{description} failed: {e:?}");
+            }
+        });
+
+        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
+        tasks.retain(|handle| !handle.is_finished());
+        tasks.push(handle);
+    }
+
+    fn abort_pending_tasks(&self) {
+        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+    }
+
     fn venue(&self) -> Venue {
         *HYPERLIQUID_VENUE
+    }
+
+    fn custom_instrument_id(data_type: &DataType) -> anyhow::Result<Option<InstrumentId>> {
+        let Some(raw_instrument_id) = data_type
+            .metadata()
+            .and_then(|m| m.get("instrument_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let instrument_id = InstrumentId::from_str(raw_instrument_id)
+            .with_context(|| format!("invalid instrument_id metadata `{raw_instrument_id}`"))?;
+
+        Ok(Some(instrument_id))
     }
 
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
@@ -176,7 +214,26 @@ impl HyperliquidDataClient {
         });
 
         for instrument in &instruments {
+            self.http_client.cache_instrument(instrument);
             self.ws_client.cache_instrument(instrument.clone());
+        }
+
+        match self
+            .http_client
+            .build_all_dex_asset_ctxs_instrument_ids()
+            .await
+        {
+            Ok(mapping) => {
+                let mapping = mapping
+                    .into_iter()
+                    .map(|(dex, instrument_ids)| (Ustr::from(dex.as_str()), instrument_ids))
+                    .collect();
+                self.ws_client
+                    .cache_all_dex_asset_ctxs_instrument_ids(mapping);
+            }
+            Err(e) => {
+                log::warn!("Failed to build Hyperliquid allDexsAssetCtxs mapping: {e}");
+            }
         }
 
         log::info!(
@@ -303,170 +360,11 @@ impl HyperliquidDataClient {
             log::info!("Hyperliquid WebSocket consumption loop finished");
         });
 
-        self.tasks.push(task);
+        let mut slot = self.ws_stream_handle.lock().expect(MUTEX_POISONED);
+        *slot = Some(task);
         log::info!("WebSocket consumption task spawned");
 
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn handle_ws_message(
-        msg: HyperliquidWsMessage,
-        ws_client: &HyperliquidWebSocketClient,
-        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-        instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-        coin_to_instrument_id: &Arc<AtomicMap<Ustr, InstrumentId>>,
-        _venue: Venue,
-        clock: &'static AtomicTime,
-    ) {
-        match msg {
-            HyperliquidWsMessage::Bbo { data } => {
-                let coin = data.coin;
-                log::debug!("Received BBO message for coin: {coin}");
-
-                let coin_map = coin_to_instrument_id.load();
-                let instrument_id = coin_map.get(&data.coin);
-
-                if let Some(&instrument_id) = instrument_id {
-                    let instruments_map = instruments.load();
-                    if let Some(instrument) = instruments_map.get(&instrument_id) {
-                        let ts_init = clock.get_time_ns();
-
-                        match parse_ws_quote_tick(&data, instrument, ts_init) {
-                            Ok(quote_tick) => {
-                                log::debug!(
-                                    "Parsed quote tick for {}: bid={}, ask={}",
-                                    data.coin,
-                                    quote_tick.bid_price,
-                                    quote_tick.ask_price
-                                );
-
-                                if let Err(e) =
-                                    data_sender.send(DataEvent::Data(Data::Quote(quote_tick)))
-                                {
-                                    log::error!("Failed to send quote tick: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to parse quote tick for {}: {e}", data.coin);
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!(
-                        "Received BBO for unknown coin: {} (no matching instrument found)",
-                        data.coin
-                    );
-                }
-            }
-            HyperliquidWsMessage::Trades { data } => {
-                let count = data.len();
-                log::debug!("Received {count} trade(s)");
-
-                for trade_data in data {
-                    let coin = trade_data.coin;
-                    let coin_map = coin_to_instrument_id.load();
-
-                    if let Some(&instrument_id) = coin_map.get(&coin) {
-                        let instruments_map = instruments.load();
-                        if let Some(instrument) = instruments_map.get(&instrument_id) {
-                            let ts_init = clock.get_time_ns();
-
-                            match parse_ws_trade_tick(&trade_data, instrument, ts_init) {
-                                Ok(trade_tick) => {
-                                    if let Err(e) =
-                                        data_sender.send(DataEvent::Data(Data::Trade(trade_tick)))
-                                    {
-                                        log::error!("Failed to send trade tick: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to parse trade tick for {coin}: {e}");
-                                }
-                            }
-                        }
-                    } else {
-                        log::warn!("Received trade for unknown coin: {coin}");
-                    }
-                }
-            }
-            HyperliquidWsMessage::L2Book { data } => {
-                let coin = data.coin;
-                log::debug!("Received L2 book update for coin: {coin}");
-
-                let coin_map = coin_to_instrument_id.load();
-                if let Some(&instrument_id) = coin_map.get(&data.coin) {
-                    let instruments_map = instruments.load();
-                    if let Some(instrument) = instruments_map.get(&instrument_id) {
-                        let ts_init = clock.get_time_ns();
-
-                        match parse_ws_order_book_deltas(&data, instrument, ts_init) {
-                            Ok(deltas) => {
-                                if let Err(e) = data_sender.send(DataEvent::Data(Data::Deltas(
-                                    OrderBookDeltas_API::new(deltas),
-                                ))) {
-                                    log::error!("Failed to send order book deltas: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to parse order book deltas for {}: {e}",
-                                    data.coin
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!("Received L2 book for unknown coin: {coin}");
-                }
-            }
-            HyperliquidWsMessage::Candle { data } => {
-                let coin = &data.s;
-                let interval = &data.i;
-                log::debug!("Received candle for {coin}:{interval}");
-
-                if let Some(bar_type) = ws_client.get_bar_type(&data.s, &data.i) {
-                    let coin = Ustr::from(&data.s);
-                    let coin_map = coin_to_instrument_id.load();
-
-                    if let Some(&instrument_id) = coin_map.get(&coin) {
-                        let instruments_map = instruments.load();
-                        if let Some(instrument) = instruments_map.get(&instrument_id) {
-                            let ts_init = clock.get_time_ns();
-
-                            match parse_ws_candle(&data, instrument, &bar_type, ts_init) {
-                                Ok(bar) => {
-                                    if let Err(e) =
-                                        data_sender.send(DataEvent::Data(Data::Bar(bar)))
-                                    {
-                                        log::error!("Failed to send bar data: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to parse candle for {coin}: {e}");
-                                }
-                            }
-                        }
-                    } else {
-                        log::warn!("Received candle for unknown coin: {coin}");
-                    }
-                } else {
-                    log::debug!("Received candle for {coin}:{interval} but no BarType tracked");
-                }
-            }
-            _ => {
-                log::trace!("Received unhandled WebSocket message: {msg:?}");
-            }
-        }
-    }
-}
-
-impl HyperliquidDataClient {
-    #[allow(dead_code)]
-    fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
-        if let Err(e) = sender.send(DataEvent::Data(data)) {
-            log::error!("Failed to emit data event: {e}");
-        }
     }
 }
 
@@ -501,7 +399,11 @@ impl DataClient for HyperliquidDataClient {
         log::debug!("Resetting Hyperliquid data client {}", self.client_id);
         self.is_connected.store(false, Ordering::Relaxed);
         self.cancellation_token = CancellationToken::new();
-        self.tasks.clear();
+        self.abort_pending_tasks();
+
+        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+            handle.abort();
+        }
         Ok(())
     }
 
@@ -521,6 +423,10 @@ impl DataClient for HyperliquidDataClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
         if self.is_connected() {
             return Ok(());
+        }
+
+        if self.cancellation_token.is_cancelled() {
+            self.cancellation_token = CancellationToken::new();
         }
 
         register_hyperliquid_custom_data();
@@ -553,11 +459,14 @@ impl DataClient for HyperliquidDataClient {
 
         self.cancellation_token.cancel();
 
-        for task in self.tasks.drain(..) {
-            if let Err(e) = task.await {
-                log::error!("Error waiting for task to complete: {e}");
-            }
+        let ws_stream_handle = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take();
+        if let Some(handle) = ws_stream_handle
+            && let Err(e) = handle.await
+        {
+            log::error!("Error waiting for WebSocket stream task: {e}");
         }
+
+        self.abort_pending_tasks();
 
         if let Err(e) = self.ws_client.disconnect().await {
             log::error!("Error disconnecting WebSocket client: {e}");
@@ -588,10 +497,31 @@ impl DataClient for HyperliquidDataClient {
 
             log::debug!("Subscribing to all mids (dex: {:?})", dex.as_deref());
 
-            get_runtime().spawn(async move {
-                if let Err(e) = ws.subscribe_all_mids_with_dex(dex.as_deref()).await {
-                    log::error!("Failed to subscribe to all mids (dex: {dex:?}): {e:?}");
-                }
+            self.spawn_task("subscribe_all_mids", async move {
+                ws.subscribe_all_mids_with_dex(dex.as_deref()).await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidAllDexsAssetCtxs" {
+            let ws = self.ws_client.clone();
+
+            self.spawn_task("subscribe_all_dexs_asset_ctxs", async move {
+                ws.subscribe_all_dexs_asset_ctxs().await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidOpenInterest" {
+            let ws = self.ws_client.clone();
+            let instrument_id = Self::custom_instrument_id(&cmd.data_type)?.context(
+                "HyperliquidOpenInterest subscriptions require metadata['instrument_id']",
+            )?;
+
+            self.spawn_task("subscribe_open_interest", async move {
+                ws.subscribe_open_interest(instrument_id).await
             });
 
             return Ok(());
@@ -618,10 +548,31 @@ impl DataClient for HyperliquidDataClient {
 
             log::debug!("Unsubscribing from all mids (dex: {:?})", dex.as_deref());
 
-            get_runtime().spawn(async move {
-                if let Err(e) = ws.unsubscribe_all_mids_with_dex(dex.as_deref()).await {
-                    log::error!("Failed to unsubscribe from all mids (dex: {dex:?}): {e:?}");
-                }
+            self.spawn_task("unsubscribe_all_mids", async move {
+                ws.unsubscribe_all_mids_with_dex(dex.as_deref()).await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidAllDexsAssetCtxs" {
+            let ws = self.ws_client.clone();
+
+            self.spawn_task("unsubscribe_all_dexs_asset_ctxs", async move {
+                ws.unsubscribe_all_dexs_asset_ctxs().await
+            });
+
+            return Ok(());
+        }
+
+        if data_type == "HyperliquidOpenInterest" {
+            let ws = self.ws_client.clone();
+            let instrument_id = Self::custom_instrument_id(&cmd.data_type)?.context(
+                "HyperliquidOpenInterest unsubscriptions require metadata['instrument_id']",
+            )?;
+
+            self.spawn_task("unsubscribe_open_interest", async move {
+                ws.unsubscribe_open_interest(instrument_id).await
             });
 
             return Ok(());
@@ -657,13 +608,9 @@ impl DataClient for HyperliquidDataClient {
         let instrument_id = subscription.instrument_id;
         let (n_sig_figs, mantissa) = parse_book_precision_params(subscription.params.as_ref())?;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws
-                .subscribe_book_with_options(instrument_id, n_sig_figs, mantissa)
+        self.spawn_task("subscribe_book_deltas", async move {
+            ws.subscribe_book_with_options(instrument_id, n_sig_figs, mantissa)
                 .await
-            {
-                log::error!("Failed to subscribe to book deltas: {e:?}");
-            }
         });
 
         Ok(())
@@ -683,13 +630,9 @@ impl DataClient for HyperliquidDataClient {
         let instrument_id = subscription.instrument_id;
         let (n_sig_figs, mantissa) = parse_book_precision_params(subscription.params.as_ref())?;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws
-                .subscribe_book_depth10_with_options(instrument_id, n_sig_figs, mantissa)
+        self.spawn_task("subscribe_book_depth10", async move {
+            ws.subscribe_book_depth10_with_options(instrument_id, n_sig_figs, mantissa)
                 .await
-            {
-                log::error!("Failed to subscribe to book depth10: {e:?}");
-            }
         });
 
         Ok(())
@@ -701,10 +644,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = subscription.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_quotes(instrument_id).await {
-                log::error!("Failed to subscribe to quotes: {e:?}");
-            }
+        self.spawn_task("subscribe_quotes", async move {
+            ws.subscribe_quotes(instrument_id).await
         });
 
         Ok(())
@@ -716,10 +657,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = subscription.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_trades(instrument_id).await {
-                log::error!("Failed to subscribe to trades: {e:?}");
-            }
+        self.spawn_task("subscribe_trades", async move {
+            ws.subscribe_trades(instrument_id).await
         });
 
         Ok(())
@@ -729,10 +668,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_mark_prices(instrument_id).await {
-                log::error!("Failed to subscribe to mark prices: {e:?}");
-            }
+        self.spawn_task("subscribe_mark_prices", async move {
+            ws.subscribe_mark_prices(instrument_id).await
         });
 
         Ok(())
@@ -742,10 +679,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_index_prices(instrument_id).await {
-                log::error!("Failed to subscribe to index prices: {e:?}");
-            }
+        self.spawn_task("subscribe_index_prices", async move {
+            ws.subscribe_index_prices(instrument_id).await
         });
 
         Ok(())
@@ -755,10 +690,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_funding_rates(instrument_id).await {
-                log::error!("Failed to subscribe to funding rates: {e:?}");
-            }
+        self.spawn_task("subscribe_funding_rates", async move {
+            ws.subscribe_funding_rates(instrument_id).await
         });
 
         Ok(())
@@ -775,10 +708,8 @@ impl DataClient for HyperliquidDataClient {
         let bar_type = subscription.bar_type;
         let ws = self.ws_client.clone();
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_bars(bar_type).await {
-                log::error!("Failed to subscribe to bars: {e:?}");
-            }
+        self.spawn_task("subscribe_bars", async move {
+            ws.subscribe_bars(bar_type).await
         });
 
         Ok(())
@@ -796,10 +727,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = unsubscription.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_book(instrument_id).await {
-                log::error!("Failed to unsubscribe from book deltas: {e:?}");
-            }
+        self.spawn_task("unsubscribe_book_deltas", async move {
+            ws.unsubscribe_book(instrument_id).await
         });
 
         Ok(())
@@ -817,10 +746,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = unsubscription.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_book_depth10(instrument_id).await {
-                log::error!("Failed to unsubscribe from book depth10: {e:?}");
-            }
+        self.spawn_task("unsubscribe_book_depth10", async move {
+            ws.unsubscribe_book_depth10(instrument_id).await
         });
 
         Ok(())
@@ -835,10 +762,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = unsubscription.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_quotes(instrument_id).await {
-                log::error!("Failed to unsubscribe from quotes: {e:?}");
-            }
+        self.spawn_task("unsubscribe_quotes", async move {
+            ws.unsubscribe_quotes(instrument_id).await
         });
 
         Ok(())
@@ -853,10 +778,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = unsubscription.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_trades(instrument_id).await {
-                log::error!("Failed to unsubscribe from trades: {e:?}");
-            }
+        self.spawn_task("unsubscribe_trades", async move {
+            ws.unsubscribe_trades(instrument_id).await
         });
 
         Ok(())
@@ -866,10 +789,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_mark_prices(instrument_id).await {
-                log::error!("Failed to unsubscribe from mark prices: {e:?}");
-            }
+        self.spawn_task("unsubscribe_mark_prices", async move {
+            ws.unsubscribe_mark_prices(instrument_id).await
         });
 
         Ok(())
@@ -879,10 +800,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_index_prices(instrument_id).await {
-                log::error!("Failed to unsubscribe from index prices: {e:?}");
-            }
+        self.spawn_task("unsubscribe_index_prices", async move {
+            ws.unsubscribe_index_prices(instrument_id).await
         });
 
         Ok(())
@@ -892,10 +811,8 @@ impl DataClient for HyperliquidDataClient {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_funding_rates(instrument_id).await {
-                log::error!("Failed to unsubscribe from funding rates: {e:?}");
-            }
+        self.spawn_task("unsubscribe_funding_rates", async move {
+            ws.unsubscribe_funding_rates(instrument_id).await
         });
 
         Ok(())
@@ -907,10 +824,8 @@ impl DataClient for HyperliquidDataClient {
         let bar_type = unsubscription.bar_type;
         let ws = self.ws_client.clone();
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_bars(bar_type).await {
-                log::error!("Failed to unsubscribe from bars: {e:?}");
-            }
+        self.spawn_task("unsubscribe_bars", async move {
+            ws.unsubscribe_bars(bar_type).await
         });
 
         Ok(())
@@ -932,40 +847,39 @@ impl DataClient for HyperliquidDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
-            match http.request_instruments().await {
-                Ok(instruments) => {
-                    instruments_cache.rcu(|instruments_map| {
-                        coin_map.rcu(|coin_to_id| {
-                            for instrument in &instruments {
-                                let instrument_id = instrument.id();
-                                instruments_map.insert(instrument_id, instrument.clone());
-                                let coin = instrument.raw_symbol().inner();
-                                coin_to_id.insert(coin, instrument_id);
-                                ws_instruments.insert(coin, instrument.clone());
-                            }
-                        });
-                    });
+        self.spawn_task("request_instruments", async move {
+            let instruments = http
+                .request_instruments()
+                .await
+                .context("failed to fetch instruments from Hyperliquid")?;
 
-                    let response = DataResponse::Instruments(InstrumentsResponse::new(
-                        request_id,
-                        client_id,
-                        venue,
-                        instruments,
-                        start_nanos,
-                        end_nanos,
-                        clock.get_time_ns(),
-                        params,
-                    ));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send instruments response: {e}");
+            instruments_cache.rcu(|instruments_map| {
+                coin_map.rcu(|coin_to_id| {
+                    for instrument in &instruments {
+                        let instrument_id = instrument.id();
+                        instruments_map.insert(instrument_id, instrument.clone());
+                        let coin = instrument.raw_symbol().inner();
+                        coin_to_id.insert(coin, instrument_id);
+                        ws_instruments.insert(coin, instrument.clone());
                     }
-                }
-                Err(e) => {
-                    log::error!("Failed to fetch instruments from Hyperliquid: {e:?}");
-                }
+                });
+            });
+
+            let response = DataResponse::Instruments(InstrumentsResponse::new(
+                request_id,
+                client_id,
+                venue,
+                instruments,
+                start_nanos,
+                end_nanos,
+                clock.get_time_ns(),
+                params,
+            ));
+
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send instruments response: {e}");
             }
+            Ok(())
         });
 
         Ok(())
@@ -987,47 +901,46 @@ impl DataClient for HyperliquidDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
-            match http.request_instruments().await {
-                Ok(all_instruments) => {
-                    instruments_cache.rcu(|instruments_map| {
-                        coin_map.rcu(|coin_to_id| {
-                            for instrument in &all_instruments {
-                                let id = instrument.id();
-                                instruments_map.insert(id, instrument.clone());
-                                let coin = instrument.raw_symbol().inner();
-                                coin_to_id.insert(coin, id);
-                                ws_instruments.insert(coin, instrument.clone());
-                            }
-                        });
-                    });
+        self.spawn_task("request_instrument", async move {
+            let all_instruments = http
+                .request_instruments()
+                .await
+                .context("failed to fetch instruments from Hyperliquid")?;
 
-                    if let Some(instrument) = all_instruments
-                        .into_iter()
-                        .find(|i| i.id() == instrument_id)
-                    {
-                        let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-                            request_id,
-                            client_id,
-                            instrument.id(),
-                            instrument,
-                            start_nanos,
-                            end_nanos,
-                            clock.get_time_ns(),
-                            params,
-                        )));
-
-                        if let Err(e) = sender.send(DataEvent::Response(response)) {
-                            log::error!("Failed to send instrument response: {e}");
-                        }
-                    } else {
-                        log::error!("Instrument not found: {instrument_id}");
+            instruments_cache.rcu(|instruments_map| {
+                coin_map.rcu(|coin_to_id| {
+                    for instrument in &all_instruments {
+                        let id = instrument.id();
+                        instruments_map.insert(id, instrument.clone());
+                        let coin = instrument.raw_symbol().inner();
+                        coin_to_id.insert(coin, id);
+                        ws_instruments.insert(coin, instrument.clone());
                     }
+                });
+            });
+
+            if let Some(instrument) = all_instruments
+                .into_iter()
+                .find(|i| i.id() == instrument_id)
+            {
+                let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                    request_id,
+                    client_id,
+                    instrument.id(),
+                    instrument,
+                    start_nanos,
+                    end_nanos,
+                    clock.get_time_ns(),
+                    params,
+                )));
+
+                if let Err(e) = sender.send(DataEvent::Response(response)) {
+                    log::error!("Failed to send instrument response: {e}");
                 }
-                Err(e) => {
-                    log::error!("Failed to fetch instruments from Hyperliquid: {e:?}");
-                }
+            } else {
+                log::error!("Instrument not found: {instrument_id}");
             }
+            Ok(())
         });
 
         Ok(())
@@ -1050,26 +963,26 @@ impl DataClient for HyperliquidDataClient {
         let end_nanos = datetime_to_unix_nanos(end);
         let instruments = Arc::clone(&self.instruments);
 
-        get_runtime().spawn(async move {
-            match request_bars_from_http(http, bar_type, start, end, limit, instruments).await {
-                Ok(bars) => {
-                    let response = DataResponse::Bars(BarsResponse::new(
-                        request_id,
-                        client_id,
-                        bar_type,
-                        bars,
-                        start_nanos,
-                        end_nanos,
-                        clock.get_time_ns(),
-                        params,
-                    ));
+        self.spawn_task("request_bars", async move {
+            let bars = request_bars_from_http(http, bar_type, start, end, limit, instruments)
+                .await
+                .context("bar request failed")?;
 
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send bars response: {e}");
-                    }
-                }
-                Err(e) => log::error!("Bar request failed: {e:?}"),
+            let response = DataResponse::Bars(BarsResponse::new(
+                request_id,
+                client_id,
+                bar_type,
+                bars,
+                start_nanos,
+                end_nanos,
+                clock.get_time_ns(),
+                params,
+            ));
+
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send bars response: {e}");
             }
+            Ok(())
         });
 
         Ok(())
@@ -1123,52 +1036,51 @@ impl DataClient for HyperliquidDataClient {
         };
         let end_ms = end_dt.map(|dt| dt.timestamp_millis().max(0) as u64);
 
-        get_runtime().spawn(async move {
-            match http.info_funding_history(&coin, start_ms, end_ms).await {
-                Ok(entries) => {
-                    let mut funding_rates: Vec<FundingRateUpdate> = entries
-                        .iter()
-                        .filter_map(
-                            |entry| match funding_entry_to_update(entry, instrument_id) {
-                                Ok(update) => Some(update),
-                                Err(e) => {
-                                    log::warn!(
-                                        "Skipping funding history entry for {instrument_id}: {e}",
-                                    );
-                                    None
-                                }
-                            },
-                        )
-                        .collect();
+        self.spawn_task("request_funding_rates", async move {
+            let entries = http
+                .info_funding_history(&coin, start_ms, end_ms)
+                .await
+                .with_context(|| format!("funding rates request failed for {instrument_id}"))?;
 
-                    if let Some(limit) = limit
-                        && funding_rates.len() > limit
-                    {
-                        funding_rates.truncate(limit);
-                    }
+            let mut funding_rates: Vec<FundingRateUpdate> = entries
+                .iter()
+                .filter_map(
+                    |entry| match funding_entry_to_update(entry, instrument_id) {
+                        Ok(update) => Some(update),
+                        Err(e) => {
+                            log::warn!("Skipping funding history entry for {instrument_id}: {e}",);
+                            None
+                        }
+                    },
+                )
+                .collect();
 
-                    log::debug!(
-                        "Fetched {} funding rates for {instrument_id}",
-                        funding_rates.len(),
-                    );
-
-                    let response = DataResponse::FundingRates(FundingRatesResponse::new(
-                        request_id,
-                        client_id,
-                        instrument_id,
-                        funding_rates,
-                        start_nanos,
-                        end_nanos,
-                        clock.get_time_ns(),
-                        params,
-                    ));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send funding rates response: {e}");
-                    }
-                }
-                Err(e) => log::error!("Funding rates request failed for {instrument_id}: {e:?}"),
+            if let Some(limit) = limit
+                && funding_rates.len() > limit
+            {
+                funding_rates.truncate(limit);
             }
+
+            log::debug!(
+                "Fetched {} funding rates for {instrument_id}",
+                funding_rates.len(),
+            );
+
+            let response = DataResponse::FundingRates(FundingRatesResponse::new(
+                request_id,
+                client_id,
+                instrument_id,
+                funding_rates,
+                start_nanos,
+                end_nanos,
+                clock.get_time_ns(),
+                params,
+            ));
+
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send funding rates response: {e}");
+            }
+            Ok(())
         });
 
         Ok(())
@@ -1193,96 +1105,113 @@ impl DataClient for HyperliquidDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
-            match http.info_l2_book(&raw_symbol).await {
-                Ok(l2_book) => {
-                    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
-                    let ts_event = UnixNanos::from(l2_book.time * 1_000_000);
+        self.spawn_task("request_book_snapshot", async move {
+            let l2_book = http
+                .info_l2_book(&raw_symbol)
+                .await
+                .with_context(|| format!("book snapshot request failed for {instrument_id}"))?;
 
-                    let all_bids = l2_book
-                        .levels
-                        .first()
-                        .map_or([].as_slice(), |v| v.as_slice());
-                    let all_asks = l2_book
-                        .levels
-                        .get(1)
-                        .map_or([].as_slice(), |v| v.as_slice());
+            let book = parse_l2_book_snapshot(
+                &l2_book,
+                instrument_id,
+                price_precision,
+                size_precision,
+                depth,
+            );
 
-                    let bids = match depth {
-                        Some(d) if d < all_bids.len() => &all_bids[..d],
-                        _ => all_bids,
-                    };
-                    let asks = match depth {
-                        Some(d) if d < all_asks.len() => &all_asks[..d],
-                        _ => all_asks,
-                    };
+            let response = DataResponse::Book(BookResponse::new(
+                request_id,
+                client_id,
+                instrument_id,
+                book,
+                None,
+                None,
+                clock.get_time_ns(),
+                params,
+            ));
 
-                    for (i, level) in bids.iter().enumerate() {
-                        let px: f64 = match level.px.parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let sz: f64 = match level.sz.parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        if sz > 0.0 {
-                            let price = Price::new(px, price_precision);
-                            let size = Quantity::new(sz, size_precision);
-                            let order = BookOrder::new(OrderSide::Buy, price, size, i as u64);
-                            book.add(order, 0, i as u64, ts_event);
-                        }
-                    }
-
-                    let bids_len = bids.len();
-
-                    for (i, level) in asks.iter().enumerate() {
-                        let px: f64 = match level.px.parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let sz: f64 = match level.sz.parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        if sz > 0.0 {
-                            let price = Price::new(px, price_precision);
-                            let size = Quantity::new(sz, size_precision);
-                            let order =
-                                BookOrder::new(OrderSide::Sell, price, size, (bids_len + i) as u64);
-                            book.add(order, 0, (bids_len + i) as u64, ts_event);
-                        }
-                    }
-
-                    log::info!(
-                        "Fetched order book for {instrument_id} with {} bids and {} asks",
-                        bids.len(),
-                        asks.len(),
-                    );
-
-                    let response = DataResponse::Book(BookResponse::new(
-                        request_id,
-                        client_id,
-                        instrument_id,
-                        book,
-                        None,
-                        None,
-                        clock.get_time_ns(),
-                        params,
-                    ));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send book snapshot response: {e}");
-                    }
-                }
-                Err(e) => log::error!("Book snapshot request failed for {instrument_id}: {e:?}"),
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send book snapshot response: {e}");
             }
+            Ok(())
         });
 
         Ok(())
     }
+}
+
+// Levels with unparsable px/sz or non-positive size are skipped rather than
+// erroring; the snapshot's `time` field (ms) becomes `ts_event` after the
+// ms->ns conversion.
+pub(crate) fn parse_l2_book_snapshot(
+    l2_book: &HyperliquidL2Book,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    depth: Option<usize>,
+) -> OrderBook {
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let ts_event = UnixNanos::from(l2_book.time * 1_000_000);
+
+    let all_bids = l2_book
+        .levels
+        .first()
+        .map_or([].as_slice(), |v| v.as_slice());
+    let all_asks = l2_book
+        .levels
+        .get(1)
+        .map_or([].as_slice(), |v| v.as_slice());
+
+    let bids = match depth {
+        Some(d) if d < all_bids.len() => &all_bids[..d],
+        _ => all_bids,
+    };
+    let asks = match depth {
+        Some(d) if d < all_asks.len() => &all_asks[..d],
+        _ => all_asks,
+    };
+
+    for (i, level) in bids.iter().enumerate() {
+        let Ok(px) = level.px.parse::<f64>() else {
+            continue;
+        };
+        let Ok(sz) = level.sz.parse::<f64>() else {
+            continue;
+        };
+
+        if sz > 0.0 {
+            let price = Price::new(px, price_precision);
+            let size = Quantity::new(sz, size_precision);
+            let order = BookOrder::new(OrderSide::Buy, price, size, i as u64);
+            book.add(order, 0, i as u64, ts_event);
+        }
+    }
+
+    let bids_len = bids.len();
+
+    for (i, level) in asks.iter().enumerate() {
+        let Ok(px) = level.px.parse::<f64>() else {
+            continue;
+        };
+        let Ok(sz) = level.sz.parse::<f64>() else {
+            continue;
+        };
+
+        if sz > 0.0 {
+            let price = Price::new(px, price_precision);
+            let size = Quantity::new(sz, size_precision);
+            let order = BookOrder::new(OrderSide::Sell, price, size, (bids_len + i) as u64);
+            book.add(order, 0, (bids_len + i) as u64, ts_event);
+        }
+    }
+
+    log::info!(
+        "Built order book for {instrument_id} with {} bids and {} asks",
+        bids.len(),
+        asks.len(),
+    );
+
+    book
 }
 
 // Reads optional `nSigFigs` / `mantissa` L2 precision controls from
@@ -1533,5 +1462,117 @@ mod tests {
         assert_eq!(updates[0].rate, dec!(0.0000125));
         assert_eq!(updates[1].rate, dec!(-0.0000081));
         assert_eq!(updates[2].rate, dec!(0.0000033));
+    }
+
+    fn level(px: &str, sz: &str) -> crate::http::models::HyperliquidLevel {
+        crate::http::models::HyperliquidLevel {
+            px: px.to_string(),
+            sz: sz.to_string(),
+        }
+    }
+
+    fn sample_l2_book() -> HyperliquidL2Book {
+        HyperliquidL2Book {
+            coin: Ustr::from("BTC"),
+            levels: vec![
+                vec![
+                    level("98450.50", "2.5"),
+                    level("98449.00", "1.2"),
+                    level("98448.00", "0.8"),
+                ],
+                vec![
+                    level("98451.00", "1.5"),
+                    level("98452.00", "2.0"),
+                    level("98453.00", "0.5"),
+                ],
+            ],
+            time: 1769908800000,
+        }
+    }
+
+    #[rstest]
+    fn test_parse_l2_book_snapshot_populates_both_sides() {
+        let book_data = sample_l2_book();
+        let instrument_id = btc_perp_id();
+        let book = parse_l2_book_snapshot(&book_data, instrument_id, 2, 4, None);
+
+        assert_eq!(book.instrument_id, instrument_id);
+        assert_eq!(book.book_type, BookType::L2_MBP);
+        assert_eq!(book.best_bid_price(), Some(Price::new(98450.50, 2)));
+        assert_eq!(book.best_ask_price(), Some(Price::new(98451.00, 2)));
+        assert_eq!(book.best_bid_size(), Some(Quantity::new(2.5, 4)));
+        assert_eq!(book.best_ask_size(), Some(Quantity::new(1.5, 4)));
+        assert_eq!(book.update_count, 6);
+    }
+
+    #[rstest]
+    fn test_parse_l2_book_snapshot_truncates_to_depth() {
+        let book_data = sample_l2_book();
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, Some(1));
+
+        // depth=1 keeps the top of book on each side, drops the rest.
+        assert_eq!(book.update_count, 2);
+        assert_eq!(book.best_bid_price(), Some(Price::new(98450.50, 2)));
+        assert_eq!(book.best_ask_price(), Some(Price::new(98451.00, 2)));
+    }
+
+    #[rstest]
+    fn test_parse_l2_book_snapshot_uses_venue_time_as_ts_event() {
+        let book_data = sample_l2_book();
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+        let expected_ts = UnixNanos::from(1769908800000_u64 * 1_000_000);
+
+        // ts_last reflects the last applied delta; every added order
+        // carries the venue time after the ms->ns conversion.
+        assert_eq!(book.ts_last, expected_ts);
+    }
+
+    #[rstest]
+    fn test_parse_l2_book_snapshot_skips_non_positive_size() {
+        let book_data = HyperliquidL2Book {
+            coin: Ustr::from("BTC"),
+            levels: vec![
+                vec![level("98450.50", "2.5"), level("98449.00", "0")],
+                vec![level("98451.00", "0"), level("98452.00", "1.5")],
+            ],
+            time: 1769908800000,
+        };
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+
+        assert_eq!(book.update_count, 2, "zero-sized levels must be skipped");
+        assert_eq!(book.best_bid_price(), Some(Price::new(98450.50, 2)));
+        assert_eq!(book.best_ask_price(), Some(Price::new(98452.00, 2)));
+    }
+
+    #[rstest]
+    fn test_parse_l2_book_snapshot_skips_unparsable_levels() {
+        let book_data = HyperliquidL2Book {
+            coin: Ustr::from("BTC"),
+            levels: vec![
+                vec![level("not-a-number", "1.0"), level("98449.00", "1.2")],
+                vec![level("98451.00", "garbage"), level("98452.00", "1.5")],
+            ],
+            time: 1769908800000,
+        };
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+
+        // Each side has one parseable level remaining.
+        assert_eq!(book.update_count, 2);
+        assert_eq!(book.best_bid_price(), Some(Price::new(98449.00, 2)));
+        assert_eq!(book.best_ask_price(), Some(Price::new(98452.00, 2)));
+    }
+
+    #[rstest]
+    fn test_parse_l2_book_snapshot_empty_levels_yields_empty_book() {
+        let book_data = HyperliquidL2Book {
+            coin: Ustr::from("BTC"),
+            levels: vec![],
+            time: 1769908800000,
+        };
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+
+        assert_eq!(book.update_count, 0);
+        assert!(book.best_bid_price().is_none());
+        assert!(book.best_ask_price().is_none());
     }
 }

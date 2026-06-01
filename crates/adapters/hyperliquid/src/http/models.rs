@@ -29,8 +29,10 @@ use crate::common::enums::{
 /// Response from candleSnapshot endpoint (returns array directly).
 pub type HyperliquidCandleSnapshot = Vec<HyperliquidCandle>;
 
+const CLOID_MARKER_PREFIX_BYTES: [u8; 2] = [0x6e, 0x42];
+
 /// A 128-bit client order ID represented as a hex string with `0x` prefix.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Cloid(pub [u8; 16]);
 
 impl Cloid {
@@ -60,16 +62,31 @@ impl Cloid {
         Ok(Self(bytes))
     }
 
-    /// Creates a `Cloid` from a Nautilus `ClientOrderId` by hashing it.
-    ///
-    /// Uses keccak256 hash and takes the first 16 bytes to create a deterministic
-    /// 128-bit CLOID from any client order ID format.
+    /// Creates a deterministic `Cloid` from a Nautilus `ClientOrderId`.
     #[must_use]
     pub fn from_client_order_id(client_order_id: ClientOrderId) -> Self {
         let hash = keccak256(client_order_id.as_str().as_bytes());
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&hash[..16]);
+        bytes[..CLOID_MARKER_PREFIX_BYTES.len()].copy_from_slice(&CLOID_MARKER_PREFIX_BYTES);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
         Self(bytes)
+    }
+
+    /// Creates a legacy deterministic `Cloid` from a Nautilus `ClientOrderId`.
+    #[must_use]
+    pub fn from_legacy_client_order_id(client_order_id: ClientOrderId) -> Self {
+        let hash = keccak256(client_order_id.as_str().as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&hash[..16]);
+        Self(bytes)
+    }
+
+    /// Returns whether the CLOID matches the UUIDv4 version and variant bits.
+    #[must_use]
+    pub fn is_uuid_v4(&self) -> bool {
+        self.0[6] >> 4 == 4 && matches!(self.0[8] >> 4, 8..=11)
     }
 
     /// Converts the CLOID to a hex string with `0x` prefix.
@@ -191,6 +208,15 @@ pub struct MarginTier {
     pub lower_bound: String,
     /// Maximum leverage for this tier.
     pub max_leverage: u32,
+}
+
+/// Descriptor for a builder-deployed perp dex from `POST /info` with
+/// `{ "type": "perpDexs" }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpDex {
+    /// Dex identifier used by WebSocket `dex` metadata and subscription routing.
+    pub name: String,
 }
 
 /// Complete spot metadata response from `POST /info` with `{ "type": "spotMeta" }`.
@@ -541,7 +567,7 @@ pub struct HyperliquidOrderInfo {
     /// Original order size.
     #[serde(rename = "origSz")]
     pub orig_sz: String,
-    /// Optional client order ID (hex representation of the keccak256 cloid).
+    /// Optional client order ID (hex representation of the venue CLOID).
     #[serde(default)]
     pub cloid: Option<String>,
 }
@@ -681,6 +707,8 @@ pub const RESPONSE_STATUS_OK: &str = "ok";
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
 
     use super::*;
 
@@ -892,6 +920,136 @@ mod tests {
             "Should have grouping field"
         );
     }
+
+    #[rstest]
+    fn test_user_outcome_split_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::SplitOutcome(HyperliquidExecSplitOutcomeParams {
+                outcome: 1,
+                amount: dec!(123.0),
+            }),
+        };
+
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "splitOutcome": { "outcome": 1, "amount": "123.0" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_split_msgpack_roundtrip() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::SplitOutcome(HyperliquidExecSplitOutcomeParams {
+                outcome: 4,
+                amount: dec!(10),
+            }),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&action).unwrap();
+        let decoded: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            json!({
+                "type": "userOutcome",
+                "splitOutcome": { "outcome": 4, "amount": "10" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_outcome_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeOutcome(HyperliquidExecMergeOutcomeParams {
+                outcome: 1,
+                amount: Some(dec!(5.0)),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeOutcome": { "outcome": 1, "amount": "5.0" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_outcome_null_amount_means_max() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeOutcome(HyperliquidExecMergeOutcomeParams {
+                outcome: 7,
+                amount: None,
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeOutcome": { "outcome": 7, "amount": null }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_question_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeQuestion(HyperliquidExecMergeQuestionParams {
+                question: 9,
+                amount: Some(dec!(2.0)),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeQuestion": { "question": 9, "amount": "2.0" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_question_null_amount_means_max() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeQuestion(HyperliquidExecMergeQuestionParams {
+                question: 9,
+                amount: None,
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeQuestion": { "question": 9, "amount": null }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_negate_outcome_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::NegateOutcome(HyperliquidExecNegateOutcomeParams {
+                question: 9,
+                outcome: 52,
+                amount: dec!(1.5),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "negateOutcome": { "question": 9, "outcome": 52, "amount": "1.5" }
+            })
+        );
+    }
 }
 
 /// Time-in-force for limit orders in exchange endpoint.
@@ -1061,6 +1219,101 @@ pub struct HyperliquidExecModifyOrderRequest {
     pub order: HyperliquidExecPlaceOrderRequest,
 }
 
+/// Parameters for the HIP-4 `splitOutcome` operation inside a `userOutcome` action.
+///
+/// Debits `amount` quote tokens from the user's spot balance and credits both
+/// the Yes and No side tokens of the referenced outcome.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecSplitOutcomeParams {
+    /// Outcome index (matches `outcomeMeta.outcomes[i].outcome`).
+    pub outcome: u32,
+    /// Quote-token amount to split, serialized as a decimal string (e.g. `"123.0"`).
+    #[serde(
+        serialize_with = "crate::common::parse::serialize_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
+    )]
+    pub amount: Decimal,
+}
+
+/// Parameters for the HIP-4 `mergeOutcome` operation inside a `userOutcome` action.
+///
+/// Burns `amount` matched Yes + No side tokens of `outcome` for `amount` quote
+/// tokens back. `amount = None` serializes as `null`, which the venue treats as
+/// the maximum mergeable balance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecMergeOutcomeParams {
+    /// Outcome index whose Yes + No pair is being merged.
+    pub outcome: u32,
+    /// Side-token amount to merge, or `None` to merge the maximum available.
+    #[serde(
+        default,
+        serialize_with = "crate::common::parse::serialize_optional_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_optional_decimal_from_str"
+    )]
+    pub amount: Option<Decimal>,
+}
+
+/// Parameters for the HIP-4 `mergeQuestion` operation inside a `userOutcome` action.
+///
+/// Burns `amount` Yes shares of every outcome associated with `question` for
+/// `amount` quote tokens back. `amount = None` serializes as `null`, meaning
+/// the maximum mergeable balance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecMergeQuestionParams {
+    /// Question identifier whose named outcomes are being merged.
+    pub question: u32,
+    /// Yes-share amount to merge per outcome, or `None` for the max.
+    #[serde(
+        default,
+        serialize_with = "crate::common::parse::serialize_optional_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_optional_decimal_from_str"
+    )]
+    pub amount: Option<Decimal>,
+}
+
+/// Parameters for the HIP-4 `negateOutcome` operation inside a `userOutcome` action.
+///
+/// Converts `amount` `No` shares of `outcome` (within `question`) into `amount`
+/// `Yes` shares of every other outcome in the same question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecNegateOutcomeParams {
+    /// Question identifier the outcome belongs to.
+    pub question: u32,
+    /// Outcome index whose `No` shares are being negated.
+    pub outcome: u32,
+    /// Side-token amount to negate, serialized as a decimal string.
+    #[serde(
+        serialize_with = "crate::common::parse::serialize_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
+    )]
+    pub amount: Decimal,
+}
+
+/// Operations carried by the [`HyperliquidExecAction::UserOutcome`] action.
+///
+/// Each variant serializes as a single-keyed object (for example,
+/// `{ "splitOutcome": { ... } }`) and is flattened into the outer action
+/// envelope alongside `"type": "userOutcome"` to match the Hyperliquid wire
+/// format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HyperliquidExecUserOutcomeOp {
+    /// Split `amount` quote tokens into `amount` Yes plus `amount` No shares.
+    #[serde(rename = "splitOutcome")]
+    SplitOutcome(HyperliquidExecSplitOutcomeParams),
+    /// Merge `amount` Yes + No side-token pairs of `outcome` back into quote
+    /// tokens (reverse of [`Self::SplitOutcome`]).
+    #[serde(rename = "mergeOutcome")]
+    MergeOutcome(HyperliquidExecMergeOutcomeParams),
+    /// Merge `amount` Yes shares of every outcome in `question` into quote
+    /// tokens (multi-outcome reverse of `splitOutcome`).
+    #[serde(rename = "mergeQuestion")]
+    MergeQuestion(HyperliquidExecMergeQuestionParams),
+    /// Swap `amount` `No` shares of one outcome into `Yes` shares of every
+    /// other outcome in the same question.
+    #[serde(rename = "negateOutcome")]
+    NegateOutcome(HyperliquidExecNegateOutcomeParams),
+}
+
 /// TWAP (Time-Weighted Average Price) order specification for exchange endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HyperliquidExecTwapRequest {
@@ -1183,6 +1436,18 @@ pub enum HyperliquidExecAction {
             deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
         )]
         amount: Decimal,
+    },
+
+    /// HIP-4 outcome-side token management (`splitOutcome` and related ops).
+    ///
+    /// The active op is carried via [`HyperliquidExecUserOutcomeOp`] and
+    /// flattened into this action envelope, producing wire payloads such as
+    /// `{ "type": "userOutcome", "splitOutcome": { ... } }`.
+    #[serde(rename = "userOutcome")]
+    UserOutcome {
+        /// Operation to perform on the user's outcome balances.
+        #[serde(flatten)]
+        op: HyperliquidExecUserOutcomeOp,
     },
 
     /// Place a TWAP order.

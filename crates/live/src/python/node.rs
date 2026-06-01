@@ -493,6 +493,7 @@ impl LiveNode {
     #[cfg(feature = "examples")]
     #[pyo3(name = "add_native_strategy")]
     fn py_add_native_strategy(&mut self, config: &Bound<'_, PyAny>) -> PyResult<()> {
+        use nautilus_testkit::{ExecTester, ExecTesterConfig};
         use nautilus_trading::examples::strategies::{
             CompositeMarketMaker, CompositeMarketMakerConfig, DeltaNeutralVol,
             DeltaNeutralVolConfig, EmaCross, EmaCrossConfig, GridMarketMaker,
@@ -514,6 +515,9 @@ impl LiveNode {
         } else if let Ok(config) = config.extract::<HurstVpinDirectionalConfig>() {
             self.add_strategy(HurstVpinDirectional::new(config))
                 .map_err(to_pyruntime_err)
+        } else if let Ok(config) = config.extract::<ExecTesterConfig>() {
+            self.add_strategy(ExecTester::new(config))
+                .map_err(to_pyruntime_err)
         } else {
             let type_name = config.get_type().name()?;
             Err(to_pytype_err(format!(
@@ -529,10 +533,14 @@ impl LiveNode {
     #[cfg(feature = "examples")]
     #[pyo3(name = "add_native_actor")]
     fn py_add_native_actor(&mut self, config: &Bound<'_, PyAny>) -> PyResult<()> {
+        use nautilus_testkit::{DataTester, DataTesterConfig};
         use nautilus_trading::examples::actors::{BookImbalanceActor, BookImbalanceActorConfig};
 
         if let Ok(config) = config.extract::<BookImbalanceActorConfig>() {
             self.add_actor(BookImbalanceActor::from_config(config))
+                .map_err(to_pyruntime_err)
+        } else if let Ok(config) = config.extract::<DataTesterConfig>() {
+            self.add_actor(DataTester::new(config))
                 .map_err(to_pyruntime_err)
         } else {
             let type_name = config.get_type().name()?;
@@ -1017,6 +1025,49 @@ impl LiveNodeBuilderPy {
                         })
                     }
                     Err(e) => Err(to_pyruntime_err(format!("Failed to add exec client: {e}"))),
+                }
+            })
+        } else {
+            Err(to_pyruntime_err("Builder already consumed"))
+        }
+    }
+
+    #[pyo3(name = "add_simulated_exec_client")]
+    #[expect(clippy::needless_pass_by_value)]
+    fn py_add_simulated_exec_client(
+        &self,
+        name: Option<String>,
+        factory: Py<PyAny>,
+        config: Py<PyAny>,
+    ) -> PyResult<Self> {
+        let mut inner_ref = self.inner.borrow_mut();
+        if let Some(builder) = inner_ref.take() {
+            Python::attach(|py| -> PyResult<Self> {
+                let registry = get_global_pyo3_registry();
+
+                let boxed_factory = registry.extract_sim_exec_factory(py, factory.clone_ref(py))?;
+                let boxed_config = registry.extract_config(py, config.clone_ref(py))?;
+
+                let factory_name = factory
+                    .getattr(py, "name")?
+                    .call0(py)?
+                    .extract::<String>(py)?;
+                let client_name = name.unwrap_or(factory_name);
+
+                match builder.add_simulated_exec_client(
+                    Some(client_name),
+                    boxed_factory,
+                    boxed_config,
+                ) {
+                    Ok(updated_builder) => {
+                        *inner_ref = Some(updated_builder);
+                        Ok(Self {
+                            inner: self.inner.clone(),
+                        })
+                    }
+                    Err(e) => Err(to_pyruntime_err(format!(
+                        "Failed to add simulated exec client: {e}"
+                    ))),
                 }
             })
         } else {

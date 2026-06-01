@@ -21,6 +21,7 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
+import msgspec
 import pandas as pd
 from ibapi.commission_and_fees_report import CommissionAndFeesReport
 from ibapi.const import UNSET_DECIMAL
@@ -980,7 +981,11 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         PyCondition.type(command, SubmitOrder, "command")
 
         try:
-            ib_order: IBOrder = self._transform_order_to_ib_order(command.order)
+            self._ensure_client_ready_for_order_request("submit order")
+            ib_order: IBOrder = self._transform_order_to_ib_order(
+                command.order,
+                command.params,
+            )
             ib_order.orderId = self._client.next_order_id()
             self._client.place_order(ib_order)
             self._handle_order_event(status=OrderStatus.SUBMITTED, order=command.order)
@@ -994,6 +999,17 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         PyCondition.type(command, SubmitOrderList, "command")
 
+        try:
+            self._ensure_client_ready_for_order_request("submit order list")
+        except ValueError as e:
+            for order in command.order_list.orders:
+                self._handle_order_event(
+                    status=OrderStatus.REJECTED,
+                    order=order,
+                    reason=str(e),
+                )
+            return
+
         order_id_map = {}
         client_id_to_orders = {}
         ib_orders = []
@@ -1004,7 +1020,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             client_id_to_orders[order.client_order_id.value] = order
 
             try:
-                ib_order = self._transform_order_to_ib_order(order)
+                ib_order = self._transform_order_to_ib_order(order, command.params)
                 ib_order.transmit = False
                 ib_order.orderId = order_id_map[order.client_order_id.value]
                 ib_orders.append(ib_order)
@@ -1048,11 +1064,27 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         if not (command.quantity or command.price or command.trigger_price):
             return
 
+        try:
+            self._ensure_client_ready_for_order_request("modify order")
+        except ValueError as e:
+            self.generate_order_modify_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=command.venue_order_id,
+                reason=str(e),
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
         nautilus_order: Order = self._cache.order(command.client_order_id)
         self._log.info(f"Nautilus order status is {nautilus_order.status_string()}")
 
         try:
-            ib_order: IBOrder = self._transform_order_to_ib_order(nautilus_order)
+            ib_order: IBOrder = self._transform_order_to_ib_order(
+                nautilus_order,
+                command.params,
+            )
         except ValueError as e:
             self._handle_order_event(
                 status=OrderStatus.REJECTED,
@@ -1098,7 +1130,17 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         self._log.info(f"Placing {ib_order!r}")
         self._client.place_order(ib_order)
 
-    def _transform_order_to_ib_order(self, order: Order) -> IBOrder:  # noqa: C901
+    def _ensure_client_ready_for_order_request(self, request: str) -> None:
+        if not self._client.is_ready:
+            raise ValueError(
+                f"Interactive Brokers client is not ready; refusing to {request}",
+            )
+
+    def _transform_order_to_ib_order(  # noqa: C901
+        self,
+        order: Order,
+        params: dict[str, Any] | None = None,
+    ) -> IBOrder:
         if order.is_post_only:
             raise ValueError("`post_only` not supported by Interactive Brokers")
 
@@ -1163,6 +1205,12 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         else:
             details = self.instrument_provider.contract_details[order.instrument_id]
             ib_order.contract = details.contract
+
+        if routing_exchange := self._routing_exchange_from_params(params):
+            ib_order.contract = self._contract_with_routing_exchange(
+                ib_order.contract,
+                routing_exchange,
+            )
 
         ib_order.account = self.account_id.get_id()
         ib_order.clearingAccount = self.account_id.get_id()
@@ -1233,6 +1281,29 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             )
 
         return ib_order
+
+    def _routing_exchange_from_params(self, params: dict[str, Any] | None) -> str | None:
+        if not params:
+            return None
+
+        if "exchange" not in params:
+            return None
+
+        value = params["exchange"]
+        if not isinstance(value, str):
+            raise ValueError("`exchange` order param must be a string")
+
+        return value or None
+
+    def _contract_with_routing_exchange(
+        self,
+        contract: IBContract | None,
+        routing_exchange: str,
+    ) -> IBContract:
+        if contract is None:
+            raise ValueError("Cannot override routing exchange without an IB contract")
+
+        return msgspec.structs.replace(contract, exchange=routing_exchange)
 
     def _create_ib_conditions(
         self,
@@ -1375,6 +1446,19 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
     async def _cancel_order(self, command: CancelOrder) -> None:
         PyCondition.not_none(command, "command")
 
+        try:
+            self._ensure_client_ready_for_order_request("cancel order")
+        except ValueError as e:
+            self.generate_order_cancel_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=command.venue_order_id,
+                reason=str(e),
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
         venue_order_id = command.venue_order_id
 
         if venue_order_id:
@@ -1388,6 +1472,22 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 f"Interactive Brokers does not support order_side filtering for cancel all orders; "
                 f"ignoring order_side={order_side_to_str(command.order_side)} and canceling all orders",
             )
+
+        try:
+            self._ensure_client_ready_for_order_request("cancel orders")
+        except ValueError as e:
+            for order in self._cache.orders_open(
+                instrument_id=command.instrument_id,
+            ):
+                self.generate_order_cancel_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    reason=str(e),
+                    ts_event=self._clock.timestamp_ns(),
+                )
+            return
 
         for order in self._cache.orders_open(
             instrument_id=command.instrument_id,

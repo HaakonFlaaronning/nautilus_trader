@@ -30,7 +30,7 @@ use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, CustomData, DataType, FundingRateUpdate, HasTsInit,
         IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        QuoteTick, TradeTick,
+        OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose,
         custom::CustomDataTrait,
         greeks::OptionGreekValues,
@@ -69,8 +69,9 @@ use crate::{
     component::Component,
     logging::{logger::LogGuard, logging_is_initialized},
     messages::data::{
-        BarsResponse, BookResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
-        InstrumentResponse, InstrumentsResponse, PARAMS_IS_PARENT, QuotesResponse, TradesResponse,
+        BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
+        DataResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
+        PARAMS_IS_PARENT, QuotesResponse, TradesResponse,
     },
     msgbus::{
         self, MessageBus, get_message_bus,
@@ -144,6 +145,7 @@ struct TestDataActor {
     pub received_data: Vec<String>, // Use string for simplicity
     pub received_books: Vec<OrderBook>,
     pub received_deltas: Vec<OrderBookDelta>,
+    pub received_depths: Vec<OrderBookDepth10>,
     pub received_quotes: Vec<QuoteTick>,
     pub received_trades: Vec<TradeTick>,
     pub received_bars: Vec<Bar>,
@@ -232,6 +234,16 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
+    fn on_historical_book_deltas(&mut self, deltas: &[OrderBookDelta]) -> anyhow::Result<()> {
+        self.received_deltas.extend(deltas);
+        Ok(())
+    }
+
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+        self.received_depths.extend(depths);
+        Ok(())
+    }
+
     fn on_historical_funding_rates(
         &mut self,
         funding_rates: &[FundingRateUpdate],
@@ -313,7 +325,7 @@ impl DataActor for TestDataActor {
 
 // Custom functionality as required
 impl TestDataActor {
-    pub fn new(config: DataActorConfig) -> Self {
+    pub(crate) fn new(config: DataActorConfig) -> Self {
         Self {
             core: DataActorCore::new(config),
             received_time_events: Vec::new(),
@@ -321,6 +333,7 @@ impl TestDataActor {
             received_data: Vec::new(),
             received_books: Vec::new(),
             received_deltas: Vec::new(),
+            received_depths: Vec::new(),
             received_quotes: Vec::new(),
             received_trades: Vec::new(),
             received_bars: Vec::new(),
@@ -345,7 +358,7 @@ impl TestDataActor {
     }
 
     #[allow(dead_code)]
-    pub fn custom_function(&self) {}
+    pub(crate) fn custom_function(&self) {}
 }
 
 #[fixture]
@@ -1175,6 +1188,75 @@ fn test_request_trades(
 }
 
 #[rstest]
+fn test_request_book_deltas(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let request_id = actor
+        .request_book_deltas(audusd_sim.id, None, None, None, None, None)
+        .unwrap();
+
+    let client_id = ClientId::new("TestClient");
+    let delta = stub_delta();
+    let response = BookDeltasResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        vec![delta],
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    );
+
+    msgbus::send_response(&request_id, &DataResponse::BookDeltas(response));
+
+    assert_eq!(actor.received_deltas.len(), 1);
+    assert_eq!(actor.received_deltas[0], delta);
+}
+
+#[rstest]
+fn test_request_book_depth(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let request_id = actor
+        .request_book_depth(audusd_sim.id, None, None, None, None, None, None)
+        .unwrap();
+
+    let client_id = ClientId::new("TestClient");
+    let mut depth = stub_depth10();
+    depth.instrument_id = audusd_sim.id;
+    let response = BookDepthResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        vec![depth],
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    );
+
+    msgbus::send_response(&request_id, &DataResponse::BookDepth(response));
+
+    assert_eq!(actor.received_depths.len(), 1);
+    assert_eq!(actor.received_depths[0], depth);
+}
+
+#[rstest]
 fn test_request_funding_rates(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
@@ -1274,10 +1356,10 @@ fn test_subscribe_and_receive_instruments(
 
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
     let topic1 = get_instrument_topic(inst1.id());
-    msgbus::publish_any(topic1, &inst1);
+    msgbus::publish_instrument(topic1, &inst1);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
     let topic2 = get_instrument_topic(inst2.id());
-    msgbus::publish_any(topic2, &inst2);
+    msgbus::publish_instrument(topic2, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], inst1);
@@ -1301,8 +1383,8 @@ fn test_subscribe_and_receive_instrument(
     let topic = get_instrument_topic(audusd_sim.id);
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic, &inst1);
-    msgbus::publish_any(topic, &inst2);
+    msgbus::publish_instrument(topic, &inst1);
+    msgbus::publish_instrument(topic, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], inst1);
@@ -1543,19 +1625,19 @@ fn test_unsubscribe_instruments(
 
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim.clone());
     let topic1 = get_instrument_topic(inst1.id());
-    msgbus::publish_any(topic1, &inst1);
+    msgbus::publish_instrument(topic1, &inst1);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
     let topic2 = get_instrument_topic(inst2.id());
-    msgbus::publish_any(topic2, &inst2);
+    msgbus::publish_instrument(topic2, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
     actor.unsubscribe_instruments(venue, None, None);
 
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish_any(topic1, &inst3);
+    msgbus::publish_instrument(topic1, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic2, &inst4);
+    msgbus::publish_instrument(topic2, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 }
@@ -1575,18 +1657,18 @@ fn test_unsubscribe_instrument(
 
     let topic = get_instrument_topic(audusd_sim.id);
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim.clone());
-    msgbus::publish_any(topic, &inst3);
+    msgbus::publish_instrument(topic, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
-    msgbus::publish_any(topic, &inst4);
+    msgbus::publish_instrument(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
     actor.unsubscribe_instrument(audusd_sim.id, None, None);
 
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish_any(topic, &inst3);
+    msgbus::publish_instrument(topic, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic, &inst4);
+    msgbus::publish_instrument(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 }
@@ -2125,7 +2207,8 @@ fn test_subscribe_and_receive_pool_swaps(
         "0x123".to_string(),
         0,
         0,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
         Address::from([0x12; 20]),
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
@@ -2186,7 +2269,8 @@ fn test_unsubscribe_pool_swaps(
         "0x123".to_string(),
         0,
         0,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
         Address::from([0x12; 20]),
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
@@ -2209,7 +2293,8 @@ fn test_unsubscribe_pool_swaps(
         "0x456".to_string(),
         0,
         0,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
         Address::from([0x12; 20]),
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),

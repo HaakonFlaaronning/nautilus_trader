@@ -33,12 +33,47 @@ use nautilus_model::{
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use nautilus_system::config::{NautilusKernelConfig, StreamingConfig};
+use nautilus_system::{
+    config::{NautilusKernelConfig, StreamingConfig},
+    event_store::EventStoreConfig,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// The default rate limit string used for order submission and modification.
 const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
+
+/// Configuration for one Rust-native plug-in instance loaded by a live node.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginConfig {
+    /// Path to the plug-in cdylib. Relative paths resolve from the process working directory.
+    pub path: String,
+    /// Type name from the plug-in manifest to instantiate.
+    pub type_name: String,
+    /// Per-instance JSON configuration passed to the plug-in `create` thunk.
+    #[builder(default)]
+    pub config: HashMap<String, serde_json::Value>,
+    /// Optional SHA-256 hex digest of the cdylib before loading.
+    pub sha256: Option<String>,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self::builder()
+            .path(String::new())
+            .type_name(String::new())
+            .build()
+    }
+}
 
 /// Configuration for live data engines.
 #[cfg_attr(
@@ -545,7 +580,7 @@ pub struct LiveNodeConfig {
     /// The unique instance identifier for the kernel
     pub instance_id: Option<UUID4>,
     /// The timeout for all clients to connect and initialize.
-    #[builder(default = Duration::from_secs(120))]
+    #[builder(default = Duration::from_secs(60))]
     pub timeout_connection: Duration,
     /// The timeout for execution state to reconcile.
     #[builder(default = Duration::from_secs(30))]
@@ -572,6 +607,12 @@ pub struct LiveNodeConfig {
     pub emulator: Option<OrderEmulatorConfig>,
     /// The configuration for streaming to feather files.
     pub streaming: Option<StreamingConfig>,
+    /// The event-store configuration.
+    ///
+    /// When set, the live node boots a kernel-managed event-store run for audit and replay.
+    /// The caller supplies a factory via `LiveNodeBuilder::with_event_store` to construct
+    /// the concrete `KernelEventStore`; this field carries the configuration that factory reads.
+    pub event_store: Option<EventStoreConfig>,
     /// If the asyncio event loop should run in debug mode.
     #[builder(default)]
     pub loop_debug: bool,
@@ -590,6 +631,9 @@ pub struct LiveNodeConfig {
     /// The execution client configurations.
     #[builder(default)]
     pub exec_clients: HashMap<String, LiveExecClientConfig>,
+    /// The Rust-native plug-in instances to load before startup.
+    #[builder(default)]
+    pub plugins: Vec<PluginConfig>,
 }
 
 impl Default for LiveNodeConfig {
@@ -628,6 +672,37 @@ impl LiveNodeConfig {
         self.data_engine.validate_runtime_support()?;
         self.risk_engine.validate_runtime_support()?;
         self.exec_engine.validate_runtime_support()?;
+        self.validate_plugin_configs()?;
+
+        Ok(())
+    }
+
+    fn validate_plugin_configs(&self) -> anyhow::Result<()> {
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            plugin.validate_runtime_support(index)?;
+        }
+        Ok(())
+    }
+}
+
+impl PluginConfig {
+    fn validate_runtime_support(&self, index: usize) -> anyhow::Result<()> {
+        if self.path.trim().is_empty() {
+            anyhow::bail!("LiveNodeConfig.plugins[{index}].path must not be empty");
+        }
+
+        if self.type_name.trim().is_empty() {
+            anyhow::bail!("LiveNodeConfig.plugins[{index}].type_name must not be empty");
+        }
+
+        if let Some(sha256) = &self.sha256 {
+            let valid = sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit());
+            if !valid {
+                anyhow::bail!(
+                    "LiveNodeConfig.plugins[{index}].sha256 must be a 64-character hex digest"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -865,10 +940,12 @@ mod tests {
         assert_eq!(config.data_engine.qsize, 100_000);
         assert_eq!(config.risk_engine.qsize, 100_000);
         assert_eq!(config.exec_engine.qsize, 100_000);
+        assert_eq!(config.timeout_connection, Duration::from_secs(60));
         assert!(config.exec_engine.reconciliation);
         assert!(!config.exec_engine.filter_unclaimed_external_orders);
         assert!(config.data_clients.is_empty());
         assert!(config.exec_clients.is_empty());
+        assert!(config.plugins.is_empty());
     }
 
     #[rstest]
@@ -1256,6 +1333,50 @@ mod tests {
     }
 
     #[rstest]
+    fn test_validate_runtime_support_rejects_empty_plugin_path() {
+        let config = LiveNodeConfig {
+            plugins: vec![PluginConfig {
+                type_name: "ExampleActor".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(error.contains("plugins[0].path"));
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_rejects_empty_plugin_type_name() {
+        let config = LiveNodeConfig {
+            plugins: vec![PluginConfig {
+                path: "./libexample.so".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(error.contains("plugins[0].type_name"));
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_rejects_invalid_plugin_sha256() {
+        let config = LiveNodeConfig {
+            plugins: vec![PluginConfig {
+                path: "./libexample.so".to_string(),
+                type_name: "ExampleActor".to_string(),
+                sha256: Some("not-a-digest".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(error.contains("sha256"));
+    }
+
+    #[rstest]
     fn test_live_exec_engine_config_defaults() {
         let config = LiveExecEngineConfig::default();
 
@@ -1390,6 +1511,11 @@ handle_revised_bars = true
 [exec_clients.hyperliquid]
 routing = { default = true, venues = ["HYPERLIQUID"] }
 instrument_provider = { load_all = true }
+
+[[plugins]]
+path = "./target/debug/examples/libcustom_data_plugin.so"
+type_name = "ExampleStrategy"
+config = { strategy_id = "ExampleStrategy-001", threshold = 10 }
 "#,
         )
         .unwrap();
@@ -1407,5 +1533,38 @@ instrument_provider = { load_all = true }
             Some(vec!["HYPERLIQUID".to_string()]),
         );
         assert!(exec_client.instrument_provider.load_all);
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(
+            config.plugins[0].path,
+            "./target/debug/examples/libcustom_data_plugin.so"
+        );
+        assert_eq!(config.plugins[0].type_name, "ExampleStrategy");
+        assert_eq!(
+            config.plugins[0].config["strategy_id"],
+            serde_json::json!("ExampleStrategy-001")
+        );
+        assert_eq!(config.plugins[0].config["threshold"], serde_json::json!(10));
+    }
+
+    #[rstest]
+    fn live_node_config_serde_roundtrip_with_event_store() {
+        let config = LiveNodeConfig {
+            event_store: Some(EventStoreConfig {
+                channel_capacity: 5_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let restored: LiveNodeConfig = serde_json::from_str(&json).expect("deserialize");
+
+        let restored_event_store = restored.event_store.expect("event_store present");
+        assert_eq!(restored_event_store.channel_capacity, 5_000);
+    }
+
+    #[rstest]
+    fn live_node_config_default_has_no_event_store() {
+        let config = LiveNodeConfig::default();
+        assert!(config.event_store.is_none());
     }
 }

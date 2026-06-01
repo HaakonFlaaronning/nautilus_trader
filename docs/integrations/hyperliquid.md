@@ -29,10 +29,11 @@ and won't need to work directly with these lower-level components.
 
 You can find live example scripts [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/hyperliquid/).
 
-## Builder attribution
+## Builder address
 
 Mainnet orders submitted through the adapter include a NautilusTrader builder address with a
-zero fee rate. This is for attribution only and does not charge any additional fees.
+**zero fee rate**, so it adds no trading cost to your orders. This helps us gauge real usage of
+the integration and prioritize ongoing maintenance and improvements.
 
 The builder address is omitted from orders in two cases:
 
@@ -115,22 +116,44 @@ though orders are live on the venue. See [GH-4010](https://github.com/nautechsys
 Hyperliquid offers linear perpetual futures, HIP-3 builder-deployed perpetuals, native
 spot markets, and HIP-4 binary outcome markets.
 
-| Product Type      | Data Feed | Trading   | Notes                                                 |
-|-------------------|-----------|-----------|-------------------------------------------------------|
-| Perpetual Futures | ✓         | ✓         | USDC‑settled linear perps (validator‑operated).       |
-| HIP‑3 Perpetuals  | ✓         | ✓         | Builder‑deployed perps. Excluded by default.          |
-| Spot              | ✓         | ✓         | Native spot markets.                                  |
-| HIP‑4 Outcomes    | ✓         | Partial   | USDH‑settled binaries; order placement awaits `splitOutcome` wiring. See [HIP-4 outcome markets](#hip-4-outcome-markets). |
+| Product Type      | Data Feed | Trading | Notes                                           |
+|-------------------|-----------|---------|-------------------------------------------------|
+| Spot              | ✓         | ✓       | Native spot markets.                            |
+| Perpetual Futures | ✓         | ✓       | USDC‑settled linear perps (validator‑operated). |
+| HIP‑3 Perpetuals  | ✓         | ✓       | Builder‑deployed perps. Opt‑in.                 |
+| HIP‑4 Outcomes    | ✓         | ✓       | USDH‑settled binary outcomes. Opt‑in.           |
 
 :::note
 All perpetual futures on Hyperliquid are settled in USDC. Spot markets are standard
 currency pairs. See [HIP-3 builder-deployed perpetuals](#hip-3-builder-deployed-perpetuals)
 and [HIP-4 outcome markets](#hip-4-outcome-markets) for configuration and opt-in details.
+Hyperliquid's current API docs mark `outcomeMeta` as testnet-only, so HIP-4 discovery
+depends on that payload being available from the selected environment.
 :::
 
 ## Symbology
 
 Hyperliquid uses a specific symbol format for instruments:
+
+### Spot markets
+
+Format: `{Base}-{Quote}-SPOT`
+
+Examples:
+
+- `PURR-USDC-SPOT` - PURR/USDC spot pair
+- `HYPE-USDC-SPOT` - HYPE/USDC spot pair
+
+To subscribe in your strategy:
+
+```python
+InstrumentId.from_str("PURR-USDC-SPOT.HYPERLIQUID")
+```
+
+:::note
+Spot instruments may include vault tokens (prefixed with `vntls:`). These are automatically
+handled by the instrument provider.
+:::
 
 ### Perpetual futures
 
@@ -170,47 +193,30 @@ To subscribe in your strategy:
 InstrumentId.from_str("xyz:TSLA-USD-PERP.HYPERLIQUID")
 ```
 
-### Spot markets
-
-Format: `{Base}-{Quote}-SPOT`
-
-Examples:
-
-- `PURR-USDC-SPOT` - PURR/USDC spot pair
-- `HYPE-USDC-SPOT` - HYPE/USDC spot pair
-
-To subscribe in your strategy:
-
-```python
-InstrumentId.from_str("PURR-USDC-SPOT.HYPERLIQUID")
-```
-
-:::note
-Spot instruments may include vault tokens (prefixed with `vntls:`). These are automatically
-handled by the instrument provider.
-:::
-
 ### HIP-4 outcome side tokens
 
-Format: `+{encoding}` (token form) or `#{encoding}` (spot-coin form), where
-`encoding = 10 * outcome + side` and `side` is `0` for Yes, `1` for No.
+Format: `{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`, where `outcome_index`
+is the `outcome` field from `outcomeMeta` and the middle segment names the
+binary side. The `-OUTCOME` suffix is symmetric with `-PERP` / `-SPOT`.
 
 [HIP-4](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-4-outcome-markets)
 side tokens are binary contracts that settle in USDH at `0` (loser) or `1`
-(winner). Nautilus uses the token form (`+{encoding}.HYPERLIQUID`); the wire
-`raw_symbol` uses the coin form (`#{encoding}`), which is what `l2Book` and
-`allMids` accept.
+(winner). The Nautilus symbol uses the human-readable form above; the wire
+`raw_symbol` uses the venue coin form `#{encoding}` (where
+`encoding = 10 * outcome_index + side`, `side` is `0` for Yes / `1` for No),
+which is what `l2Book` and `allMids` accept.
 
-Examples:
+Examples (outcome 25):
 
-- `+250.HYPERLIQUID`: Yes side of outcome 25.
-- `+251.HYPERLIQUID`: No side of outcome 25.
-- `#250`: equivalent wire symbol for market-data subscriptions.
+- `25-YES-OUTCOME.HYPERLIQUID`: Yes side. Encoding `250`, wire coin `#250`,
+  token name `+250`, action asset id `100_000_250`.
+- `25-NO-OUTCOME.HYPERLIQUID`: No side. Encoding `251`, wire coin `#251`,
+  token name `+251`, action asset id `100_000_251`.
 
 To subscribe in your strategy:
 
 ```python
-InstrumentId.from_str("+250.HYPERLIQUID")
+InstrumentId.from_str("25-YES-OUTCOME.HYPERLIQUID")
 ```
 
 :::note
@@ -332,16 +338,20 @@ through Nautilus until the venue rename resolves the collision.
 
 ## HIP-4 outcome markets
 
-[HIP-4](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-4-outcome-markets)
+[HIP-4](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/asset-ids#outcomes)
 markets are fully-collateralized binary contracts. Each market has two side
 tokens (Yes / No) that settle to `1 USDH` (winner) or `0 USDH` (loser) on the
-resolution date. The current live market is the recurring BTC daily binary,
-which settles at 06:00 UTC against the BTC mark price.
+resolution date. Hyperliquid's current API docs expose outcome metadata through
+`outcomeMeta` and mark that endpoint as testnet-only. The adapter treats outcome
+metadata as best-effort and skips HIP-4 instruments when the venue does not
+return that payload.
 
 ### Loading outcome instruments
 
 Include `HyperliquidProductType.OUTCOME` in `product_types` on both the data
-and exec client configs:
+and exec client configs. This opts into outcome discovery where the venue
+exposes `outcomeMeta`; current Hyperliquid docs mark that metadata endpoint as
+testnet-only.
 
 ```python
 from nautilus_trader.adapters.hyperliquid import HyperliquidDataClientConfig
@@ -357,10 +367,42 @@ HyperliquidDataClientConfig(
 ```
 
 The provider emits two `BinaryOption` instruments per outcome (one per side),
-denominated in USDH. `expiration_ns` is parsed from the venue description
-(`expiry:YYYYMMDD-HHMM`, UTC). Standalone binaries carry their own expiry;
-named and fallback outcomes inherit from their parent question. Defaults:
-`0.0001` per tick, `0.01` per lot.
+denominated in USDH. Symbols use the form
+`{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`. `expiration_ns` is parsed
+from the venue description (`expiry:YYYYMMDD-HHMM`, UTC). Standalone binaries
+carry their own expiry; named and fallback outcomes inherit from their
+parent question. Defaults: `0.0001` per tick, `0.01` per lot.
+
+Each instrument's `BinaryOption.info` carries the parsed venue metadata as a
+key/value map (consumed via `info["key"]` in Python or `Params.get_str(...)`
+in Rust). Derived identifiers are always populated; description-derived
+fields appear when the venue includes them.
+
+| Field              | Source                         | Notes                                             |
+|--------------------|--------------------------------|---------------------------------------------------|
+| `outcome_index`    | derived                        | `outcome` from `outcomeMeta`                      |
+| `outcome_side`     | derived                        | `0` = Yes, `1` = No                               |
+| `side_name`        | derived                        | `"Yes"` or `"No"`                                 |
+| `encoding`         | derived                        | `10 * outcome_index + side`                       |
+| `asset_id`         | derived                        | `100_000_000 + encoding`                          |
+| `market_name`      | `outcomeMeta.outcomes[*].name` | venue market label                                |
+| `class`            | description                    | `priceBinary` or `priceBucket`                    |
+| `underlying`       | description                    | underlying asset code                             |
+| `expiry`           | description                    | `YYYYMMDD-HHMM` UTC                               |
+| `target_price`     | description                    | binary settlement threshold                       |
+| `period`           | description                    | recurrence period (e.g. `1d`, `3m`)               |
+| `price_thresholds` | description                    | comma‑separated thresholds (bucket markets)       |
+| `named_index`      | named‑outcome description      | position in parent `named_outcomes` array         |
+| `is_fallback`      | fallback‑outcome description   | `true` for the `other` outcome of a question      |
+| `question`         | parent question                | question id                                       |
+| `question_name`    | parent question                | question label                                    |
+| `question_*`       | parent question description    | every parsed question field, `question_` prefixed |
+
+Description keys are lowered from venue camelCase to snake_case
+(`targetPrice` -> `target_price`, `priceThresholds` -> `price_thresholds`).
+Values are kept as strings to preserve wire fidelity; numeric identifiers
+(`outcome_index`, `outcome_side`, `encoding`, `asset_id`, `question`,
+`named_index`) are stored as JSON numbers.
 
 ### Settlement currency
 
@@ -374,36 +416,49 @@ carries USDH alongside USDC and any other non-zero spot holdings.
 
 ### Trading flow
 
-:::warning
-Order placement on outcome side tokens is not yet end-to-end working through
-the adapter. The venue requires a `splitOutcome` action to mint side-token
-pairs before orders can match; that action is not wired in this release.
-See [Current limitation](#current-limitation).
-:::
+Outcome side tokens (`{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`) trade
+through the standard order path. Submit `SubmitOrder` as you would for any
+perp or spot instrument; the execution client routes it through the same
+`Order` action against the venue's `#{encoding}` orderbook (where
+`encoding = 10 * outcome_index + outcome_side`). No HIP-4-specific call is
+needed.
 
-The full HIP-4 trade path is:
+Settlement is venue-driven; see [Settlement dispatch](#settlement-dispatch).
 
-1. `splitOutcome { outcome, amount }`: debit `amount` quote tokens, credit
-   `amount` Yes + `amount` No side tokens. Action type `userOutcome`.
-2. `order`: sell the side you don't want, or hold both for hedging. Buy Yes
-   at `p` equals Sell No at `1 - p` on the merged book.
-3. `negateOutcome { question, outcome, amount }`: for multi-outcome questions,
-   swap No shares of one outcome into Yes shares of every other.
+#### Advanced workflows
 
-#### Current limitation
+The full `userOutcome` action set is reachable directly on
+`HyperliquidHttpClient` (Rust and PyO3) for strategies that need to manage
+side-token inventory off-book:
 
-The adapter implements step 2 only. Buys on `+E.HYPERLIQUID` are rejected with
-`Insufficient spot balance asset=100000{encoding}` when the account holds no
-side tokens.
+```python
+from decimal import Decimal
+from nautilus_trader.core.nautilus_pyo3 import HyperliquidEnvironment
+from nautilus_trader.core.nautilus_pyo3 import HyperliquidHttpClient
 
-To trade outcomes today, perform the split off-adapter (for example through
-the Hyperliquid web UI) and the existing order path will operate on the
-resulting balances. Position reconciliation and account state work for
-positions acquired this way; settlement dispatch additionally requires the
-Rust execution client (see [Settlement dispatch](#settlement-dispatch)).
+client = HyperliquidHttpClient.from_env(HyperliquidEnvironment.MAINNET)
 
-A follow-up will wire `userOutcome` / `splitOutcome` / `negateOutcome` and
-expose them through a strategy-level helper.
+# Mint matched Yes + No side tokens from USDH (e.g. dual-side market making)
+await client.submit_split_outcome(50, Decimal("1.0"))
+
+# Burn a matched Yes + No pair back to USDH (amount=None merges the max)
+await client.submit_merge_outcome(50, None)
+
+# Multi-outcome priceBucket helpers
+await client.submit_merge_question(9, None)
+await client.submit_negate_outcome(9, 52, Decimal("1.0"))
+```
+
+| Action                  | Use case |
+|-------------------------|----------|
+| `submit_split_outcome`  | Mint paired Yes + No tokens from quote (initial market making, dual‑side hedges) |
+| `submit_merge_outcome`  | Burn a matched Yes + No pair back to quote without crossing the spread |
+| `submit_merge_question` | Close a full multi‑outcome basket back to quote atomically |
+| `submit_negate_outcome` | Convert No shares of one outcome into Yes shares of every other in the same question |
+
+For directional bets the ordinary `SubmitOrder` path is sufficient; the
+methods above are only needed when you want to create or destroy side-token
+inventory off-book.
 
 ### Order constraints
 
@@ -420,44 +475,20 @@ supported. The venue minimum is 10 USDH notional; size `order_qty` so that
 
 ### Settlement dispatch
 
-:::note
-Settlement polling is implemented in the Rust-native `HyperliquidExecutionClient`
-(used through `HyperliquidExecutionClientFactory`). The Python execution client
-in `nautilus_trader/adapters/hyperliquid/execution.py` does not start the poll
-and its config does not expose `outcome_settlement_poll_secs`. Strategies
-running through the standard `TradingNode` + `HyperliquidLiveExecClientFactory`
-path use the Python client and will not receive synthetic settlement fills.
-:::
+At expiry the venue closes held side-token balances and emits a `Settlement`
+fill per side. The adapter consumes these through the standard user-fills
+stream (HTTP poll and WebSocket); no synthetic dispatch runs.
 
-On connect, the Rust execution client starts a periodic `outcomeMeta` poll
-(`outcome_settlement_poll_secs`, default `60`; `0` disables). For each
-newly-resolved `(outcome_index, outcome_side)` pair held on the spot side it
-emits a synthetic position-closing `FillReport`:
+Each settlement fill:
 
-- `order_side`: `SELL`.
-- `last_qty`: held spot balance, snapped to `size_precision = 2`.
-- `last_px`: `1.0` USDH (winner) or `0.0` USDH (loser), at `price_precision = 4`.
-- `commission`: zero USDH.
-- `venue_order_id` and `trade_id` are deterministic
-  (`HYPERLIQUID-SETTLE-{idx}-{side}` and `-{final}`).
+- `order_side = SELL`, zero commission.
+- Price `1` USDH for the winning side, `0` for the loser.
+- Surfaces as a `FillReport`.
+- Also emits `OrderFilled` when WebSocket dispatch links the position to a
+  tracked order.
 
-An in-process tracker deduplicates pairs within a session.
-
-For multi-outcome `priceBucket` questions, resolution comes from
-`outcomeMeta.questions[*].settledNamedOutcomes`. When non-empty, the helper
-emits both sides per outcome: the winning named outcome resolves Yes -> `1` /
-No -> `0`; every losing named outcome and the fallback resolves
-Yes -> `0` / No -> `1`.
-
-Coverage gaps:
-
-- **Standalone `priceBinary` outcomes** (e.g. the recurring BTC daily): not
-  referenced by any question, so resolution needs a separate signal (such as
-  `settledOutcome`). Not yet implemented.
-- **Fallback-wins**: when no named outcome resolves and the fallback wins.
-  The helper currently emits only when a named outcome wins.
-- **Cross-restart dedup**: the tracker is in-process. A restart polling a
-  still-resolved outcome may re-emit; deterministic ids help consumers dedupe.
+Covers standalone `priceBinary` outcomes and multi-outcome `priceBucket`
+questions uniformly.
 
 ### Position reconciliation
 
@@ -475,8 +506,10 @@ HIP-4 side tokens arrive on `spotClearinghouseState` with `coin` set to the
 The venue exposes multi-outcome markets via the top-level `questions` array in
 `outcomeMeta`. Each question references a fallback outcome plus a sequence of
 named outcomes whose individual descriptions point back at the question via
-`index:N`. The Rust model decodes this shape today; the adapter currently
-treats each side token as an independent binary.
+`index:N`. Each side token is modeled as an independent `BinaryOption`
+instrument; the `submit_merge_question` and `submit_negate_outcome` actions
+on `HyperliquidHttpClient` operate at the question level for basket close
+and cross-outcome rotation.
 
 ## Instrument provider
 
@@ -504,17 +537,19 @@ instrument_provider=InstrumentProviderConfig(
 The adapter supports the following data subscriptions. All perpetual data types
 (mark prices, index prices, funding rates) apply to both standard and HIP-3 perps.
 
-| Data type         | Sub. | Snapshot | Hist. | Nautilus type        | Notes                         |
-|-------------------|------|----------|-------|----------------------|-------------------------------|
-| Trade ticks       | ✓    | -        | -     | `TradeTick`          | WebSocket trades.             |
-| Quote ticks       | ✓    | -        | -     | `QuoteTick`          | Best bid/offer.               |
-| Order book deltas | ✓    | ✓        | -     | `OrderBookDelta`     | L2 snapshots.                 |
-| Order book depth  | ✓    | -        | -     | `OrderBookDepth10`   | Top-10 L2 snapshots.          |
-| Bars              | ✓    | -        | ✓     | `Bar`                | Supported intervals below.    |
-| Mark prices       | ✓    | -        | -     | `MarkPriceUpdate`    | Perpetual mark price ticks.   |
-| Index prices      | ✓    | -        | -     | `IndexPriceUpdate`   | Underlying reference prices.  |
-| Funding rates     | ✓    | -        | ✓     | `FundingRateUpdate`  | `fundingHistory` endpoint.    |
-| All mids          | ✓    | -        | -     | `HyperliquidAllMids` | Custom data from `allMids`.   |
+| Data type         | Sub. | Snapshot | Hist. | Nautilus type                 | Notes                                 |
+|-------------------|------|----------|-------|-------------------------------|---------------------------------------|
+| Trade ticks       | ✓    | -        | -     | `TradeTick`                   | WebSocket trades.                     |
+| Quote ticks       | ✓    | -        | -     | `QuoteTick`                   | Best bid/offer.                       |
+| Order book deltas | ✓    | ✓        | -     | `OrderBookDelta`              | L2 snapshots.                         |
+| Order book depth  | ✓    | -        | -     | `OrderBookDepth10`            | Top-10 L2 snapshots.                  |
+| Bars              | ✓    | -        | ✓     | `Bar`                         | Supported intervals below.            |
+| Mark prices       | ✓    | -        | -     | `MarkPriceUpdate`             | Perpetual mark price ticks.           |
+| Index prices      | ✓    | -        | -     | `IndexPriceUpdate`            | Underlying reference prices.          |
+| Funding rates     | ✓    | -        | ✓     | `FundingRateUpdate`           | `fundingHistory` endpoint.            |
+| Open interest     | ✓    | -        | -     | `HyperliquidOpenInterest`     | Custom data from `activeAssetCtx`.    |
+| All mids          | ✓    | -        | -     | `HyperliquidAllMids`          | Custom data from `allMids`.           |
+| All dex contexts  | ✓    | -        | -     | `HyperliquidAllDexsAssetCtxs` | Custom data from `allDexsAssetCtxs`.  |
 
 :::note
 Historical quote and trade requests are not supported. Hyperliquid does not publish
@@ -526,7 +561,11 @@ a public trade-tape endpoint; real-time trades are available via the WebSocket
 
 The `l2Book` subscription accepts optional `nSigFigs` and `mantissa` parameters
 that thin the venue-side book aggregation. The adapter forwards them when
-passed through `subscribe_params` on book deltas and depth subscriptions:
+passed through `subscribe_params` on book deltas and depth subscriptions.
+
+Hyperliquid accepts `nSigFigs` values `2`, `3`, `4`, `5`, or omitted for full
+precision. `mantissa` is only valid when `nSigFigs=5` and accepts `1`, `2`, or
+`5`.
 
 ```python
 from nautilus_trader.model.data import BookType
@@ -542,13 +581,20 @@ Omitting both params subscribes to the full-depth book.
 
 ### Hyperliquid specific data
 
-The adapter emits `HyperliquidAllMids` custom data from the WebSocket `allMids`
-feed. Each update carries all currently reported mid prices in one payload.
+The adapter emits two Hyperliquid-specific custom data types:
 
-| Field      | Type             | Description                                             |
-|------------|------------------|---------------------------------------------------------|
-| `mids`     | `dict[str, str]` | Instrument ID to mid price mapping.                     |
-| `ts_event` | `int`            | UNIX timestamp in nanoseconds when the update occurred. |
+- `HyperliquidAllMids` from the WebSocket `allMids` feed. Each update carries
+  all currently reported mid prices in one payload.
+- `HyperliquidAllDexsAssetCtxs` from the WebSocket `allDexsAssetCtxs` feed.
+  Each update carries normalized per-instrument asset-context entries across
+  the default perp dex and HIP-3 builder dexes.
+- `HyperliquidOpenInterest` from the shared `activeAssetCtx` feed used by
+  mark prices, index prices, and funding rates.
+
+| Field      | Type             | Description                                              |
+|------------|------------------|----------------------------------------------------------|
+| `mids`     | `dict[str, str]` | Instrument ID to mid price mapping.                      |
+| `ts_event` | `int`            | UNIX timestamp in nanoseconds when the update occurred.  |
 | `ts_init`  | `int`            | UNIX timestamp in nanoseconds when the object was built. |
 
 Subscribe from an actor or strategy with `DataType(HyperliquidAllMids)`.
@@ -563,6 +609,104 @@ self.subscribe_data(
     data_type=DataType(HyperliquidAllMids, metadata={"dex": "hyperliquid"}),
     client_id=HYPERLIQUID_CLIENT_ID,
 )
+```
+
+`HyperliquidOpenInterest` carries the latest open interest for one
+perpetual instrument. Subscribe with the canonical Nautilus `instrument_id`
+in `metadata["instrument_id"]`:
+
+| Field           | Type           | Description                                                                 |
+|-----------------|----------------|-----------------------------------------------------------------------------|
+| `instrument_id` | `InstrumentId` | Canonical Nautilus instrument ID.                                           |
+| `open_interest` | `Decimal`      | Open interest parsed for direct arithmetic use.                             |
+| `ts_event`      | `int`          | UNIX timestamp in nanoseconds when the update occurred. Mirrors `ts_init`.  |
+| `ts_init`       | `int`          | UNIX timestamp in nanoseconds when the object was built.                    |
+
+```python
+from nautilus_trader.adapters.hyperliquid import HYPERLIQUID_CLIENT_ID
+from nautilus_trader.adapters.hyperliquid import HyperliquidOpenInterest
+from nautilus_trader.model.data import DataType
+
+self.subscribe_data(
+    data_type=DataType(
+        HyperliquidOpenInterest,
+        metadata={"instrument_id": str(self.instrument_id)},
+    ),
+    client_id=HYPERLIQUID_CLIENT_ID,
+)
+```
+
+`HyperliquidOpenInterest` reuses the same single underlying
+`activeAssetCtx` venue subscription that already backs mark prices, index
+prices, and funding rates for the same coin. Adding OI does not open a second
+parallel `activeAssetCtx` subscription.
+
+In a Python strategy running inside a `TradingNode`, the payload is delivered
+to `on_data` as the concrete custom data type itself:
+
+```python
+from decimal import Decimal
+
+from nautilus_trader.adapters.hyperliquid import HyperliquidOpenInterest
+
+def on_data(self, data) -> None:
+    if isinstance(data, HyperliquidOpenInterest):
+        if data.open_interest > Decimal("1000"):
+            self.log.info(f"OI {data.instrument_id} -> {data.open_interest}")
+```
+
+`HyperliquidAllDexsAssetCtxs` exposes a whole-feed aggregate rather than one
+topic per instrument, so strategies subscribe once and filter the normalized
+entries they need:
+
+| Field             | Type                              | Description                                                                |
+|-------------------|-----------------------------------|----------------------------------------------------------------------------|
+| `dex`             | `str`                             | Perp dex identifier from Hyperliquid `perpDexs`. `""` is the default dex.  |
+| `instrument_id`   | `InstrumentId`                    | Canonical Nautilus instrument ID for the entry.                            |
+| `mark_price`      | `Price`                           | Current mark price.                                                        |
+| `oracle_price`    | `Price`                           | Current oracle / index reference price.                                    |
+| `prev_day_price`  | `Price`                           | Previous day reference price from the venue payload.                       |
+| `mid_price`       | `Price \| None`                   | Mid price when present in the venue payload.                               |
+| `impact_prices`   | `HyperliquidImpactPrices \| None` | Best bid / ask impact prices when present.                                 |
+| `funding_rate`    | `Decimal`                         | Funding rate parsed for direct arithmetic use.                             |
+| `open_interest`   | `Decimal`                         | Open interest parsed for direct arithmetic use.                            |
+| `premium`         | `Decimal \| None`                 | Premium when present in the venue payload.                                 |
+| `day_ntl_volume`  | `Decimal`                         | 24h notional volume.                                                       |
+| `day_base_volume` | `Decimal`                         | 24h base volume.                                                           |
+| `ts_event`        | `int`                             | UNIX timestamp in nanoseconds when the update occurred. Mirrors `ts_init`. |
+| `ts_init`         | `int`                             | UNIX timestamp in nanoseconds when the object was built.                   |
+
+The underlying Hyperliquid wire payload arrives as
+`ctxs: [[dex, ctxs[]], ...]`. The adapter decodes that live venue format and
+normalizes it into the per-entry output shown below before the strategy sees
+the data.
+
+The adapter does not invent `dex` values. It bootstraps the ordered dex
+universe from Hyperliquid `meta` / `allPerpMetas` and resolves builder dex
+identifiers from the live `perpDexs` info endpoint. The empty string `""`
+represents Hyperliquid's default perp dex; non-empty values such as `xyz`,
+`flx`, or `vntl` are venue-defined builder dex identifiers.
+
+The mapping is resolved from the instruments loaded at connect, and the feed is
+positional (no per-entry coin name), so perps listed later only appear after a
+reconnect. A context-count mismatch for a dex logs a warning to reconnect;
+entries stay aligned positionally, which is correct for appended listings.
+
+```python
+from nautilus_trader.adapters.hyperliquid import HYPERLIQUID_CLIENT_ID
+from nautilus_trader.adapters.hyperliquid import HyperliquidAllDexsAssetCtxs
+from nautilus_trader.model.data import DataType
+
+self.subscribe_data(
+    data_type=DataType(HyperliquidAllDexsAssetCtxs),
+    client_id=HYPERLIQUID_CLIENT_ID,
+)
+
+def on_data(self, data) -> None:
+    if isinstance(data, HyperliquidAllDexsAssetCtxs):
+        for entry in data.entries:
+            if entry.dex == "xyz":
+                self.log.info(f"{entry.instrument_id} OI={entry.open_interest}")
 ```
 
 ### Supported bar intervals
@@ -596,14 +740,14 @@ instructions apply to both.
 
 ### Order types
 
-| Order Type          | Perpetuals | Spot | Notes                                                       |
-|---------------------|------------|------|-------------------------------------------------------------|
-| `MARKET`            | ✓          | ✓    | IOC limit with configurable slippage from best BBO.         |
-| `LIMIT`             | ✓          | ✓    |                                                             |
-| `STOP_MARKET`       | ✓          | ✓    | Stop loss orders.                                           |
-| `STOP_LIMIT`        | ✓          | ✓    | Stop loss with limit execution.                             |
-| `MARKET_IF_TOUCHED` | ✓          | ✓    | Take profit at market.                                      |
-| `LIMIT_IF_TOUCHED`  | ✓          | ✓    | Take profit with limit execution.                           |
+| Order Type          | Perpetuals | Spot | Notes                                               |
+|---------------------|------------|------|-----------------------------------------------------|
+| `MARKET`            | ✓          | ✓    | IOC limit with configurable slippage from best BBO. |
+| `LIMIT`             | ✓          | ✓    |                                                     |
+| `STOP_MARKET`       | ✓          | ✓    | Stop loss orders.                                   |
+| `STOP_LIMIT`        | ✓          | ✓    | Stop loss with limit execution.                     |
+| `MARKET_IF_TOUCHED` | ✓          | ✓    | Take profit at market.                              |
+| `LIMIT_IF_TOUCHED`  | ✓          | ✓    | Take profit with limit execution.                   |
 
 :::info
 Conditional orders (stop and if-touched) are implemented using Hyperliquid's native trigger
@@ -613,32 +757,34 @@ against the [mark price](https://hyperliquid.gitbook.io/hyperliquid-docs/trading
 
 :::note
 Market orders require cached quote data. The adapter uses the best ask (for buys) or best bid
-(for sells) with a configurable slippage buffer (default 50 bps). Prices are rounded to 5
-significant figures, which is a Hyperliquid API requirement for all limit prices. Ensure you
-subscribe to quotes for any instrument you intend to trade with market orders.
+(for sells) with a configurable slippage buffer (default 50 bps). Prices are rounded to
+Hyperliquid's price constraints before submission. Ensure you subscribe to quotes for any
+instrument you intend to trade with market orders.
 
-The slippage buffer is controlled by `market_order_slippage_bps` on
-`HyperliquidExecClientConfig` and can be overridden per-order via the
-`market_order_slippage_bps` key in `SubmitOrder.params`.
+When using the Rust-native execution client, the slippage buffer is controlled by
+`market_order_slippage_bps` on `HyperliquidExecClientConfig` and can be overridden per-order
+via the `market_order_slippage_bps` key in `SubmitOrder.params`. The Python `TradingNode` path
+uses a fixed 50 bps slippage and does not expose this knob on its config.
 :::
 
 :::note
 `STOP_MARKET` and `MARKET_IF_TOUCHED` orders do not carry a limit price. The adapter derives
 one from the trigger price with the same configurable slippage buffer (default 50 bps), rounds
-to 5 significant figures, and clamps to the instrument's price precision (ceiling for buys,
-floor for sells). This guarantees Hyperliquid's `limit_px >= trigger_px` (buys) /
+to 5 significant figures, and clamps to the venue decimal limit (ceiling for buys, floor for
+sells). This guarantees Hyperliquid's `limit_px >= trigger_px` (buys) /
 `limit_px <= trigger_px` (sells) constraint.
 :::
 
 :::warning
 **Price normalization is enabled by default.** Hyperliquid enforces a maximum of 5 significant
-figures on all order prices. This is a dynamic constraint that depends on the price magnitude
-and cannot be fully encoded in the static instrument price precision. For example, if ETH is
-trading at $2,600 (4 integer digits), only 1 decimal place is allowed despite the instrument
-having `price_precision=2`.
+figures on order prices, plus a per-asset decimal limit based on `szDecimals`
+(`6 - szDecimals` for perps, `8 - szDecimals` for spot). For example, if ETH is trading at
+$2,600 (4 integer digits), only 1 decimal place is allowed despite the instrument having
+`price_precision=2`.
 
 By default, the adapter normalizes all outgoing limit and trigger prices to 5 significant
-figures to prevent order rejections. This means your submitted prices may shift slightly.
+figures and clamps them to the instrument price precision to prevent order rejections. This
+means your submitted prices may shift slightly.
 To disable this and take full control of price formatting, set `normalize_prices=False`
 in your `HyperliquidExecClientConfig`.
 
@@ -683,19 +829,20 @@ ALO (Add-Liquidity-Only) lane.
 
 ### Order operations
 
-| Operation         | Perpetuals | Spot | Notes                                                    |
-|-------------------|------------|------|----------------------------------------------------------|
-| Submit order      | ✓          | ✓    | Single order submission.                                 |
-| Submit order list | ✓          | ✓    | Batch order submission (single API call).                |
-| Modify order      | ✓          | ✓    | Requires venue order ID.                                 |
-| Cancel order      | ✓          | ✓    | Cancel by client order ID.                               |
-| Cancel all orders | ✓          | ✓    | Single batched `cancelByCloid` for open orders.          |
-| Batch cancel      | ✓          | ✓    | Single batched `cancelByCloid` for the provided list.    |
+| Operation         | Perpetuals | Spot | Notes                                                 |
+|-------------------|------------|------|-------------------------------------------------------|
+| Submit order      | ✓          | ✓    | Single order submission.                              |
+| Submit order list | ✓          | ✓    | Batch order submission (single API call).             |
+| Modify order      | ✓          | ✓    | Requires venue order ID.                              |
+| Cancel order      | ✓          | ✓    | Cancel by client order ID.                            |
+| Cancel all orders | ✓          | ✓    | Single batched `cancelByCloid` for open orders.       |
+| Batch cancel      | ✓          | ✓    | Single batched `cancelByCloid` for the provided list. |
 
 :::info
-When the venue rejects individual orders inside a batch cancel (for example
-`MissingOrder` for an already-terminal order), the adapter emits a per-order
-`OrderCancelRejected` event and leaves the other cancels intact.
+When the venue returns an authoritative per-order rejection inside a batch-cancel response (for
+example `MissingOrder` for an already-terminal order), the adapter emits a per-order
+`OrderCancelRejected` event and leaves the other cancels intact. Whole-request failures with
+unknown venue outcome do not carry this per-order evidence.
 :::
 
 :::info
@@ -748,11 +895,11 @@ sequenceDiagram
     HTTP-->>ExecClient: { status: "ok" }
     ExecClient->>Dispatch: mark_pending_modify(cloid, old_oid)
     WS-->>ExecClient: ACCEPTED(new_oid, cloid)
-    ExecClient->>Dispatch: dispatch_order_status_report()
+    ExecClient->>Dispatch: dispatch_order_event()
     Dispatch->>Dispatch: cached_voi != new_oid -> promote to OrderUpdated,<br/>clear_pending_modify, record_venue_order_id(new_oid)
     Dispatch-->>Strategy: OrderUpdated(venue_order_id=new_oid)
     WS-->>ExecClient: CANCELED(old_oid, cloid)
-    ExecClient->>Dispatch: dispatch_order_status_report()
+    ExecClient->>Dispatch: dispatch_order_event()
     Dispatch->>Dispatch: cached_voi != old_oid -> Skip (stale cancel)
 ```
 
@@ -876,10 +1023,10 @@ We recommend using environment variables to manage your credentials.
 
 ## Agent wallets
 
-Hyperliquid lets a master account approve an [agent wallet](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets)
-(also called an API wallet or sub-key) that signs orders on the master's
-behalf. Orders signed by the agent belong to the master account, not to the
-agent's address.
+Hyperliquid lets a master account approve an
+[agent wallet](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets)
+(also called an API wallet or sub-key) that signs orders on the master's behalf.
+Orders signed by the agent belong to the master account, not to the agent's address.
 
 If your `HYPERLIQUID_PK` (or `HYPERLIQUID_TESTNET_PK`) is an agent wallet, you
 must also set `account_address` (or the `HYPERLIQUID_ACCOUNT_ADDRESS`
@@ -888,12 +1035,22 @@ queries the agent's address for balances, orders, and WebSocket events, which
 owns nothing, and submitted orders will never reconcile (no
 `OrderStatusReport`, no fills surfaced).
 
-Resolution order for the user address used by info queries and WebSocket
-subscriptions:
+The execution factory resolves one account address and passes that same value
+to REST account queries and WebSocket user subscriptions. Signing still uses
+the configured private key, and vault trading still sends `vaultAddress` in the
+signed exchange payload when `vault_address` is set.
+
+Explicit config values take precedence over environment variables. Environment
+variables fill only omitted config values.
+
+Resolution order for the execution account address used by info queries and
+WebSocket subscriptions:
 
 1. `account_address` (master account when using an agent wallet).
 2. `vault_address` (vault sub-account).
-3. The address derived from the private key (the wallet itself).
+3. `HYPERLIQUID_ACCOUNT_ADDRESS`.
+4. `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT`.
+5. The address derived from the private key (the wallet itself).
 
 :::note
 `HYPERLIQUID_ACCOUNT_ADDRESS` is a single env var shared by both mainnet and
@@ -911,17 +1068,20 @@ relying on the shared environment variable.
 
 ## Vault trading
 
-Hyperliquid supports [vault trading](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/vaults),
-where a wallet operates on behalf of a vault (sub-account). Orders are signed with the
-wallet's private key but include the vault address in the signature payload.
+Hyperliquid supports
+[vault trading](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/vaults), where a wallet
+operates on behalf of a vault (sub-account). Orders are signed with the wallet's private key
+but include the vault address in the signature payload.
 
 To trade via a vault, set the `vault_address` in your execution client config (or set the
 `HYPERLIQUID_VAULT` / `HYPERLIQUID_TESTNET_VAULT` environment variable).
 
 :::warning
-When vault trading is enabled, WebSocket subscriptions for order and fill updates automatically
-use the vault address instead of the wallet address. This is required to receive the vault's
-order and fill events.
+For normal vault trading, leave `account_address` unset so `vault_address`
+becomes the account address used for REST queries and WebSocket user
+subscriptions. If both `account_address` and `vault_address` are set,
+`account_address` wins for queries and subscriptions, while `vault_address`
+still goes into the signed exchange payload.
 :::
 
 ## Funding rates
@@ -934,37 +1094,51 @@ Hyperliquid perpetual futures use a fixed 1-hour funding interval. The adapter s
 The adapter implements a token bucket rate limiter for Hyperliquid's REST API with a capacity
 of 1200 weight per minute. HTTP info requests are automatically retried with exponential
 backoff (full jitter) on rate limit (429) and server error (5xx) responses.
+For WebSocket post trading requests, the adapter caps simultaneous inflight messages at 100 to
+match the venue limit.
 
 ## Configuration
 
 ### Data client configuration options
 
-| Option              | Default | Description                                     |
-|---------------------|---------|-------------------------------------------------|
-| `environment`       | `None`  | Environment enum (`MAINNET` or `TESTNET`).       |
-| `base_url_ws`       | `None`  | Override for the WebSocket base URL.            |
-| `product_types`     | `None`  | Optional product types to load, for example `PERP_HIP3` for HIP-3 perps. |
-| `http_timeout_secs` | `10`    | Timeout (seconds) applied to REST calls.        |
-| `proxy_url`         | `None`  | Optional proxy URL for HTTP and WebSocket transports. |
+| Option              | Default   | Description |
+|---------------------|-----------|-------------------------------------------------|
+| `environment`       | `None`    | Environment enum (`MAINNET` or `TESTNET`). |
+| `base_url_ws`       | `None`    | Override for the WebSocket base URL. |
+| `product_types`     | `None`    | Optional product types to load, for example `PERP_HIP3` for HIP-3 perps. |
+| `http_timeout_secs` | `10`      | Timeout (seconds) applied to REST calls. |
+| `proxy_url`         | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `transport_backend` | `Sockudo` | WebSocket transport backend. |
 
 ### Execution client configuration options
 
-| Option                      | Default | Description                                                                               |
-|-----------------------------|---------|-------------------------------------------------------------------------------------------|
-| `private_key`               | `None`  | EVM private key; loaded from `HYPERLIQUID_PK` or `HYPERLIQUID_TESTNET_PK` when omitted.   |
-| `vault_address`             | `None`  | Vault address; loaded from `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT` if omitted. |
-| `account_address`           | `None`  | Main account address for agent wallet trading; loaded from `HYPERLIQUID_ACCOUNT_ADDRESS`. |
-| `environment`               | `None`  | Environment enum (`MAINNET` or `TESTNET`).                                           |
-| `base_url_ws`               | `None`  | Override for the WebSocket base URL.                                                      |
-| `product_types`             | `None`  | Optional product types to load, for example `PERP_HIP3` for HIP-3 perps.                  |
-| `max_retries`               | `None`  | Maximum retry attempts for submit, cancel, or modify order requests.                      |
-| `retry_delay_initial_ms`    | `None`  | Initial delay (milliseconds) between retries.                                             |
-| `retry_delay_max_ms`        | `None`  | Maximum delay (milliseconds) between retries.                                             |
-| `http_timeout_secs`         | `10`    | Timeout (seconds) applied to REST calls.                                                  |
-| `normalize_prices`          | `True`  | Normalize order prices to 5 significant figures before submission.                        |
-| `market_order_slippage_bps` | `50`    | Slippage buffer (bps) applied to MARKET and stop trigger derivations.                     |
-| `outcome_settlement_poll_secs` | `60` | HIP‑4 `outcomeMeta` settlement poll interval (seconds). Rust‑only; `0` disables polling. |
-| `proxy_url`                 | `None`  | Optional proxy URL for HTTP and WebSocket transports.                                     |
+| Option                         | Default   | Description |
+|--------------------------------|-----------|-------------------------------------------------------------------------------------------|
+| `private_key`                  | `None`    | EVM private key; loaded from `HYPERLIQUID_PK` or `HYPERLIQUID_TESTNET_PK` when omitted. |
+| `vault_address`                | `None`    | Vault address; loaded from `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT` if omitted. |
+| `account_address`              | `None`    | Main account address for agent wallet trading; loaded from `HYPERLIQUID_ACCOUNT_ADDRESS`. |
+| `environment`                  | `None`    | Environment enum (`MAINNET` or `TESTNET`); resolves to `MAINNET` when unset. |
+| `base_url_ws`                  | `None`    | Override for the WebSocket base URL. |
+| `product_types`                | `None`    | Optional product types to load, for example `PERP_HIP3` for HIP-3 perps. |
+| `max_retries`                  | `None`    | Maximum retry attempts for submit, cancel, or modify order requests. Rust‑only. |
+| `retry_delay_initial_ms`       | `None`    | Initial delay (milliseconds) between retries. Rust‑only. |
+| `retry_delay_max_ms`           | `None`    | Maximum delay (milliseconds) between retries. Rust‑only. |
+| `http_timeout_secs`            | `10`      | Timeout (seconds) applied to REST calls. |
+| `normalize_prices`             | `True`    | Normalize order prices to 5 significant figures before submission. |
+| `market_order_slippage_bps`    | `50`      | Slippage buffer (bps) applied to MARKET and stop trigger derivations. Rust‑only. |
+| `outcome_settlement_poll_secs` | `0`       | HIP‑4 `outcomeMeta` settlement poll interval (seconds). Rust‑only; venue `Settlement` fills cover settlement, so polling is disabled by default. |
+| `proxy_url`                    | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `transport_backend`            | `Sockudo` | WebSocket transport backend. |
+
+:::note
+"Rust‑only" options apply when the execution client is created through the Rust-native
+`HyperliquidExecutionClientFactory`. `market_order_slippage_bps` and
+`outcome_settlement_poll_secs` are not exposed on the Python
+`HyperliquidExecClientConfig` and will be rejected by the config validator if set on
+that path. `max_retries`, `retry_delay_initial_ms`, and `retry_delay_max_ms` are
+declared on the Python config but are not yet forwarded to the Python execution
+client.
+:::
 
 ### Configuration example
 

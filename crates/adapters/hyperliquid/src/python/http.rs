@@ -29,6 +29,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use pyo3::{prelude::*, types::PyList};
+use rust_decimal::Decimal;
 use serde_json::to_string;
 
 use crate::{
@@ -49,7 +50,7 @@ impl HyperliquidHttpClient {
     fn py_new(
         private_key: Option<String>,
         vault_address: Option<String>,
-        account_address: Option<String>,
+        account_address: Option<&str>,
         environment: HyperliquidEnvironment,
         timeout_secs: u64,
         proxy_url: Option<String>,
@@ -159,6 +160,25 @@ impl HyperliquidHttpClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let meta = client.load_perp_meta().await.map_err(to_pyvalue_err)?;
             to_string(&meta).map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Builds the `allDexsAssetCtxs` normalization map from dex name to ordered instrument IDs.
+    ///
+    /// The order of instrument IDs must match the venue universe ordering for each perp dex so
+    /// incoming `ctxs` arrays can be normalized without leaking raw positional payloads.
+    #[pyo3(name = "build_all_dex_asset_ctxs_instrument_ids")]
+    fn py_build_all_dex_asset_ctxs_instrument_ids<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mapping = client
+                .build_all_dex_asset_ctxs_instrument_ids()
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(mapping.into_iter().collect::<HashMap<_, _>>())
         })
     }
 
@@ -705,6 +725,100 @@ impl HyperliquidHttpClient {
                 .await
                 .map_err(to_pyvalue_err)?;
             to_string(&json).map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Split an HIP-4 outcome's quote tokens into matched Yes and No side tokens.
+    ///
+    /// Submits a `userOutcome` exchange action with the `splitOutcome` operation:
+    /// debits `amount` quote tokens (USDH) and credits `amount` Yes plus `amount`
+    /// No side tokens for the given `outcome` index. Ordinary directional
+    /// buys and sells on outcome instruments go through the standard order path
+    /// without calling this; the action is for dual-side market making and
+    /// inventory creation.
+    #[pyo3(name = "submit_split_outcome")]
+    fn py_submit_split_outcome<'py>(
+        &self,
+        py: Python<'py>,
+        outcome: u32,
+        amount: Decimal,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let response = client
+                .submit_split_outcome(outcome, amount)
+                .await
+                .map_err(to_pyvalue_err)?;
+            to_string(&response).map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Merge matched Yes + No side-token pairs of an HIP-4 outcome back into quote tokens.
+    ///
+    /// Submits a `userOutcome` action with the `mergeOutcome` operation. Pass
+    /// `amount = None` to merge the maximum mergeable balance (venue-side
+    /// `null`).
+    #[pyo3(name = "submit_merge_outcome", signature = (outcome, amount=None))]
+    fn py_submit_merge_outcome<'py>(
+        &self,
+        py: Python<'py>,
+        outcome: u32,
+        amount: Option<Decimal>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let response = client
+                .submit_merge_outcome(outcome, amount)
+                .await
+                .map_err(to_pyvalue_err)?;
+            to_string(&response).map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Merge `Yes` shares of every outcome in a multi-outcome question into quote tokens.
+    ///
+    /// Submits a `userOutcome` action with the `mergeQuestion` operation. Pass
+    /// `amount = None` to merge the maximum balance.
+    #[pyo3(name = "submit_merge_question", signature = (question, amount=None))]
+    fn py_submit_merge_question<'py>(
+        &self,
+        py: Python<'py>,
+        question: u32,
+        amount: Option<Decimal>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let response = client
+                .submit_merge_question(question, amount)
+                .await
+                .map_err(to_pyvalue_err)?;
+            to_string(&response).map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Swap `No` shares of one outcome into `Yes` shares of every other outcome.
+    ///
+    /// Submits a `userOutcome` action with the `negateOutcome` operation. Both
+    /// outcomes must belong to the same multi-outcome `question`.
+    #[pyo3(name = "submit_negate_outcome")]
+    fn py_submit_negate_outcome<'py>(
+        &self,
+        py: Python<'py>,
+        question: u32,
+        outcome: u32,
+        amount: Decimal,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let response = client
+                .submit_negate_outcome(question, outcome, amount)
+                .await
+                .map_err(to_pyvalue_err)?;
+            to_string(&response).map_err(to_pyvalue_err)
         })
     }
 }

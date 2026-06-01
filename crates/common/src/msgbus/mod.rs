@@ -60,6 +60,7 @@ use nautilus_model::{
         option_chain::{OptionChainSlice, OptionGreeks},
     },
     events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
+    instruments::InstrumentAny,
     orderbook::OrderBook,
 };
 use smallvec::SmallVec;
@@ -77,6 +78,7 @@ pub use self::{
     },
     typed_router::{TopicRouter, TypedSubscription},
 };
+use crate::timer::TimeEvent;
 
 /// Inline capacity for handler buffers before heap allocation.
 pub(super) const HANDLER_BUFFER_CAP: usize = 64;
@@ -126,6 +128,8 @@ thread_local! {
     pub(super) static ORDER_EVENT_HANDLERS: RefCell<SmallVec<[TypedHandler<OrderEventAny>; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
     pub(super) static POSITION_EVENT_HANDLERS: RefCell<SmallVec<[TypedHandler<PositionEvent>; HANDLER_BUFFER_CAP]>> =
+        RefCell::new(SmallVec::new());
+    pub(super) static INSTRUMENT_HANDLERS: RefCell<SmallVec<[TypedHandler<InstrumentAny>; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
 
     #[cfg(feature = "defi")]
@@ -234,4 +238,9 @@ pub(super) fn dispatch_tap_response(correlation_id: &UUID4, message: &dyn Any) {
     if let Some(tap) = tap {
         tap.on_response(correlation_id, message);
     }
+}
+
+#[inline]
+pub(crate) fn dispatch_tap_time_event(event: &TimeEvent) {
+    dispatch_tap_publish(MessagingSwitchboard::time_event_topic(), event);
 }

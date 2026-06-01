@@ -37,6 +37,7 @@ use nautilus_model::{
         option_chain::{OptionChainSlice, OptionGreeks},
     },
     events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
+    instruments::InstrumentAny,
     orderbook::OrderBook,
     orders::OrderAny,
     position::Position,
@@ -47,9 +48,9 @@ use ustr::Ustr;
 use super::{
     ACCOUNT_STATE_HANDLERS, ANY_HANDLERS, BAR_HANDLERS, BOOK_HANDLERS, DELTAS_HANDLERS,
     DEPTH10_HANDLERS, FUNDING_RATE_HANDLERS, GREEKS_HANDLERS, HANDLER_BUFFER_CAP,
-    INDEX_PRICE_HANDLERS, MARK_PRICE_HANDLERS, OPTION_CHAIN_HANDLERS, OPTION_GREEKS_HANDLERS,
-    ORDER_EVENT_HANDLERS, PORTFOLIO_SNAPSHOT_HANDLERS, POSITION_EVENT_HANDLERS, QUOTE_HANDLERS,
-    TRADE_HANDLERS,
+    INDEX_PRICE_HANDLERS, INSTRUMENT_HANDLERS, MARK_PRICE_HANDLERS, OPTION_CHAIN_HANDLERS,
+    OPTION_GREEKS_HANDLERS, ORDER_EVENT_HANDLERS, PORTFOLIO_SNAPSHOT_HANDLERS,
+    POSITION_EVENT_HANDLERS, QUOTE_HANDLERS, TRADE_HANDLERS,
     core::{MessageBus, Subscription},
     dispatch_tap_publish, dispatch_tap_response, dispatch_tap_send, get_message_bus,
     matching::is_matching_backtracking,
@@ -255,10 +256,14 @@ pub fn subscribe_any(
 /// Subscribes a handler to instrument messages matching a pattern.
 pub fn subscribe_instruments(
     pattern: MStr<Pattern>,
-    handler: ShareableMessageHandler,
+    handler: TypedHandler<InstrumentAny>,
     priority: Option<u32>,
 ) {
-    subscribe_any(pattern, handler, priority);
+    get_message_bus().borrow_mut().router_instruments.subscribe(
+        pattern,
+        handler,
+        priority.unwrap_or(0),
+    );
 }
 
 /// Subscribes a handler to instrument close messages matching a pattern.
@@ -557,8 +562,11 @@ pub fn subscribe_defi_flash(
 }
 
 /// Unsubscribes a handler from instrument messages.
-pub fn unsubscribe_instruments(pattern: MStr<Pattern>, handler: &ShareableMessageHandler) {
-    unsubscribe_any(pattern, handler);
+pub fn unsubscribe_instruments(pattern: MStr<Pattern>, handler: &TypedHandler<InstrumentAny>) {
+    get_message_bus()
+        .borrow_mut()
+        .router_instruments
+        .unsubscribe(pattern, handler);
 }
 
 /// Unsubscribes a handler from instrument close messages.
@@ -936,6 +944,16 @@ pub fn publish_any(topic: MStr<Topic>, message: &dyn Any) {
     ANY_HANDLERS.with_borrow_mut(|buf| *buf = handlers);
 }
 
+/// Publishes an instrument to subscribers on a topic.
+pub fn publish_instrument(topic: MStr<Topic>, instrument: &InstrumentAny) {
+    publish_typed(
+        topic,
+        &INSTRUMENT_HANDLERS,
+        |bus, h| bus.router_instruments.fill_matching_handlers(topic, h),
+        instrument,
+    );
+}
+
 /// Publishes order book deltas to subscribers on a topic.
 pub fn publish_deltas(topic: MStr<Topic>, deltas: &OrderBookDeltas) {
     publish_typed(
@@ -1265,6 +1283,8 @@ pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
             DataResponse::Instrument(resp) => handler.0.handle(resp.as_ref()),
             DataResponse::Instruments(resp) => handler.0.handle(resp),
             DataResponse::Book(resp) => handler.0.handle(resp),
+            DataResponse::BookDeltas(resp) => handler.0.handle(resp),
+            DataResponse::BookDepth(resp) => handler.0.handle(resp),
             DataResponse::Quotes(resp) => handler.0.handle(resp),
             DataResponse::Trades(resp) => handler.0.handle(resp),
             DataResponse::FundingRates(resp) => handler.0.handle(resp),
@@ -1487,8 +1507,8 @@ mod tests {
     use nautilus_model::{
         data::{Bar, OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick},
         enums::OrderSide,
-        events::OrderDenied,
-        identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
+        events::order::spec::OrderDeniedSpec,
+        identifiers::{ClientId, InstrumentId, StrategyId, TraderId},
     };
     use rstest::rstest;
 
@@ -1730,6 +1750,7 @@ mod tests {
             UUID4::new(),
             0.into(),
             None,
+            None, // correlation_id
         ));
         send_trading_command(endpoint, cmd);
 
@@ -1773,11 +1794,6 @@ mod tests {
 
     #[rstest]
     fn test_send_order_event_allows_reentrant_topic_access() {
-        use nautilus_model::{
-            events::OrderDenied,
-            identifiers::{ClientOrderId, StrategyId, TraderId},
-        };
-
         use crate::msgbus::switchboard::get_quotes_topic;
 
         let _msgbus = get_message_bus();
@@ -1793,16 +1809,7 @@ mod tests {
         let endpoint: MStr<Endpoint> = "ReentrantTest.orderEvent".into();
         register_order_event_endpoint(endpoint, handler);
 
-        let event = OrderEventAny::Denied(OrderDenied::new(
-            TraderId::new("TESTER-001"),
-            StrategyId::new("S-001"),
-            InstrumentId::from("TEST.VENUE"),
-            ClientOrderId::new("O-001"),
-            "test denied".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        ));
+        let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
         send_order_event(endpoint, event);
 
         assert!(*topic_retrieved.borrow());
@@ -2000,6 +2007,7 @@ mod tests {
                 UUID4::new(),
                 0.into(),
                 None,
+                None, // correlation_id
             ));
             send_trading_command(cmd_endpoint, command);
             *command_sent_clone.borrow_mut() = true;
@@ -2008,16 +2016,7 @@ mod tests {
         let event_endpoint: MStr<Endpoint> = "ReentrantTest.orderEvt".into();
         register_order_event_endpoint(event_endpoint, event_handler);
 
-        let event = OrderEventAny::Denied(OrderDenied::new(
-            TraderId::new("TESTER-001"),
-            StrategyId::new("S-001"),
-            InstrumentId::from("TEST.VENUE"),
-            ClientOrderId::new("O-001"),
-            "Test denial".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        ));
+        let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
         send_order_event(event_endpoint, event);
 
         assert!(
@@ -2091,16 +2090,7 @@ mod tests {
         register_order_event_endpoint(evt_endpoint, evt_handler);
 
         let cmd_handler = TypedIntoHandler::from(move |_cmd: TradingCommand| {
-            let event = OrderEventAny::Denied(OrderDenied::new(
-                TraderId::new("TESTER-001"),
-                StrategyId::new("S-001"),
-                InstrumentId::from("TEST.VENUE"),
-                ClientOrderId::new("O-001"),
-                "Test denial".into(),
-                UUID4::new(),
-                0.into(),
-                0.into(),
-            ));
+            let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
             send_order_event(evt_endpoint, event);
             *event_sent_clone.borrow_mut() = true;
         });
@@ -2117,6 +2107,7 @@ mod tests {
             UUID4::new(),
             0.into(),
             None,
+            None, // correlation_id
         ));
         send_trading_command(cmd_endpoint, command);
 
@@ -2148,16 +2139,7 @@ mod tests {
         let call_depth_clone2 = call_depth.clone();
         let mid_cmd_handler = TypedIntoHandler::from(move |_cmd: TradingCommand| {
             *call_depth_clone2.borrow_mut() += 1;
-            let event = OrderEventAny::Denied(OrderDenied::new(
-                TraderId::new("TESTER-001"),
-                StrategyId::new("S-001"),
-                InstrumentId::from("TEST.VENUE"),
-                ClientOrderId::new("O-002"),
-                "Nested denial".into(),
-                UUID4::new(),
-                0.into(),
-                0.into(),
-            ));
+            let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
             send_order_event(final_evt_endpoint, event);
         });
         let mid_cmd_endpoint: MStr<Endpoint> = "ReentrantTest.midCmd".into();
@@ -2175,22 +2157,14 @@ mod tests {
                 UUID4::new(),
                 0.into(),
                 None,
+                None, // correlation_id
             ));
             send_trading_command(mid_cmd_endpoint, command);
         });
         let init_evt_endpoint: MStr<Endpoint> = "ReentrantTest.initEvt".into();
         register_order_event_endpoint(init_evt_endpoint, init_evt_handler);
 
-        let event = OrderEventAny::Denied(OrderDenied::new(
-            TraderId::new("TESTER-001"),
-            StrategyId::new("S-001"),
-            InstrumentId::from("TEST.VENUE"),
-            ClientOrderId::new("O-001"),
-            "Initial denial".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        ));
+        let event = OrderEventAny::Denied(OrderDeniedSpec::builder().build());
         send_order_event(init_evt_endpoint, event);
 
         assert_eq!(
@@ -2312,6 +2286,7 @@ mod tests {
             UUID4::new(),
             nautilus_core::UnixNanos::from(1),
             None,
+            None, // correlation_id
         );
         send_trading_command(
             "endpoint.send.trading.command.test".into(),

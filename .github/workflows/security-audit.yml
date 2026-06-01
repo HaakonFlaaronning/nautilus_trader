@@ -61,7 +61,7 @@ jobs:
     outputs:
       audit_needed: ${{ steps.filter.outputs.audit_needed }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -93,16 +93,8 @@ jobs:
       contents: read
       actions: read
       security-events: write
-    environment:
-      name: >-
-        ${{
-          (github.ref_name == github.event.repository.default_branch ||
-          github.ref_name == 'master') &&
-          'security-audit' ||
-          'security-audit-test'
-        }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -119,7 +111,7 @@ jobs:
         run: echo "uv_version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: ${{ steps.uv-version.outputs.uv_version }}
           enable-cache: true
@@ -138,7 +130,7 @@ jobs:
           hashFiles('zizmor.sarif') != '' &&
           (github.event_name != 'pull_request' ||
           !github.event.pull_request.head.repo.fork)
-        uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4.35.3
         with:
           sarif_file: zizmor.sarif
           category: zizmor
@@ -148,16 +140,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.audit_needed == 'true'
     runs-on: ubuntu-22.04
-    environment:
-      name: >-
-        ${{
-          (github.ref_name == github.event.repository.default_branch ||
-          github.ref_name == 'master') &&
-          'security-audit' ||
-          'security-audit-test'
-        }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -182,16 +166,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.audit_needed == 'true'
     runs-on: ubuntu-22.04
-    environment:
-      name: >-
-        ${{
-          (github.ref_name == github.event.repository.default_branch ||
-          github.ref_name == 'master') &&
-          'security-audit' ||
-          'security-audit-test'
-        }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -216,16 +192,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.audit_needed == 'true'
     runs-on: ubuntu-22.04
-    environment:
-      name: >-
-        ${{
-          (github.ref_name == github.event.repository.default_branch ||
-          github.ref_name == 'master') &&
-          'security-audit' ||
-          'security-audit-test'
-        }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -250,16 +218,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.audit_needed == 'true'
     runs-on: ubuntu-22.04
-    environment:
-      name: >-
-        ${{
-          (github.ref_name == github.event.repository.default_branch ||
-          github.ref_name == 'master') &&
-          'security-audit' ||
-          'security-audit-test'
-        }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -295,16 +255,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.audit_needed == 'true'
     runs-on: ubuntu-22.04
-    environment:
-      name: >-
-        ${{
-          (github.ref_name == github.event.repository.default_branch ||
-          github.ref_name == 'master') &&
-          'security-audit' ||
-          'security-audit-test'
-        }}
     steps:
-      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-

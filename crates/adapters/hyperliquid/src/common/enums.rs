@@ -19,7 +19,7 @@ use nautilus_model::enums::{AggressorSide, OrderSide, OrderStatus, OrderType};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
-use super::consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH;
+use super::{consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH, parse::OUTCOME_SYMBOL_SUFFIX};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HyperliquidBarInterval {
@@ -786,6 +786,31 @@ pub enum HyperliquidFillDirection {
     Buy,
     /// Selling an asset (spot only).
     Sell,
+    /// HIP-4 outcome settlement; venue closes side-token holdings at the
+    /// resolved value (1 quote token for the winning side, 0 for the loser).
+    #[serde(rename = "Settlement")]
+    #[strum(serialize = "Settlement")]
+    Settlement,
+    /// HIP-4 `userOutcome / splitOutcome`: minting paired Yes + No side tokens
+    /// from quote tokens. Venue emits one fill per side at the mid price.
+    #[serde(rename = "Split Outcome")]
+    #[strum(serialize = "Split Outcome")]
+    SplitOutcome,
+    /// HIP-4 `userOutcome / mergeOutcome`: burning paired Yes + No side tokens
+    /// back into quote tokens. Reverse of [`Self::SplitOutcome`].
+    #[serde(rename = "Merge Outcome")]
+    #[strum(serialize = "Merge Outcome")]
+    MergeOutcome,
+    /// HIP-4 `userOutcome / mergeQuestion`: burning one Yes share of every
+    /// outcome in a multi-outcome question for the equivalent quote tokens.
+    #[serde(rename = "Merge Question")]
+    #[strum(serialize = "Merge Question")]
+    MergeQuestion,
+    /// HIP-4 `userOutcome / negateOutcome`: swapping `No` shares of one
+    /// outcome for `Yes` shares of every other outcome in the same question.
+    #[serde(rename = "Negate Outcome")]
+    #[strum(serialize = "Negate Outcome")]
+    NegateOutcome,
 }
 
 /// Represents info request types for the Hyperliquid info endpoint.
@@ -868,6 +893,8 @@ pub enum HyperliquidInfoRequestType {
     ValidatorStats,
     /// Get user fee schedule and effective rates.
     UserFees,
+    /// Get the list of perp dex descriptors.
+    PerpDexs,
     /// Get metadata for all perp dexes (standard + HIP-3).
     AllPerpMetas,
 }
@@ -905,6 +932,7 @@ impl HyperliquidInfoRequestType {
             Self::DelegatorRewards => "delegatorRewards",
             Self::ValidatorStats => "validatorStats",
             Self::UserFees => "userFees",
+            Self::PerpDexs => "perpDexs",
             Self::AllPerpMetas => "allPerpMetas",
         }
     }
@@ -963,15 +991,20 @@ pub enum HyperliquidProductType {
 impl HyperliquidProductType {
     /// Extract product type from an instrument symbol.
     ///
+    /// Accepts both Nautilus instrument symbols (`{BASE}-USD-PERP`,
+    /// `{BASE}-{QUOTE}-SPOT`, `{N}-{YES|NO}-OUTCOME`) and venue wire coin
+    /// names (`#<encoding>` / `+<encoding>` for HIP-4 outcomes). Callers in
+    /// the adapter pass both forms.
+    ///
     /// # Errors
     ///
-    /// Returns error if symbol doesn't match expected format.
+    /// Returns error if symbol doesn't match any expected format.
     pub fn from_symbol(symbol: &str) -> anyhow::Result<Self> {
         if symbol.ends_with("-PERP") {
             Ok(Self::Perp)
         } else if symbol.ends_with("-SPOT") {
             Ok(Self::Spot)
-        } else if is_outcome_wire_symbol(symbol) {
+        } else if symbol.ends_with(OUTCOME_SYMBOL_SUFFIX) || is_outcome_wire_symbol(symbol) {
             Ok(Self::Outcome)
         } else {
             anyhow::bail!("Invalid Hyperliquid symbol format: {symbol}")
@@ -1110,6 +1143,39 @@ mod tests {
             HyperliquidInfoRequestType::OutcomeMeta.as_str(),
             "outcomeMeta"
         );
+    }
+
+    #[rstest]
+    fn test_fill_direction_serde() {
+        let cases = [
+            (HyperliquidFillDirection::OpenLong, "\"Open Long\""),
+            (HyperliquidFillDirection::CloseShort, "\"Close Short\""),
+            (HyperliquidFillDirection::LongToShort, "\"Long > Short\""),
+            (
+                HyperliquidFillDirection::AutoDeleveraging,
+                "\"Auto-Deleveraging\"",
+            ),
+            (HyperliquidFillDirection::Buy, "\"Buy\""),
+            (HyperliquidFillDirection::Settlement, "\"Settlement\""),
+            (HyperliquidFillDirection::SplitOutcome, "\"Split Outcome\""),
+            (HyperliquidFillDirection::MergeOutcome, "\"Merge Outcome\""),
+            (
+                HyperliquidFillDirection::MergeQuestion,
+                "\"Merge Question\"",
+            ),
+            (
+                HyperliquidFillDirection::NegateOutcome,
+                "\"Negate Outcome\"",
+            ),
+        ];
+
+        for (variant, expected) in cases {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<HyperliquidFillDirection>(expected).unwrap(),
+                variant
+            );
+        }
     }
 
     #[rstest]
@@ -1618,6 +1684,9 @@ mod tests {
     #[rstest]
     #[case("BTC-USD-PERP", HyperliquidProductType::Perp)]
     #[case("HYPE-USDC-SPOT", HyperliquidProductType::Spot)]
+    #[case("25-YES-OUTCOME", HyperliquidProductType::Outcome)]
+    #[case("25-NO-OUTCOME", HyperliquidProductType::Outcome)]
+    #[case("0-YES-OUTCOME", HyperliquidProductType::Outcome)]
     #[case("#10", HyperliquidProductType::Outcome)]
     #[case("+31", HyperliquidProductType::Outcome)]
     #[case("#0", HyperliquidProductType::Outcome)]
@@ -1641,6 +1710,9 @@ mod tests {
     #[case("@1")]
     #[case("#-1")]
     #[case("+-1")]
+    #[case("25-YES")]
+    #[case("OUTCOME")]
+    #[case("25-YES-outcome")]
     fn test_product_type_from_symbol_rejects_invalid(#[case] symbol: &str) {
         assert!(HyperliquidProductType::from_symbol(symbol).is_err());
     }

@@ -50,9 +50,9 @@ use super::{
         BinanceFuturesCoinExchangeInfo, BinanceFuturesCoinSymbol, BinanceFuturesKline,
         BinanceFuturesMarkPrice, BinanceFuturesOrder, BinanceFuturesTicker24hr,
         BinanceFuturesTrade, BinanceFuturesUsdExchangeInfo, BinanceFuturesUsdSymbol,
-        BinanceHedgeModeResponse, BinanceLeverageResponse, BinanceOpenInterest, BinanceOrderBook,
-        BinancePositionRisk, BinancePriceTicker, BinanceServerTime, BinanceUserTrade,
-        ListenKeyResponse,
+        BinanceHedgeModeResponse, BinanceLeverageResponse, BinanceOpenInterest,
+        BinanceOpenInterestHistRecord, BinanceOrderBook, BinancePositionRisk, BinancePriceTicker,
+        BinanceServerTime, BinanceUserTrade, ListenKeyResponse,
     },
     query::{
         BatchCancelItem, BatchModifyItem, BatchOrderItem, BinanceAlgoOrderQueryParams,
@@ -60,10 +60,10 @@ use super::{
         BinanceCancelAllAlgoOrdersParams, BinanceCancelAllOrdersParams, BinanceCancelOrderParams,
         BinanceDepthParams, BinanceFundingRateParams, BinanceKlinesParams, BinanceMarkPriceParams,
         BinanceModifyOrderParams, BinanceNewAlgoOrderParams, BinanceNewOrderParams,
-        BinanceOpenAlgoOrdersParams, BinanceOpenInterestParams, BinanceOpenOrdersParams,
-        BinanceOrderQueryParams, BinancePositionRiskParams, BinanceSetLeverageParams,
-        BinanceSetMarginTypeParams, BinanceTicker24hrParams, BinanceTradesParams,
-        BinanceUserTradesParams, ListenKeyParams,
+        BinanceOpenAlgoOrdersParams, BinanceOpenInterestHistParams, BinanceOpenInterestParams,
+        BinanceOpenOrdersParams, BinanceOrderQueryParams, BinancePositionRiskParams,
+        BinanceSetLeverageParams, BinanceSetMarginTypeParams, BinanceTicker24hrParams,
+        BinanceTradesParams, BinanceUserTradesParams, ListenKeyParams,
     },
 };
 use crate::common::{
@@ -433,7 +433,10 @@ impl BinanceRawFuturesHttpClient {
 
     fn build_url(&self, path: &str, query: &str) -> String {
         // Full API paths (e.g., /fapi/v2/account) bypass the default api_path
-        let url_path = if path.starts_with("/fapi/") || path.starts_with("/dapi/") {
+        let url_path = if path.starts_with("/fapi/")
+            || path.starts_with("/dapi/")
+            || path.starts_with("/futures/data/")
+        {
             path.to_string()
         } else if path.starts_with('/') {
             format!("{}{}", self.api_path, path)
@@ -640,6 +643,19 @@ impl BinanceRawFuturesHttpClient {
         params: &BinanceOpenInterestParams,
     ) -> BinanceFuturesHttpResult<BinanceOpenInterest> {
         self.get("openInterest", Some(params), false, false).await
+    }
+
+    /// Fetches historical open interest statistics for a symbol or pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn open_interest_hist(
+        &self,
+        params: &BinanceOpenInterestHistParams,
+    ) -> BinanceFuturesHttpResult<Vec<BinanceOpenInterestHistRecord>> {
+        self.get("/futures/data/openInterestHist", Some(params), false, false)
+            .await
     }
 
     /// Fetches recent public trades for a symbol.
@@ -1500,6 +1516,18 @@ impl BinanceFuturesHttpClient {
         self.inner.open_interest(params).await
     }
 
+    /// Fetches historical open interest statistics for a symbol or pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn open_interest_hist(
+        &self,
+        params: &BinanceOpenInterestHistParams,
+    ) -> BinanceFuturesHttpResult<Vec<BinanceOpenInterestHistRecord>> {
+        self.inner.open_interest_hist(params).await
+    }
+
     /// Queries a single order by order ID or client order ID.
     ///
     /// # Errors
@@ -1892,10 +1920,19 @@ impl BinanceFuturesHttpClient {
 
         let symbol = format_binance_symbol(&instrument_id);
 
-        let order_id = venue_order_id
-            .map(|id| id.inner().parse::<i64>())
-            .transpose()
-            .map_err(|_| anyhow::anyhow!("Invalid venue order ID"))?;
+        let order_id = match venue_order_id {
+            Some(venue_order_id) => match venue_order_id.inner().parse::<i64>() {
+                Ok(order_id) => Some(order_id),
+                Err(e) if client_order_id.is_some() => {
+                    log::warn!(
+                        "Unable to parse venue_order_id {venue_order_id} for cancel, canceling by client_order_id: {e}"
+                    );
+                    None
+                }
+                Err(e) => anyhow::bail!("Invalid venue order ID: {e}"),
+            },
+            None => None,
+        };
 
         let params = BinanceCancelOrderParams {
             symbol,

@@ -14,6 +14,18 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Provides the HTTP client for the Polymarket Gamma API.
+//!
+//! Gamma `/markets` server-side constraints honored by the paginator and
+//! `load_ids` chunker:
+//!
+//! - `limit` is silently capped at 100 items per page, so a larger requested
+//!   `limit` makes the "last page" check (`page_len < page_size`) trip after
+//!   page one.
+//! - `offset > 10000` is rejected with HTTP 422, so a paginator cannot walk
+//!   the full universe; callers fetching many markets must use
+//!   `condition_ids=` filtering.
+//! - `condition_ids=` accepts at most 100 IDs per request, so `load_ids` for
+//!   larger sets chunks the request and unions the responses.
 
 use std::{collections::HashMap, result::Result as StdResult, sync::Arc};
 
@@ -164,13 +176,23 @@ impl PolymarketGammaRawHttpClient {
 }
 
 fn parse_markets_to_instruments(markets: &[GammaMarket], ts_init: UnixNanos) -> Vec<InstrumentAny> {
+    let (instruments, _transient) = parse_markets_with_transient(markets, ts_init);
+    instruments
+}
+
+// Returns parsed instruments alongside condition IDs of markets still in the
+// CLOB hydration window (empty or empty-entry `clob_token_ids`), so callers
+// can retry rather than treating them as terminal.
+fn parse_markets_with_transient(
+    markets: &[GammaMarket],
+    ts_init: UnixNanos,
+) -> (Vec<InstrumentAny>, Vec<String>) {
     let mut instruments = Vec::new();
-    let mut skipped_empty = 0u32;
+    let mut transient = Vec::new();
 
     for market in markets {
-        // Markets without CLOB token IDs are not tradeable (resolved, pending, etc.)
-        if market.clob_token_ids.is_empty() {
-            skipped_empty += 1;
+        if is_transient_clob_token_ids(&market.clob_token_ids) {
+            transient.push(market.condition_id.clone());
             continue;
         }
 
@@ -187,12 +209,27 @@ fn parse_markets_to_instruments(markets: &[GammaMarket], ts_init: UnixNanos) -> 
         }
     }
 
-    if skipped_empty > 0 {
+    if !transient.is_empty() {
         log::debug!(
-            "Skipped {skipped_empty} markets with empty clob_token_ids (currently not tradeable)"
+            "{} market(s) without usable clob_token_ids deferred as transient (CLOB hydration)",
+            transient.len(),
         );
     }
-    instruments
+    (instruments, transient)
+}
+
+// Treats bare empty string, encoded empty array, and arrays with empty entries
+// as transient. Unparsable payloads fall through to `parse_gamma_market` so
+// real schema errors still surface.
+fn is_transient_clob_token_ids(raw: &str) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(ids) => ids.is_empty() || ids.iter().any(|t| t.is_empty()),
+        Err(_) => false,
+    }
 }
 
 fn flatten_event_markets(events: Vec<GammaEvent>) -> Vec<GammaMarket> {
@@ -248,7 +285,7 @@ impl PolymarketGammaHttpClient {
         &self,
         base_params: GetGammaMarketsParams,
     ) -> anyhow::Result<Vec<GammaMarket>> {
-        const PAGE_LIMIT: u32 = 500;
+        const PAGE_LIMIT: u32 = 100;
         let page_size = base_params.limit.unwrap_or(PAGE_LIMIT);
         let max_markets = base_params.max_markets;
         let mut all_markets = Vec::new();
@@ -490,6 +527,26 @@ impl PolymarketGammaHttpClient {
         let instruments = parse_markets_to_instruments(&markets, ts_init);
         log::debug!("Parsed {} instruments from params query", instruments.len());
         Ok(instruments)
+    }
+
+    /// Same as [`Self::request_instruments_by_params`] but also returns
+    /// condition IDs whose markets came back from Gamma with empty
+    /// `clob_token_ids`. Callers driving auto-load retries use the transient
+    /// list to distinguish "still hydrating in the CLOB" from "absent on the
+    /// venue".
+    pub async fn request_instruments_by_params_with_transient(
+        &self,
+        base_params: GetGammaMarketsParams,
+    ) -> anyhow::Result<(Vec<InstrumentAny>, Vec<String>)> {
+        let markets = self.fetch_gamma_markets_paginated(base_params).await?;
+        let ts_init = self.clock.get_time_ns();
+        let (instruments, transient) = parse_markets_with_transient(&markets, ts_init);
+        log::debug!(
+            "Parsed {} instruments and {} transient condition_id(s) from params query",
+            instruments.len(),
+            transient.len(),
+        );
+        Ok((instruments, transient))
     }
 
     /// Fetches instruments from an event slug with client-side sorting and limiting.

@@ -89,6 +89,12 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "plugin")]
+use ahash::AHashSet;
+#[cfg(feature = "plugin")]
+use anyhow::Context;
+#[cfg(feature = "plugin")]
+use aws_lc_rs::digest;
 use nautilus_common::{
     actor::{Actor, DataActor},
     cache::database::CacheDatabaseAdapter,
@@ -101,16 +107,24 @@ use nautilus_common::{
     },
     timer::TimeEventHandler,
 };
+#[cfg(feature = "plugin")]
+use nautilus_core::hex;
 use nautilus_core::{
     UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_secs, secs_to_nanos_unchecked},
 };
+#[cfg(feature = "plugin")]
+use nautilus_model::identifiers::{ActorId, StrategyId};
 use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientOrderId, TraderId},
     orders::Order,
 };
+#[cfg(feature = "plugin")]
+use nautilus_plugin::loader::PluginLoader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
+#[cfg(feature = "plugin")]
+use nautilus_trading::strategy::StrategyConfig;
 use nautilus_trading::{ExecutionAlgorithm, strategy::Strategy};
 use tabled::{Table, Tabled, settings::Style};
 
@@ -119,6 +133,14 @@ use crate::{
     config::LiveNodeConfig,
     manager::{ExecutionManager, ExecutionManagerConfig},
     runner::{AsyncRunner, AsyncRunnerChannels},
+};
+#[cfg(feature = "plugin")]
+use crate::{
+    config::PluginConfig,
+    plugin::{
+        ConfiguredPluginEntry, PluginControllerAdapter, configured_entry, plugin_loader,
+        register_manifest_custom_data,
+    },
 };
 
 /// Lifecycle state of the `LiveNode` runner.
@@ -161,6 +183,24 @@ impl NodeState {
     #[must_use]
     pub const fn is_running(&self) -> bool {
         matches!(self, Self::Running)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineConnectionStatus {
+    Connected,
+    TimedOut,
+    StopRequested,
+    ShutdownRequested,
+}
+
+impl EngineConnectionStatus {
+    const fn abort_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Connected | Self::TimedOut => None,
+            Self::StopRequested => Some("Stop signal received during startup"),
+            Self::ShutdownRequested => Some("Shutdown signal received during startup"),
+        }
     }
 }
 
@@ -245,6 +285,12 @@ pub struct LiveNode {
     handle: LiveNodeHandle,
     exec_manager: ExecutionManager,
     shutdown_deadline: Option<dst::time::Instant>,
+    #[cfg(feature = "plugin")]
+    plugin_loader: Option<PluginLoader>,
+    #[cfg(feature = "plugin")]
+    plugin_controllers: Vec<PluginControllerAdapter>,
+    #[cfg(feature = "plugin")]
+    plugin_controllers_started: bool,
     #[cfg(feature = "python")]
     #[allow(dead_code)] // TODO: Under development
     python_actors: Vec<pyo3::Py<pyo3::PyAny>>,
@@ -268,6 +314,12 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             shutdown_deadline: None,
+            #[cfg(feature = "plugin")]
+            plugin_loader: None,
+            #[cfg(feature = "plugin")]
+            plugin_controllers: Vec::new(),
+            #[cfg(feature = "plugin")]
+            plugin_controllers_started: false,
             #[cfg(feature = "python")]
             python_actors: Vec::new(),
         }
@@ -307,6 +359,13 @@ impl LiveNode {
 
         config.validate_runtime_support()?;
 
+        if config.event_store.is_some() {
+            anyhow::bail!(
+                "LiveNodeConfig.event_store is set but LiveNode::build cannot install a factory; \
+                 use LiveNodeBuilder::with_event_store(...) instead"
+            );
+        }
+
         let runner = AsyncRunner::new();
         runner.bind_senders();
 
@@ -320,18 +379,220 @@ impl LiveNode {
             exec_manager_config,
         );
 
-        log::info!("LiveNode built successfully with kernel config");
-
-        Ok(Self {
+        #[cfg_attr(
+            not(feature = "plugin"),
+            expect(unused_mut, reason = "plugin builds need mutable node state")
+        )]
+        let mut node = Self {
             kernel,
             runner: Some(runner),
             config,
             handle: LiveNodeHandle::new(),
             exec_manager,
             shutdown_deadline: None,
+            #[cfg(feature = "plugin")]
+            plugin_loader: None,
+            #[cfg(feature = "plugin")]
+            plugin_controllers: Vec::new(),
+            #[cfg(feature = "plugin")]
+            plugin_controllers_started: false,
             #[cfg(feature = "python")]
             python_actors: Vec::new(),
-        })
+        };
+        node.load_configured_plugins()?;
+
+        log::info!("LiveNode built successfully with kernel config");
+
+        Ok(node)
+    }
+
+    /// Loads and registers plug-ins declared on the node config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any configured plug-in cannot be loaded, verified,
+    /// registered, or instantiated.
+    #[cfg(feature = "plugin")]
+    pub(crate) fn load_configured_plugins(&mut self) -> anyhow::Result<()> {
+        let configs = self.config.plugins.clone();
+        if configs.is_empty() {
+            return Ok(());
+        }
+
+        if self.state() != NodeState::Idle {
+            anyhow::bail!("Cannot load plug-ins after the node leaves Idle state");
+        }
+
+        let mut loader = plugin_loader();
+        let mut loaded_paths = AHashSet::new();
+
+        for config in &configs {
+            verify_plugin_sha256(config)?;
+            if loaded_paths.insert(config.path.clone()) {
+                loader
+                    .load(&config.path)
+                    .with_context(|| format!("failed to load plug-in '{}'", config.path))?;
+            }
+        }
+
+        for loaded in loader.loaded() {
+            let registered = register_manifest_custom_data(loaded.validated_manifest())
+                .with_context(|| {
+                    format!(
+                        "failed to register custom data from plug-in '{}'",
+                        loaded.path().display()
+                    )
+                })?;
+
+            if registered > 0 {
+                log::info!(
+                    "Registered {registered} custom data type(s) from plug-in {}",
+                    loaded.path().display()
+                );
+            }
+        }
+
+        for config in &configs {
+            self.instantiate_configured_plugin(&loader, config)?;
+        }
+
+        self.plugin_loader = Some(loader);
+        Ok(())
+    }
+
+    /// Loads and registers plug-ins declared on the node config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when plug-ins are configured without plug-in support.
+    #[cfg(not(feature = "plugin"))]
+    pub(crate) fn load_configured_plugins(&self) -> anyhow::Result<()> {
+        if self.config.plugins.is_empty() {
+            return Ok(());
+        }
+
+        anyhow::bail!("LiveNodeConfig.plugins requires the `plugin` feature")
+    }
+
+    #[cfg(feature = "plugin")]
+    fn instantiate_configured_plugin(
+        &mut self,
+        loader: &PluginLoader,
+        config: &PluginConfig,
+    ) -> anyhow::Result<()> {
+        let loaded = loader
+            .loaded()
+            .iter()
+            .find(|loaded| loaded.path() == std::path::Path::new(&config.path))
+            .ok_or_else(|| anyhow::anyhow!("plug-in '{}' was not loaded", config.path))?;
+
+        let entry = configured_entry(loaded.validated_manifest(), &config.path, &config.type_name)?;
+        let config_json = serde_json::to_string(&config.config)?;
+
+        match entry {
+            ConfiguredPluginEntry::Actor(entry) => {
+                let actor_id = plugin_actor_id(config)?;
+                let adapter = entry
+                    .create_adapter(actor_id, &config_json)
+                    .with_context(|| {
+                        format!(
+                            "failed to instantiate plug-in actor '{}' from {}",
+                            config.type_name, config.path
+                        )
+                    })?;
+                self.add_actor(adapter)
+            }
+            ConfiguredPluginEntry::Strategy(entry) => {
+                let strategy_config = plugin_strategy_config(config)?;
+                let adapter = entry
+                    .create_adapter(strategy_config, &config_json)
+                    .with_context(|| {
+                        format!(
+                            "failed to instantiate plug-in strategy '{}' from {}",
+                            config.type_name, config.path
+                        )
+                    })?;
+                self.add_strategy(adapter)
+            }
+            ConfiguredPluginEntry::Controller(entry) => {
+                let adapter = entry.create_adapter(&config_json).with_context(|| {
+                    format!(
+                        "failed to instantiate plug-in controller '{}' from {}",
+                        config.type_name, config.path
+                    )
+                })?;
+                self.plugin_controllers.push(adapter);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "plugin")]
+    fn start_plugin_controllers(&mut self) -> anyhow::Result<()> {
+        if self.plugin_controllers_started {
+            return Ok(());
+        }
+
+        for index in 0..self.plugin_controllers.len() {
+            let result = {
+                let controller = &mut self.plugin_controllers[index];
+                controller.on_start().with_context(|| {
+                    format!(
+                        "failed to start plug-in controller '{}' from plug-in '{}'",
+                        controller.type_name(),
+                        controller.plugin_name()
+                    )
+                })
+            };
+
+            if let Err(start_err) = result {
+                for controller in self.plugin_controllers[..index].iter_mut().rev() {
+                    if let Err(stop_err) = controller.on_stop() {
+                        log::error!(
+                            "Failed to roll back plug-in controller '{}' from plug-in '{}': {stop_err}",
+                            controller.type_name(),
+                            controller.plugin_name()
+                        );
+                    }
+                }
+                return Err(start_err);
+            }
+        }
+
+        self.plugin_controllers_started = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "plugin")]
+    fn stop_plugin_controllers(&mut self) -> anyhow::Result<()> {
+        if !self.plugin_controllers_started {
+            return Ok(());
+        }
+
+        let mut first_error = None;
+
+        for controller in self.plugin_controllers.iter_mut().rev() {
+            if let Err(e) = controller.on_stop().with_context(|| {
+                format!(
+                    "failed to stop plug-in controller '{}' from plug-in '{}'",
+                    controller.type_name(),
+                    controller.plugin_name()
+                )
+            }) {
+                log::error!("{e}");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        self.plugin_controllers_started = false;
+
+        if let Some(e) = first_error {
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns a thread-safe handle to control this node.
@@ -363,6 +624,21 @@ impl LiveNode {
         self.handle.set_state(NodeState::Starting);
 
         self.kernel.start_async().await;
+        self.kernel.reset_shutdown_flag();
+
+        if self.kernel.is_event_store_replay() {
+            log::info!(
+                "Event-store replay loaded; skipping live client connection and reconciliation",
+            );
+            self.handle.set_state(NodeState::Running);
+            return Ok(());
+        }
+
+        if self.kernel.is_event_store_replay_configured() {
+            self.abort_startup("Event-store replay did not start")
+                .await?;
+            return Ok(());
+        }
 
         // Connect data clients first and flush instrument events into cache
         self.kernel.connect_data_clients().await;
@@ -373,15 +649,37 @@ impl LiveNode {
 
         self.kernel.connect_exec_clients().await;
 
-        if !self.await_engines_connected().await {
-            log::error!("Cannot start trader: engine client(s) not connected");
-            self.handle.set_state(NodeState::Running);
+        if let Some(reason) = self.startup_abort_reason() {
+            self.abort_startup(reason).await?;
             return Ok(());
+        }
+
+        match self.await_engines_connected().await {
+            EngineConnectionStatus::Connected => {}
+            EngineConnectionStatus::TimedOut => {
+                log::error!("Cannot start trader: engine client(s) not connected");
+                self.handle.set_state(NodeState::Running);
+                return Ok(());
+            }
+            EngineConnectionStatus::StopRequested => {
+                self.abort_startup("Stop signal received during startup")
+                    .await?;
+                return Ok(());
+            }
+            EngineConnectionStatus::ShutdownRequested => {
+                self.abort_startup("Shutdown signal received during startup")
+                    .await?;
+                return Ok(());
+            }
         }
 
         self.perform_startup_reconciliation().await?;
 
         self.kernel.start_trader();
+        #[cfg(feature = "plugin")]
+        if let Err(e) = self.start_plugin_controllers() {
+            return self.abort_after_trader_start_failure(e).await;
+        }
 
         self.handle.set_state(NodeState::Running);
 
@@ -403,18 +701,32 @@ impl LiveNode {
 
         self.handle.set_state(NodeState::ShuttingDown);
 
+        #[cfg(feature = "plugin")]
+        let controller_stop_result = self.stop_plugin_controllers();
+        #[cfg(not(feature = "plugin"))]
+        let controller_stop_result: anyhow::Result<()> = Ok(());
+
         self.kernel.stop_trader();
         let delay = self.kernel.delay_post_stop();
         log::info!("Awaiting residual events ({delay:?})...");
 
         dst::time::sleep(delay).await;
-        self.finalize_stop().await
+        let stop_result = self.finalize_stop().await;
+        match (controller_stop_result, stop_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(controller_err), Ok(())) => Err(controller_err),
+            (Ok(()), Err(stop_err)) => Err(stop_err),
+            (Err(controller_err), Err(stop_err)) => {
+                log::error!("Error stopping plug-in controllers: {controller_err}");
+                Err(stop_err)
+            }
+        }
     }
 
     /// Awaits engine clients to connect with timeout.
     ///
-    /// Returns `true` if all engines connected, `false` if timed out.
-    async fn await_engines_connected(&self) -> bool {
+    /// Returns the final connection wait status.
+    async fn await_engines_connected(&self) -> EngineConnectionStatus {
         log::info!(
             "Awaiting engine connections ({:?} timeout)...",
             self.config.timeout_connection
@@ -425,15 +737,25 @@ impl LiveNode {
         let interval = Duration::from_millis(100);
 
         while start.elapsed() < timeout {
+            if self.handle.should_stop() {
+                log::warn!("Stop signal received, aborting connection wait");
+                return EngineConnectionStatus::StopRequested;
+            }
+
+            if self.kernel.is_shutdown_requested() {
+                log::warn!("Shutdown signal received, aborting connection wait");
+                return EngineConnectionStatus::ShutdownRequested;
+            }
+
             if self.kernel.check_engines_connected() {
                 log::info!("All engine clients connected");
-                return true;
+                return EngineConnectionStatus::Connected;
             }
             dst::time::sleep(interval).await;
         }
 
         self.log_connection_status();
-        false
+        EngineConnectionStatus::TimedOut
     }
 
     /// Awaits engine clients to disconnect with timeout.
@@ -674,15 +996,28 @@ impl LiveNode {
         self.kernel.start_async().await;
         self.kernel.reset_shutdown_flag();
 
+        if self.kernel.is_event_store_replay() {
+            log::info!(
+                "Event-store replay loaded; skipping live client connection and reconciliation",
+            );
+            self.handle.set_state(NodeState::Running);
+            return Ok(());
+        }
+
+        if self.kernel.is_event_store_replay_configured() {
+            self.abort_startup("Event-store replay did not start")
+                .await?;
+            return Ok(());
+        }
+
         let stop_handle = self.handle.clone();
         let shutdown_flag = self.kernel.shutdown_flag();
         let mut pending = PendingEvents::default();
 
         // Startup phase 1: Connect data clients and drain instrument events into cache.
         // This ensures the cache is populated before execution clients connect.
-        // TODO: Add ctrl_c and stop_handle monitoring here to allow aborting a
-        // hanging startup. Currently signals during startup are ignored, and
-        // any pending stop_flag is cleared when transitioning to Running.
+        // TODO: Add ctrl_c, stop_handle, and shutdown_flag monitoring here to
+        // allow aborting a hanging connect future.
         drive_with_event_buffering(
             self.kernel.connect_data_clients(),
             &mut pending,
@@ -704,7 +1039,7 @@ impl LiveNode {
         );
 
         // Startup phase 2: Connect execution clients (instruments now in cache)
-        let engines_connected = drive_with_event_buffering(
+        let engine_connection_status = drive_with_event_buffering(
             self.connect_exec_phase(),
             &mut pending,
             &mut time_evt_rx,
@@ -729,10 +1064,39 @@ impl LiveNode {
             "all startup events must be processed before reconciliation",
         );
 
-        if engines_connected {
+        if let Some(reason) = engine_connection_status
+            .abort_reason()
+            .or_else(|| self.startup_abort_reason())
+        {
+            self.abort_startup(reason).await?;
+            self.drain_channels(
+                &mut time_evt_rx,
+                &mut data_evt_rx,
+                &mut data_cmd_rx,
+                &mut exec_evt_rx,
+                &mut exec_cmd_rx,
+            );
+            log::info!("Event loop stopped");
+            return Ok(());
+        }
+
+        if engine_connection_status == EngineConnectionStatus::Connected {
             // Run reconciliation now that instruments are in cache and start trader
             self.perform_startup_reconciliation().await?;
             self.kernel.start_trader();
+            #[cfg(feature = "plugin")]
+            if let Err(e) = self.start_plugin_controllers() {
+                let result = self.abort_after_trader_start_failure(e).await;
+                self.drain_channels(
+                    &mut time_evt_rx,
+                    &mut data_evt_rx,
+                    &mut data_cmd_rx,
+                    &mut exec_evt_rx,
+                    &mut exec_cmd_rx,
+                );
+                log::info!("Event loop stopped");
+                return result;
+            }
         } else {
             log::error!("Not starting trader: engine client(s) not connected");
         }
@@ -1131,19 +1495,51 @@ impl LiveNode {
 
     /// Connects execution clients and checks all engines are connected.
     ///
-    /// Returns `true` if all engines connected successfully, `false` otherwise.
+    /// Returns the final connection wait status.
     /// Must be called after data clients are connected and instrument events drained.
-    async fn connect_exec_phase(&mut self) -> anyhow::Result<bool> {
+    async fn connect_exec_phase(&mut self) -> anyhow::Result<EngineConnectionStatus> {
         self.kernel.connect_exec_clients().await;
+        Ok(self.await_engines_connected().await)
+    }
 
-        if !self.await_engines_connected().await {
-            return Ok(false);
+    fn startup_abort_reason(&self) -> Option<&'static str> {
+        if self.handle.should_stop() {
+            Some("Stop signal received during startup")
+        } else if self.kernel.is_shutdown_requested() {
+            Some("Shutdown signal received during startup")
+        } else {
+            None
         }
+    }
 
-        Ok(true)
+    async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
+        log::info!("{reason}, aborting startup");
+        self.handle.set_state(NodeState::ShuttingDown);
+        self.finalize_stop().await
+    }
+
+    #[cfg(feature = "plugin")]
+    async fn abort_after_trader_start_failure(
+        &mut self,
+        start_err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        log::info!("Plug-in controller startup failed, aborting startup");
+        self.handle.set_state(NodeState::ShuttingDown);
+        self.kernel.stop_trader();
+
+        if let Err(finalize_err) = self.finalize_stop().await {
+            anyhow::bail!(
+                "failed to start plug-in controller: {start_err}; failed to finalize startup abort: {finalize_err}"
+            );
+        }
+        Err(start_err)
     }
 
     fn initiate_shutdown(&mut self) {
+        #[cfg(feature = "plugin")]
+        if let Err(e) = self.stop_plugin_controllers() {
+            log::error!("Error stopping plug-in controllers: {e}");
+        }
         self.kernel.stop_trader();
         let delay = self.kernel.delay_post_stop();
         log::info!("Awaiting residual events ({delay:?})...");
@@ -1472,6 +1868,82 @@ impl LiveNode {
     }
 }
 
+#[cfg(feature = "plugin")]
+fn verify_plugin_sha256(config: &PluginConfig) -> anyhow::Result<()> {
+    let Some(expected) = &config.sha256 else {
+        return Ok(());
+    };
+
+    let bytes = std::fs::read(&config.path)
+        .with_context(|| format!("failed to read plug-in '{}'", config.path))?;
+    let actual = hex::encode(digest::digest(&digest::SHA256, &bytes).as_ref());
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "plug-in '{}' SHA-256 mismatch: expected {}, actual {}",
+        config.path,
+        expected,
+        actual
+    )
+}
+
+#[cfg(feature = "plugin")]
+fn plugin_actor_id(config: &PluginConfig) -> anyhow::Result<ActorId> {
+    let actor_id = plugin_config_string(config, "actor_id")?.unwrap_or(&config.type_name);
+    ActorId::new_checked(actor_id)
+        .map_err(|e| anyhow::anyhow!("invalid actor_id for plug-in '{}': {e}", config.type_name))
+}
+
+#[cfg(feature = "plugin")]
+fn plugin_strategy_config(config: &PluginConfig) -> anyhow::Result<StrategyConfig> {
+    let mut strategy_config = if let Some(value) = config.config.get("strategy_config") {
+        serde_json::from_value::<StrategyConfig>(value.clone()).with_context(|| {
+            format!(
+                "invalid strategy_config for plug-in strategy '{}'",
+                config.type_name
+            )
+        })?
+    } else {
+        StrategyConfig::default()
+    };
+
+    if strategy_config.strategy_id.is_none() {
+        let strategy_id = plugin_config_string(config, "strategy_id")?
+            .map_or_else(|| format!("{}-001", config.type_name), str::to_string);
+        strategy_config.strategy_id = Some(StrategyId::new_checked(&strategy_id).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid strategy_id for plug-in strategy '{}': {e}",
+                config.type_name
+            )
+        })?);
+    }
+
+    if strategy_config.order_id_tag.is_none()
+        && let Some(order_id_tag) = plugin_config_string(config, "order_id_tag")?
+    {
+        strategy_config.order_id_tag = Some(order_id_tag.to_string());
+    }
+
+    Ok(strategy_config)
+}
+
+#[cfg(feature = "plugin")]
+fn plugin_config_string<'a>(
+    config: &'a PluginConfig,
+    key: &'static str,
+) -> anyhow::Result<Option<&'a str>> {
+    match config.config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => anyhow::bail!(
+            "plug-in '{}' config field '{key}' must be a string",
+            config.type_name
+        ),
+    }
+}
+
 /// Flushes data events and commands from both `pending` and the channel receivers
 /// into the cache, looping until no progress is made.
 ///
@@ -1721,18 +2193,93 @@ impl PendingEvents {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "plugin")]
+    use std::collections::HashMap;
     #[cfg(feature = "python")]
     use std::sync::Arc;
+    use std::{cell::RefCell, rc::Rc};
 
     #[cfg(feature = "python")]
     use nautilus_common::runner::{
         SyncDataCommandSender, SyncTradingCommandSender, replace_data_cmd_sender,
         replace_exec_cmd_sender,
     };
+    use nautilus_common::{cache::Cache, clock::Clock};
+    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_execution::engine::SnapshotAnchorer;
     use nautilus_model::identifiers::TraderId;
+    use nautilus_system::{KernelEventStore, RegisteredComponents, event_store::EventStoreConfig};
     use rstest::*;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ReplayKernelEventStore {
+        fail_restore: bool,
+    }
+
+    impl KernelEventStore for ReplayKernelEventStore {
+        fn restore_parent_cache(
+            &mut self,
+            _instance_id: UUID4,
+            _cache: &mut Cache,
+        ) -> anyhow::Result<()> {
+            if self.fail_restore {
+                anyhow::bail!("replay restore failed");
+            }
+
+            Ok(())
+        }
+
+        fn open(
+            &mut self,
+            _instance_id: UUID4,
+            _components: &RegisteredComponents,
+            _environment: Environment,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
+            None
+        }
+
+        fn seal(&mut self, _ts_init: UnixNanos) {}
+
+        fn run_id(&self) -> Option<&str> {
+            Some("replay-child")
+        }
+
+        fn parent_run_id(&self) -> Option<&str> {
+            Some("seed-run")
+        }
+
+        fn is_event_store_replay_configured(&self) -> bool {
+            true
+        }
+
+        fn is_halted(&self) -> bool {
+            false
+        }
+    }
+
+    fn live_node_with_replay_store(fail_restore: bool) -> LiveNode {
+        // load_state must be true: the kernel rejects event-store replay otherwise,
+        // and LiveNodeConfig defaults it to false.
+        let builder = LiveNodeBuilder::new(TraderId::default(), Environment::Live)
+            .unwrap()
+            .with_exec_engine_config(crate::config::LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            })
+            .with_load_state(true)
+            .with_name("TestKernel")
+            .with_event_store(move |_instance_id: UUID4, _clock: Rc<RefCell<dyn Clock>>| {
+                Ok(Box::new(ReplayKernelEventStore { fail_restore }) as Box<dyn KernelEventStore>)
+            });
+
+        builder.build().unwrap()
+    }
 
     #[rstest]
     #[case(0, NodeState::Idle)]
@@ -1772,6 +2319,154 @@ mod tests {
         assert!(NodeState::Running.is_running());
         assert!(!NodeState::ShuttingDown.is_running());
         assert!(!NodeState::Stopped.is_running());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_await_engines_connected_returns_stop_requested() {
+        let node = LiveNode::build("TestNode".to_string(), None).unwrap();
+        let handle = node.handle();
+
+        handle.stop();
+
+        let status = node.await_engines_connected().await;
+
+        assert_eq!(status, EngineConnectionStatus::StopRequested);
+        assert!(handle.should_stop());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_await_engines_connected_returns_shutdown_requested() {
+        let node = LiveNode::build("TestNode".to_string(), None).unwrap();
+
+        node.kernel().shutdown_flag().set(true);
+
+        let status = node.await_engines_connected().await;
+
+        assert_eq!(status, EngineConnectionStatus::ShutdownRequested);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_start_stop_request_aborts_startup_without_running() {
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
+        let handle = node.handle();
+
+        handle.stop();
+        node.start().await.unwrap();
+
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(handle.should_stop());
+        assert!(!handle.is_running());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_start_event_store_replay_skips_live_connections() {
+        let mut node = live_node_with_replay_store(false);
+        let handle = node.handle();
+
+        node.start().await.unwrap();
+
+        assert_eq!(handle.state(), NodeState::Running);
+        assert!(handle.is_running());
+        assert!(node.kernel.is_event_store_replay());
+        assert!(node.runner.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_start_event_store_replay_config_failure_aborts_startup() {
+        let mut node = live_node_with_replay_store(true);
+        let handle = node.handle();
+
+        node.start().await.unwrap();
+
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!handle.is_running());
+        assert!(node.kernel.is_event_store_replay_configured());
+        assert!(!node.kernel.is_event_store_replay());
+        assert!(node.runner.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_run_event_store_replay_consumes_runner_and_stops_before_connections() {
+        let mut node = live_node_with_replay_store(false);
+        let handle = node.handle();
+
+        node.run().await.unwrap();
+
+        assert_eq!(handle.state(), NodeState::Running);
+        assert!(handle.is_running());
+        assert!(node.kernel.is_event_store_replay());
+        assert!(node.runner.is_none());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_run_event_store_replay_config_failure_aborts_startup() {
+        let mut node = live_node_with_replay_store(true);
+        let handle = node.handle();
+
+        node.run().await.unwrap();
+
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!handle.is_running());
+        assert!(node.kernel.is_event_store_replay_configured());
+        assert!(!node.kernel.is_event_store_replay());
+        assert!(node.runner.is_none());
+    }
+
+    #[rstest]
+    fn test_build_rejects_event_store_config_without_factory() {
+        let config = LiveNodeConfig {
+            event_store: Some(EventStoreConfig::default()),
+            exec_engine: crate::config::LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = LiveNodeBuilder::from_config(config)
+            .expect("builder")
+            .build()
+            .expect_err("should reject event_store config without factory");
+
+        assert!(
+            err.to_string().contains("with_event_store"),
+            "error message should mention with_event_store, was: {err}"
+        );
+    }
+
+    #[rstest]
+    fn test_direct_build_rejects_event_store_config() {
+        let config = LiveNodeConfig {
+            event_store: Some(EventStoreConfig::default()),
+            exec_engine: crate::config::LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = LiveNode::build("TestNode".to_string(), Some(config))
+            .expect_err("LiveNode::build should reject event_store config");
+
+        assert!(
+            err.to_string().contains("with_event_store"),
+            "error message should mention with_event_store, was: {err}"
+        );
     }
 
     #[rstest]
@@ -1906,6 +2601,72 @@ mod tests {
             .with_delay_shutdown_secs(10);
 
         assert_eq!(builder.name(), "TestNode");
+    }
+
+    #[cfg(feature = "plugin")]
+    #[rstest]
+    fn test_plugin_actor_id_rejects_non_string_actor_id() {
+        let config = PluginConfig {
+            path: "./libexample.so".to_string(),
+            type_name: "ExampleActor".to_string(),
+            config: HashMap::from([("actor_id".to_string(), serde_json::json!(42))]),
+            sha256: None,
+        };
+
+        let error = plugin_actor_id(&config).unwrap_err().to_string();
+
+        assert!(error.contains("actor_id"));
+        assert!(error.contains("must be a string"));
+    }
+
+    #[cfg(feature = "plugin")]
+    #[rstest]
+    fn test_plugin_strategy_config_accepts_nested_strategy_config() {
+        let config = PluginConfig {
+            path: "./libexample.so".to_string(),
+            type_name: "ExampleStrategy".to_string(),
+            config: HashMap::from([(
+                "strategy_config".to_string(),
+                serde_json::json!({
+                    "strategy_id": "NestedStrategy-001",
+                    "order_id_tag": "NEST",
+                }),
+            )]),
+            sha256: None,
+        };
+
+        let strategy_config = plugin_strategy_config(&config).unwrap();
+
+        assert_eq!(
+            strategy_config.strategy_id,
+            Some(StrategyId::from("NestedStrategy-001"))
+        );
+        assert_eq!(strategy_config.order_id_tag.as_deref(), Some("NEST"));
+    }
+
+    #[cfg(feature = "plugin")]
+    #[rstest]
+    fn test_plugin_strategy_config_uses_top_level_strategy_id_and_order_id_tag() {
+        let config = PluginConfig {
+            path: "./libexample.so".to_string(),
+            type_name: "ExampleStrategy".to_string(),
+            config: HashMap::from([
+                (
+                    "strategy_id".to_string(),
+                    serde_json::json!("TopLevelStrategy-001"),
+                ),
+                ("order_id_tag".to_string(), serde_json::json!("TOP")),
+            ]),
+            sha256: None,
+        };
+
+        let strategy_config = plugin_strategy_config(&config).unwrap();
+
+        assert_eq!(
+            strategy_config.strategy_id,
+            Some(StrategyId::from("TopLevelStrategy-001"))
+        );
+        assert_eq!(strategy_config.order_id_tag.as_deref(), Some("TOP"));
     }
 
     #[cfg(feature = "python")]
@@ -2083,6 +2844,7 @@ mod tests {
             UUID4::new(),
             UnixNanos::default(),
             None,
+            None, // correlation_id
         ))
     }
 
@@ -2157,22 +2919,11 @@ mod tests {
     }
 
     fn stub_order_event() -> ExecutionEvent {
-        use nautilus_core::{UUID4, UnixNanos};
-        use nautilus_model::{
-            events::OrderSubmitted,
-            identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId},
-        };
+        use nautilus_model::events::order::spec::OrderSubmittedSpec;
 
-        ExecutionEvent::Order(OrderEventAny::Submitted(OrderSubmitted::new(
-            TraderId::from("TESTER-001"),
-            StrategyId::from("S-001"),
-            InstrumentId::from("TEST.VENUE"),
-            ClientOrderId::from("O-001"),
-            AccountId::from("TEST-001"),
-            UUID4::new(),
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )))
+        ExecutionEvent::Order(OrderEventAny::Submitted(
+            OrderSubmittedSpec::builder().build(),
+        ))
     }
 
     fn stub_account_event() -> ExecutionEvent {
@@ -2308,70 +3059,36 @@ mod tests {
     }
 
     fn stub_submitted_batch_event() -> ExecutionEvent {
-        use nautilus_core::{UUID4, UnixNanos};
         use nautilus_model::{
-            events::{OrderSubmitted, OrderSubmittedBatch},
-            identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId},
+            events::{OrderSubmittedBatch, order::spec::OrderSubmittedSpec},
+            identifiers::ClientOrderId,
         };
 
         let events = vec![
-            OrderSubmitted::new(
-                TraderId::from("TESTER-001"),
-                StrategyId::from("S-001"),
-                InstrumentId::from("TEST.VENUE"),
-                ClientOrderId::from("O-001"),
-                AccountId::from("TEST-001"),
-                UUID4::new(),
-                UnixNanos::default(),
-                UnixNanos::default(),
-            ),
-            OrderSubmitted::new(
-                TraderId::from("TESTER-001"),
-                StrategyId::from("S-001"),
-                InstrumentId::from("TEST.VENUE"),
-                ClientOrderId::from("O-002"),
-                AccountId::from("TEST-001"),
-                UUID4::new(),
-                UnixNanos::default(),
-                UnixNanos::default(),
-            ),
+            OrderSubmittedSpec::builder()
+                .client_order_id(ClientOrderId::from("O-001"))
+                .build(),
+            OrderSubmittedSpec::builder()
+                .client_order_id(ClientOrderId::from("O-002"))
+                .build(),
         ];
 
         ExecutionEvent::OrderSubmittedBatch(OrderSubmittedBatch::new(events))
     }
 
     fn stub_canceled_batch_event() -> ExecutionEvent {
-        use nautilus_core::{UUID4, UnixNanos};
         use nautilus_model::{
-            events::{OrderCanceled, OrderCanceledBatch},
-            identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId},
+            events::{OrderCanceledBatch, order::spec::OrderCanceledSpec},
+            identifiers::ClientOrderId,
         };
 
         let events = vec![
-            OrderCanceled::new(
-                TraderId::from("TESTER-001"),
-                StrategyId::from("S-001"),
-                InstrumentId::from("TEST.VENUE"),
-                ClientOrderId::from("O-001"),
-                UUID4::new(),
-                UnixNanos::default(),
-                UnixNanos::default(),
-                false,
-                None,
-                Some(AccountId::from("TEST-001")),
-            ),
-            OrderCanceled::new(
-                TraderId::from("TESTER-001"),
-                StrategyId::from("S-001"),
-                InstrumentId::from("TEST.VENUE"),
-                ClientOrderId::from("O-002"),
-                UUID4::new(),
-                UnixNanos::default(),
-                UnixNanos::default(),
-                false,
-                None,
-                Some(AccountId::from("TEST-001")),
-            ),
+            OrderCanceledSpec::builder()
+                .client_order_id(ClientOrderId::from("O-001"))
+                .build(),
+            OrderCanceledSpec::builder()
+                .client_order_id(ClientOrderId::from("O-002"))
+                .build(),
         ];
 
         ExecutionEvent::OrderCanceledBatch(OrderCanceledBatch::new(events))
