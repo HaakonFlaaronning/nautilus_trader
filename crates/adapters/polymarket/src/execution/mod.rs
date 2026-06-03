@@ -189,15 +189,9 @@ impl PolymarketExecutionClient {
                 "POLY_1271 signature type requires a deposit wallet funder distinct from the signing address"
             );
         }
-        // POLY_ADDRESS in L2 HMAC headers must always be the signer EOA — the API
-        // key is bound to the signing address. Sending the funder (proxy) for
-        // Poly1271 yields HTTP 401 "Invalid api key". Verified against live CLOB:
-        // signer EOA → 200, funder → 401. Maker/proxy is order-side metadata only.
-        let api_address = signer_address.clone();
-
         let http_client = PolymarketClobHttpClient::new(
             secrets.credential.clone(),
-            api_address,
+            signer_address.clone(),
             config.base_url_http.clone(),
             config.http_timeout_secs,
         )
