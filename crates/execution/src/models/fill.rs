@@ -417,6 +417,112 @@ impl FillModel for OneTickSlippageFillModel {
     }
 }
 
+/// Fill model that forces a configurable fixed slippage on every fill, with
+/// optional clamping to the Polymarket binary-option `[tick, 1 - tick]`
+/// probability domain.
+///
+/// Builds a synthetic L2 book with unlimited liquidity sitting `slippage`
+/// price units away from the matching engine's transient best bid/ask
+/// (which, on Polymarket trade-tick replay, equals the last traded price).
+/// Aggressive buys fill at `best_ask + slippage`; aggressive sells fill at
+/// `best_bid - slippage`. When `clamp_to_probability_domain` is true (default
+/// for prediction markets), the shifted prices are clamped into Polymarket's
+/// `[tick, 1 - tick]` domain so post-slippage prices remain valid.
+///
+/// Differs from `OneTickSlippageFillModel` in that the slippage amount is
+/// configurable in absolute price units rather than hard-coded to one tick.
+/// Deterministic — `is_slipped()` always returns true. The right fit for
+/// markets like Polymarket where a uniform fixed slippage applies to every
+/// fill.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.execution",
+        unsendable,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")
+)]
+pub struct PolymarketFixedSlippageFillModel {
+    slippage: f64,
+    clamp_to_probability_domain: bool,
+}
+
+impl PolymarketFixedSlippageFillModel {
+    /// Creates a new [`PolymarketFixedSlippageFillModel`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `slippage` is negative.
+    pub fn new(slippage: f64, clamp_to_probability_domain: Option<bool>) -> anyhow::Result<Self> {
+        if slippage < 0.0 {
+            anyhow::bail!("`slippage` must be greater than or equal to zero")
+        }
+        Ok(Self {
+            slippage,
+            clamp_to_probability_domain: clamp_to_probability_domain.unwrap_or(true),
+        })
+    }
+}
+
+impl Default for PolymarketFixedSlippageFillModel {
+    fn default() -> Self {
+        Self::new(0.02, None).unwrap()
+    }
+}
+
+impl FillModel for PolymarketFixedSlippageFillModel {
+    fn is_limit_filled(&mut self) -> bool {
+        true
+    }
+
+    fn is_slipped(&mut self) -> bool {
+        true
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        instrument: &InstrumentAny,
+        _order: &OrderAny,
+        best_bid: Price,
+        best_ask: Price,
+    ) -> Option<OrderBook> {
+        let price_prec = instrument.price_precision();
+        let size_prec = instrument.size_precision();
+        let slippage_price = Price::new(self.slippage, price_prec);
+        let mut bid_px = best_bid - slippage_price;
+        let mut ask_px = best_ask + slippage_price;
+
+        if self.clamp_to_probability_domain {
+            let tick = instrument.price_increment();
+            let upper_bound = Price::new(1.0, price_prec) - tick;
+            bid_px = bid_px.max(tick);
+            ask_px = ask_px.min(upper_bound);
+        }
+
+        let mut book = build_l2_book(instrument.id());
+        add_order(
+            &mut book,
+            OrderSide::Buy,
+            bid_px,
+            unlimited_liquidity(size_prec),
+            1,
+        );
+        add_order(
+            &mut book,
+            OrderSide::Sell,
+            ask_px,
+            unlimited_liquidity(size_prec),
+            2,
+        );
+        Some(book)
+    }
+}
+
 /// Fill model with 50/50 chance of best price fill or one tick slippage.
 #[derive(Debug)]
 #[cfg_attr(
@@ -1268,6 +1374,7 @@ pub enum FillModelAny {
     Default(DefaultFillModel),
     BestPrice(BestPriceFillModel),
     OneTickSlippage(OneTickSlippageFillModel),
+    PolymarketFixedSlippage(PolymarketFixedSlippageFillModel),
     Probabilistic(ProbabilisticFillModel),
     TwoTier(TwoTierFillModel),
     ThreeTier(ThreeTierFillModel),
@@ -1284,6 +1391,7 @@ impl FillModel for FillModelAny {
             Self::Default(m) => m.is_limit_filled(),
             Self::BestPrice(m) => m.is_limit_filled(),
             Self::OneTickSlippage(m) => m.is_limit_filled(),
+            Self::PolymarketFixedSlippage(m) => m.is_limit_filled(),
             Self::Probabilistic(m) => m.is_limit_filled(),
             Self::TwoTier(m) => m.is_limit_filled(),
             Self::ThreeTier(m) => m.is_limit_filled(),
@@ -1300,6 +1408,7 @@ impl FillModel for FillModelAny {
             Self::Default(m) => m.fill_limit_inside_spread(),
             Self::BestPrice(m) => m.fill_limit_inside_spread(),
             Self::OneTickSlippage(m) => m.fill_limit_inside_spread(),
+            Self::PolymarketFixedSlippage(m) => m.fill_limit_inside_spread(),
             Self::Probabilistic(m) => m.fill_limit_inside_spread(),
             Self::TwoTier(m) => m.fill_limit_inside_spread(),
             Self::ThreeTier(m) => m.fill_limit_inside_spread(),
@@ -1316,6 +1425,7 @@ impl FillModel for FillModelAny {
             Self::Default(m) => m.is_slipped(),
             Self::BestPrice(m) => m.is_slipped(),
             Self::OneTickSlippage(m) => m.is_slipped(),
+            Self::PolymarketFixedSlippage(m) => m.is_slipped(),
             Self::Probabilistic(m) => m.is_slipped(),
             Self::TwoTier(m) => m.is_slipped(),
             Self::ThreeTier(m) => m.is_slipped(),
@@ -1342,6 +1452,9 @@ impl FillModel for FillModelAny {
                 m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask)
             }
             Self::OneTickSlippage(m) => {
+                m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask)
+            }
+            Self::PolymarketFixedSlippage(m) => {
                 m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask)
             }
             Self::Probabilistic(m) => {
@@ -1384,6 +1497,7 @@ impl Display for FillModelAny {
             Self::Default(m) => write!(f, "{m}"),
             Self::BestPrice(_) => write!(f, "BestPriceFillModel"),
             Self::OneTickSlippage(_) => write!(f, "OneTickSlippageFillModel"),
+            Self::PolymarketFixedSlippage(_) => write!(f, "PolymarketFixedSlippageFillModel"),
             Self::Probabilistic(_) => write!(f, "ProbabilisticFillModel"),
             Self::TwoTier(_) => write!(f, "TwoTierFillModel"),
             Self::ThreeTier(_) => write!(f, "ThreeTierFillModel"),
@@ -1571,5 +1685,126 @@ mod tests {
 
         let one_tick = FillModelAny::OneTickSlippage(OneTickSlippageFillModel::default());
         assert!(!one_tick.fill_limit_inside_spread());
+    }
+
+    fn polymarket_binary_option_2dp() -> InstrumentAny {
+        use chrono::{TimeZone, Utc};
+        use nautilus_core::UnixNanos;
+        use nautilus_model::{
+            enums::AssetClass,
+            identifiers::{InstrumentId, Symbol},
+            instruments::BinaryOption,
+            types::Currency,
+        };
+
+        let raw_symbol = Symbol::new("polymarket-test-market");
+        let activation = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let expiration = Utc.with_ymd_and_hms(2026, 5, 1, 0, 5, 0).unwrap();
+        let price_increment = Price::from("0.01");
+        let size_increment = Quantity::from("0.01");
+        let inst = BinaryOption::new(
+            InstrumentId::from("test-market.POLYMARKET"),
+            raw_symbol,
+            AssetClass::Alternative,
+            Currency::USDC(),
+            UnixNanos::from(activation.timestamp_nanos_opt().unwrap() as u64),
+            UnixNanos::from(expiration.timestamp_nanos_opt().unwrap() as u64),
+            price_increment.precision,
+            size_increment.precision,
+            price_increment,
+            size_increment,
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        InstrumentAny::BinaryOption(inst)
+    }
+
+    #[rstest]
+    fn test_polymarket_fixed_slippage_negative_rejected() {
+        let result = PolymarketFixedSlippageFillModel::new(-0.01, None);
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_polymarket_fixed_slippage_is_always_slipped() {
+        let mut model = PolymarketFixedSlippageFillModel::default();
+        assert!(model.is_slipped());
+        assert!(model.is_limit_filled());
+    }
+
+    #[rstest]
+    fn test_polymarket_fixed_slippage_shifts_book_by_slippage() {
+        // slippage=0.02 on a binary option with tick=0.01, mid 0.50/0.51.
+        let instrument = polymarket_binary_option_2dp();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .build();
+
+        let mut model = PolymarketFixedSlippageFillModel::new(0.02, Some(true)).unwrap();
+        let book = model
+            .get_orderbook_for_fill_simulation(
+                &instrument,
+                &order,
+                Price::from("0.50"),
+                Price::from("0.51"),
+            )
+            .unwrap();
+
+        assert_eq!(book.best_bid_price().unwrap(), Price::from("0.48"));
+        assert_eq!(book.best_ask_price().unwrap(), Price::from("0.53"));
+    }
+
+    #[rstest]
+    fn test_polymarket_fixed_slippage_clamps_to_probability_domain() {
+        // Bid near 0, ask near 1: post-slippage should clamp to [tick, 1-tick].
+        let instrument = polymarket_binary_option_2dp();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .build();
+
+        let mut model = PolymarketFixedSlippageFillModel::new(0.05, Some(true)).unwrap();
+        let book = model
+            .get_orderbook_for_fill_simulation(
+                &instrument,
+                &order,
+                Price::from("0.02"),
+                Price::from("0.97"),
+            )
+            .unwrap();
+
+        // bid 0.02 - 0.05 = -0.03 -> clamped to tick (0.01)
+        // ask 0.97 + 0.05 = 1.02 -> clamped to 1 - tick (0.99)
+        assert_eq!(book.best_bid_price().unwrap(), Price::from("0.01"));
+        assert_eq!(book.best_ask_price().unwrap(), Price::from("0.99"));
+    }
+
+    #[rstest]
+    fn test_polymarket_fixed_slippage_clamp_off_allows_oob() {
+        // With clamp disabled, slippage may push prices outside [0, 1] — caller's problem.
+        let instrument = polymarket_binary_option_2dp();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .build();
+
+        let mut model = PolymarketFixedSlippageFillModel::new(0.02, Some(false)).unwrap();
+        let book = model
+            .get_orderbook_for_fill_simulation(
+                &instrument,
+                &order,
+                Price::from("0.50"),
+                Price::from("0.51"),
+            )
+            .unwrap();
+
+        // No clamping — pure best_bid - slippage, best_ask + slippage.
+        assert_eq!(book.best_bid_price().unwrap(), Price::from("0.48"));
+        assert_eq!(book.best_ask_price().unwrap(), Price::from("0.53"));
     }
 }

@@ -18,6 +18,8 @@ __all__ = [
     "OneTickSlippageFillModel",
     "OrderEmulatorConfig",
     "PerContractFeeModel",
+    "PolymarketFeeModel",
+    "PolymarketFixedSlippageFillModel",
     "ProbabilisticFillModel",
     "SizeAwareFillModel",
     "StaticLatencyModel",
@@ -136,6 +138,16 @@ class OrderEmulatorConfig:
 @typing.final
 class PerContractFeeModel:
     def __init__(self, commission: model.Money) -> None: ...
+
+@typing.final
+class PolymarketFeeModel:
+    def __init__(self, maker_rebates_enabled: bool | None = None) -> None: ...
+
+@typing.final
+class PolymarketFixedSlippageFillModel:
+    def __init__(
+        self, slippage: float, clamp_to_probability_domain: bool | None = None
+    ) -> None: ...
 
 @typing.final
 class ProbabilisticFillModel:

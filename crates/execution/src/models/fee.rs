@@ -62,6 +62,7 @@ pub enum FeeModelAny {
     PerContract(PerContractFeeModel),
     CappedOption(CappedOptionFeeModel),
     TieredNotionalOption(TieredNotionalOptionFeeModel),
+    Polymarket(PolymarketFeeModel),
 }
 
 impl FeeModel for FeeModelAny {
@@ -84,6 +85,9 @@ impl FeeModel for FeeModelAny {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
             Self::TieredNotionalOption(model) => {
+                model.get_commission(order, fill_quantity, fill_px, instrument)
+            }
+            Self::Polymarket(model) => {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
         }
@@ -127,6 +131,13 @@ impl FeeModel for FeeModelAny {
                 underlying_px,
             ),
             Self::TieredNotionalOption(model) => model.get_commission_with_context(
+                order,
+                fill_quantity,
+                fill_px,
+                instrument,
+                underlying_px,
+            ),
+            Self::Polymarket(model) => model.get_commission_with_context(
                 order,
                 fill_quantity,
                 fill_px,
@@ -427,6 +438,118 @@ impl FeeModel for TieredNotionalOptionFeeModel {
     }
 }
 
+/// Polymarket-aware fee model implementing the documented `p * (1 - p)` curve.
+///
+/// Formula: `fee = quantity * fee_rate * p * (1 - p)`, where `fee_rate` is the
+/// effective per-category taker rate read from `instrument.taker_fee()` and
+/// `p` is the fill price in `[0, 1]`. Per Polymarket's fee schedule the rate
+/// is category-dependent (0.07 crypto, 0.04 politics/finance/tech/mentions,
+/// 0.05 economics/culture/weather/general/other, 0.03 sports, 0 geopolitics) —
+/// callers must ensure the instrument's `taker_fee` reflects the documented
+/// effective rate, not gamma's `feeSchedule.rate` which is uniformly 0.25.
+///
+/// Makers never pay taker fees. When `maker_rebates_enabled` is true (default),
+/// maker fills receive a per-fill credit equal to the documented rebate share
+/// of their fee-equivalent: 20% for crypto markets, 25% for other paying
+/// categories, 0 for fee-free markets. The rebate is inferred from the taker
+/// fee rate (each rebate tier maps to a unique rate or rate group). Returned
+/// as a negative `Money` so the matching engine credits it back to the
+/// account. This is an optimistic upper bound — actual rebates are
+/// distributed daily proportional to the trader's share of maker fee
+/// equivalent against the full market pool, which is not knowable in a
+/// backtest.
+///
+/// Fees are rounded to 5 decimal places per the docs (smallest charged fee
+/// 0.00001 USDC).
+///
+/// Reference: <https://docs.polymarket.com/trading/fees>
+/// Reference: <https://docs.polymarket.com/market-makers/maker-rebates>
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.execution",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")
+)]
+pub struct PolymarketFeeModel {
+    maker_rebates_enabled: bool,
+}
+
+impl PolymarketFeeModel {
+    /// Creates a new [`PolymarketFeeModel`] instance.
+    #[must_use]
+    pub fn new(maker_rebates_enabled: Option<bool>) -> Self {
+        Self {
+            maker_rebates_enabled: maker_rebates_enabled.unwrap_or(true),
+        }
+    }
+}
+
+impl Default for PolymarketFeeModel {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl FeeModel for PolymarketFeeModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        let quote_currency = instrument.quote_currency();
+        let taker_fee = instrument.taker_fee();
+        if taker_fee <= Decimal::ZERO {
+            return Ok(Money::zero(quote_currency));
+        }
+
+        let qty = fill_quantity.as_decimal();
+        let p = fill_px.as_decimal();
+        let fee_equivalent = qty * taker_fee * p * (dec!(1) - p);
+
+        let amount = match order.liquidity_side() {
+            Some(LiquiditySide::Maker) => {
+                if !self.maker_rebates_enabled {
+                    return Ok(Money::zero(quote_currency));
+                }
+                let rebate_share = polymarket_rebate_share(taker_fee);
+                if rebate_share.is_zero() {
+                    return Ok(Money::zero(quote_currency));
+                }
+                -(fee_equivalent * rebate_share).round_dp(5)
+            }
+            // Taker / NoLiquiditySide / unset: charge taker fee.
+            _ => fee_equivalent.round_dp(5),
+        };
+
+        Money::from_decimal(amount, quote_currency).map_err(Into::into)
+    }
+}
+
+/// Maker rebate share for a Polymarket market, derived from the documented
+/// taker fee rate. Crypto markets (rate 0.07) pay 20% of the rebate pool;
+/// other paying categories (rates 0.03 / 0.04 / 0.05) pay 25%. Fee-free
+/// markets (rate 0) and unknown rates return 0.
+///
+/// Reference: <https://docs.polymarket.com/market-makers/maker-rebates>
+fn polymarket_rebate_share(fee_rate: Decimal) -> Decimal {
+    let rate = fee_rate.normalize();
+    if rate == dec!(0.07) {
+        dec!(0.20)
+    } else if rate == dec!(0.03) || rate == dec!(0.04) || rate == dec!(0.05) {
+        dec!(0.25)
+    } else {
+        dec!(0)
+    }
+}
+
 fn option_fee_rate(
     order: &OrderAny,
     instrument: &InstrumentAny,
@@ -488,7 +611,7 @@ mod tests {
 
     use super::{
         CappedOptionFeeModel, FeeModel, FeeModelAny, FixedFeeModel, MakerTakerFeeModel,
-        PerContractFeeModel, TieredNotionalOptionFeeModel,
+        PerContractFeeModel, PolymarketFeeModel, TieredNotionalOptionFeeModel,
     };
 
     #[rstest]
@@ -963,5 +1086,142 @@ mod tests {
             .build();
 
         TestOrderStubs::make_filled_order(&limit_order, instrument, liquidity_side)
+    }
+
+    // Build a Polymarket BinaryOption stub with the supplied taker fee.
+    fn polymarket_binary_option(taker_fee: Decimal) -> InstrumentAny {
+        use chrono::{TimeZone, Utc};
+        use nautilus_core::UnixNanos;
+        use nautilus_model::{
+            enums::AssetClass,
+            identifiers::{InstrumentId, Symbol},
+            instruments::BinaryOption,
+        };
+
+        let raw_symbol = Symbol::new("polymarket-test-market");
+        let activation = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let expiration = Utc.with_ymd_and_hms(2026, 5, 1, 0, 5, 0).unwrap();
+        let price_increment = Price::from("0.01");
+        let size_increment = Quantity::from("0.01");
+        let inst = BinaryOption::new(
+            InstrumentId::from("test-market.POLYMARKET"),
+            raw_symbol,
+            AssetClass::Alternative,
+            Currency::USDC(),
+            UnixNanos::from(activation.timestamp_nanos_opt().unwrap() as u64),
+            UnixNanos::from(expiration.timestamp_nanos_opt().unwrap() as u64),
+            price_increment.precision,
+            size_increment.precision,
+            price_increment,
+            size_increment,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(taker_fee),
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        InstrumentAny::BinaryOption(inst)
+    }
+
+    fn polymarket_fill(instrument: &InstrumentAny, liquidity_side: LiquiditySide) -> OrderAny {
+        let limit_order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .price(Price::from("0.50"))
+            .quantity(Quantity::from("100"))
+            .build();
+        TestOrderStubs::make_filled_order(&limit_order, instrument, liquidity_side)
+    }
+
+    #[rstest]
+    #[case::p10(Price::from("0.10"), dec!(0.63))]
+    #[case::p30(Price::from("0.30"), dec!(1.47))]
+    #[case::p50(Price::from("0.50"), dec!(1.75))]
+    #[case::p70(Price::from("0.70"), dec!(1.47))]
+    #[case::p90(Price::from("0.90"), dec!(0.63))]
+    fn test_polymarket_fee_model_taker_curve(
+        #[case] fill_px: Price,
+        #[case] expected: Decimal,
+    ) {
+        // qty=100, rate=0.07. Formula: 100 * 0.07 * p * (1-p).
+        let instrument = polymarket_binary_option(dec!(0.07));
+        let fill = polymarket_fill(&instrument, LiquiditySide::Taker);
+        let fee_model = PolymarketFeeModel::new(None);
+
+        let commission = fee_model
+            .get_commission(&fill, Quantity::from("100"), fill_px, &instrument)
+            .unwrap();
+
+        assert_eq!(commission.currency, Currency::USDC());
+        assert_eq!(commission.as_decimal(), expected);
+    }
+
+    #[rstest]
+    fn test_polymarket_fee_model_maker_disabled() {
+        let instrument = polymarket_binary_option(dec!(0.07));
+        let fill = polymarket_fill(&instrument, LiquiditySide::Maker);
+        let fee_model = PolymarketFeeModel::new(Some(false));
+
+        let commission = fee_model
+            .get_commission(&fill, Quantity::from("100"), Price::from("0.50"), &instrument)
+            .unwrap();
+
+        assert_eq!(commission, Money::zero(Currency::USDC()));
+    }
+
+    #[rstest]
+    fn test_polymarket_fee_model_maker_rebate_crypto() {
+        // qty=100, rate=0.07, p=0.5, crypto rebate share 0.20.
+        // fee_equivalent = 100 * 0.07 * 0.5 * 0.5 = 1.75
+        // rebate = 1.75 * 0.20 = 0.35 -> credited as -0.35
+        let instrument = polymarket_binary_option(dec!(0.07));
+        let fill = polymarket_fill(&instrument, LiquiditySide::Maker);
+        let fee_model = PolymarketFeeModel::new(Some(true));
+
+        let commission = fee_model
+            .get_commission(&fill, Quantity::from("100"), Price::from("0.50"), &instrument)
+            .unwrap();
+
+        assert_eq!(commission.as_decimal(), dec!(-0.35));
+    }
+
+    #[rstest]
+    fn test_polymarket_fee_model_maker_rebate_non_crypto() {
+        // qty=100, rate=0.04 (politics), p=0.5, non-crypto rebate share 0.25.
+        // fee_equivalent = 100 * 0.04 * 0.5 * 0.5 = 1.00
+        // rebate = 1.00 * 0.25 = 0.25 -> credited as -0.25
+        let instrument = polymarket_binary_option(dec!(0.04));
+        let fill = polymarket_fill(&instrument, LiquiditySide::Maker);
+        let fee_model = PolymarketFeeModel::new(Some(true));
+
+        let commission = fee_model
+            .get_commission(&fill, Quantity::from("100"), Price::from("0.50"), &instrument)
+            .unwrap();
+
+        assert_eq!(commission.as_decimal(), dec!(-0.25));
+    }
+
+    #[rstest]
+    fn test_polymarket_fee_model_zero_rate_returns_zero() {
+        // Geopolitics markets have taker_fee=0.
+        let instrument = polymarket_binary_option(Decimal::ZERO);
+        let fill = polymarket_fill(&instrument, LiquiditySide::Taker);
+        let fee_model = PolymarketFeeModel::default();
+
+        let commission = fee_model
+            .get_commission(&fill, Quantity::from("100"), Price::from("0.50"), &instrument)
+            .unwrap();
+
+        assert_eq!(commission, Money::zero(Currency::USDC()));
     }
 }
