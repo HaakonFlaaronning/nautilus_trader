@@ -29,7 +29,7 @@ use nautilus_core::{
 use nautilus_execution::models::{
     fee::{
         CappedOptionFeeModel, FeeModelAny, FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel,
-        TieredNotionalOptionFeeModel,
+        PolymarketFeeModel, TieredNotionalOptionFeeModel,
     },
     fill::{
         BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
@@ -1084,6 +1084,10 @@ pub(crate) fn pyobject_to_fee_model_any(
 
     if let Ok(m) = obj.extract::<TieredNotionalOptionFeeModel>() {
         return Ok(FeeModelAny::TieredNotionalOption(m));
+    }
+
+    if let Ok(m) = obj.extract::<PolymarketFeeModel>() {
+        return Ok(FeeModelAny::Polymarket(m));
     }
 
     let type_name = obj.get_type().name()?;
