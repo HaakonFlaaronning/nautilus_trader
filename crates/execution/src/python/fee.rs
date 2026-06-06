@@ -22,7 +22,7 @@ use rust_decimal::Decimal;
 
 use crate::models::fee::{
     CappedOptionFeeModel, FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel,
-    TieredNotionalOptionFeeModel,
+    PolymarketFeeModel, TieredNotionalOptionFeeModel,
 };
 
 #[pymethods]
@@ -106,6 +106,46 @@ impl TieredNotionalOptionFeeModel {
     #[pyo3(signature = (maker_rate=None, taker_rate=None))]
     fn py_new(maker_rate: Option<Decimal>, taker_rate: Option<Decimal>) -> PyResult<Self> {
         Self::new(maker_rate, taker_rate).map_err(to_pyruntime_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl PolymarketFeeModel {
+    /// Polymarket-aware fee model implementing the documented `p * (1 - p)` curve.
+    ///
+    /// Formula: `fee = quantity * fee_rate * p * (1 - p)`, where `fee_rate` is the
+    /// effective per-category taker rate read from `instrument.taker_fee()` and
+    /// `p` is the fill price in `[0, 1]`. Per Polymarket's fee schedule the rate
+    /// is category-dependent (0.07 crypto, 0.04 politics/finance/tech/mentions,
+    /// 0.05 economics/culture/weather/general/other, 0.03 sports, 0 geopolitics) —
+    /// callers must ensure the instrument's `taker_fee` reflects the documented
+    /// effective rate, not gamma's `feeSchedule.rate` which is uniformly 0.25.
+    ///
+    /// Makers never pay taker fees. When `maker_rebates_enabled` is true (default),
+    /// maker fills receive a per-fill credit equal to the documented rebate share
+    /// of their fee-equivalent: 20% for crypto markets, 25% for other paying
+    /// categories, 0 for fee-free markets. The rebate is inferred from the taker
+    /// fee rate (each rebate tier maps to a unique rate or rate group). Returned
+    /// as a negative `Money` so the matching engine credits it back to the
+    /// account. This is an optimistic upper bound — actual rebates are
+    /// distributed daily proportional to the trader's share of maker fee
+    /// equivalent against the full market pool, which is not knowable in a
+    /// backtest.
+    ///
+    /// Fees are rounded to 5 decimal places per the docs (smallest charged fee
+    /// 0.00001 USDC).
+    ///
+    /// Reference: <https://docs.polymarket.com/trading/fees>
+    /// Reference: <https://docs.polymarket.com/market-makers/maker-rebates>
+    #[new]
+    #[pyo3(signature = (maker_rebates_enabled=None))]
+    fn py_new(maker_rebates_enabled: Option<bool>) -> Self {
+        Self::new(maker_rebates_enabled)
     }
 
     fn __repr__(&self) -> String {

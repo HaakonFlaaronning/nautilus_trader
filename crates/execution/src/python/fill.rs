@@ -20,8 +20,9 @@ use pyo3::prelude::*;
 
 use crate::models::fill::{
     BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, LimitOrderPartialFillModel,
-    MarketHoursFillModel, OneTickSlippageFillModel, ProbabilisticFillModel, SizeAwareFillModel,
-    ThreeTierFillModel, TwoTierFillModel, VolumeSensitiveFillModel,
+    MarketHoursFillModel, OneTickSlippageFillModel, PolymarketFixedSlippageFillModel,
+    ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
+    VolumeSensitiveFillModel,
 };
 
 macro_rules! impl_fill_model_pymethods {
@@ -56,6 +57,37 @@ impl_fill_model_pymethods!(LimitOrderPartialFillModel);
 impl_fill_model_pymethods!(SizeAwareFillModel);
 impl_fill_model_pymethods!(VolumeSensitiveFillModel);
 impl_fill_model_pymethods!(MarketHoursFillModel);
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl PolymarketFixedSlippageFillModel {
+    /// Fill model that forces a configurable fixed slippage on every fill, with
+    /// optional clamping to the Polymarket binary-option `[tick, 1 - tick]`
+    /// probability domain.
+    ///
+    /// Builds a synthetic L2 book with unlimited liquidity sitting `slippage`
+    /// price units away from the matching engine's transient best bid/ask
+    /// (which, on Polymarket trade-tick replay, equals the last traded price).
+    /// Aggressive buys fill at `best_ask + slippage`; aggressive sells fill at
+    /// `best_bid - slippage`. When `clamp_to_probability_domain` is true (default
+    /// for prediction markets), the shifted prices are clamped into Polymarket's
+    /// `[tick, 1 - tick]` domain so post-slippage prices remain valid.
+    ///
+    /// Differs from `OneTickSlippageFillModel` in that the slippage amount is
+    /// configurable in absolute price units rather than hard-coded to one tick.
+    /// Deterministic — `is_slipped()` always returns true. The right fit for
+    /// markets like Polymarket where a uniform fixed slippage applies to every
+    /// fill.
+    #[new]
+    #[pyo3(signature = (slippage, clamp_to_probability_domain=None))]
+    fn py_new(slippage: f64, clamp_to_probability_domain: Option<bool>) -> PyResult<Self> {
+        Self::new(slippage, clamp_to_probability_domain).map_err(to_pyruntime_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]

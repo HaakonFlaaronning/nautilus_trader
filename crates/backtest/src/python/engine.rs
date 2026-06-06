@@ -29,13 +29,13 @@ use nautilus_core::{
 use nautilus_execution::models::{
     fee::{
         CappedOptionFeeModel, FeeModelAny, FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel,
-        TieredNotionalOptionFeeModel,
+        PolymarketFeeModel, TieredNotionalOptionFeeModel,
     },
     fill::{
         BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
         LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
-        ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
-        VolumeSensitiveFillModel,
+        PolymarketFixedSlippageFillModel, ProbabilisticFillModel, SizeAwareFillModel,
+        ThreeTierFillModel, TwoTierFillModel, VolumeSensitiveFillModel,
     },
     latency::{LatencyModelAny, StaticLatencyModel},
 };
@@ -1024,6 +1024,10 @@ pub(crate) fn pyobject_to_fill_model_any(
         return Ok(FillModelAny::OneTickSlippage(m));
     }
 
+    if let Ok(m) = obj.extract::<PolymarketFixedSlippageFillModel>() {
+        return Ok(FillModelAny::PolymarketFixedSlippage(m));
+    }
+
     if let Ok(m) = obj.extract::<ProbabilisticFillModel>() {
         return Ok(FillModelAny::Probabilistic(m));
     }
@@ -1084,6 +1088,10 @@ pub(crate) fn pyobject_to_fee_model_any(
 
     if let Ok(m) = obj.extract::<TieredNotionalOptionFeeModel>() {
         return Ok(FeeModelAny::TieredNotionalOption(m));
+    }
+
+    if let Ok(m) = obj.extract::<PolymarketFeeModel>() {
+        return Ok(FeeModelAny::Polymarket(m));
     }
 
     let type_name = obj.get_type().name()?;
