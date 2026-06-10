@@ -63,6 +63,7 @@ pub enum FeeModelAny {
     CappedOption(CappedOptionFeeModel),
     TieredNotionalOption(TieredNotionalOptionFeeModel),
     Polymarket(PolymarketFeeModel),
+    ConfigurableMakerTaker(ConfigurableMakerTakerFeeModel),
 }
 
 impl FeeModel for FeeModelAny {
@@ -88,6 +89,9 @@ impl FeeModel for FeeModelAny {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
             Self::Polymarket(model) => {
+                model.get_commission(order, fill_quantity, fill_px, instrument)
+            }
+            Self::ConfigurableMakerTaker(model) => {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
         }
@@ -138,6 +142,13 @@ impl FeeModel for FeeModelAny {
                 underlying_px,
             ),
             Self::Polymarket(model) => model.get_commission_with_context(
+                order,
+                fill_quantity,
+                fill_px,
+                instrument,
+                underlying_px,
+            ),
+            Self::ConfigurableMakerTaker(model) => model.get_commission_with_context(
                 order,
                 fill_quantity,
                 fill_px,
@@ -276,6 +287,69 @@ impl FeeModel for MakerTakerFeeModel {
         let commission = match order.liquidity_side() {
             Some(LiquiditySide::Maker) => notional * instrument.maker_fee(),
             Some(LiquiditySide::Taker) => notional * instrument.taker_fee(),
+            Some(LiquiditySide::NoLiquiditySide) | None => anyhow::bail!("Liquidity side not set"),
+        };
+
+        if instrument.is_inverse() {
+            Money::from_decimal(commission, instrument.base_currency().unwrap()).map_err(Into::into)
+        } else {
+            Money::from_decimal(commission, instrument.quote_currency()).map_err(Into::into)
+        }
+    }
+}
+
+/// Maker/taker fee model with rates configured at construction.
+///
+/// Identical commission math to [`MakerTakerFeeModel`] but reads its rates from
+/// the model itself instead of `instrument.maker_fee()` / `instrument.taker_fee()`.
+/// Use when the catalog's baked-in instrument fees are outdated or when fees
+/// need to vary per run independently of instrument metadata (e.g. simulating
+/// different exchange tiers).
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.execution",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")
+)]
+pub struct ConfigurableMakerTakerFeeModel {
+    maker_rate: Decimal,
+    taker_rate: Decimal,
+}
+
+impl ConfigurableMakerTakerFeeModel {
+    /// Creates a new [`ConfigurableMakerTakerFeeModel`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either rate is negative.
+    pub fn new(maker_rate: Decimal, taker_rate: Decimal) -> anyhow::Result<Self> {
+        check_fee_rate(Some(maker_rate), "maker_rate")?;
+        check_fee_rate(Some(taker_rate), "taker_rate")?;
+        Ok(Self {
+            maker_rate,
+            taker_rate,
+        })
+    }
+}
+
+impl FeeModel for ConfigurableMakerTakerFeeModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        let notional = instrument.calculate_notional_value(fill_quantity, fill_px, Some(false));
+        let commission = match order.liquidity_side() {
+            Some(LiquiditySide::Maker) => notional * self.maker_rate,
+            Some(LiquiditySide::Taker) => notional * self.taker_rate,
             Some(LiquiditySide::NoLiquiditySide) | None => anyhow::bail!("Liquidity side not set"),
         };
 

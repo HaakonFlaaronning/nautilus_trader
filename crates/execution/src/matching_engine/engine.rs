@@ -4500,6 +4500,11 @@ impl OrderMatchingEngine {
         let initial_total_filled = total_filled;
         let mut last_fill_px: Option<Price> = None;
 
+        let is_expiration_close = order.tags().is_some_and(|tags| {
+            tags.iter()
+                .any(|t| t.as_str().starts_with("EXPIRATION_") && t.as_str().ends_with("_CLOSE"))
+        });
+
         for &(fill_px, fill_qty) in fills {
             let Some(mut fill_px) = self.normalize_fill_price(fill_px, order.client_order_id())
             else {
@@ -4518,7 +4523,10 @@ impl OrderMatchingEngine {
                 initial_market_to_limit_fill = true;
             }
 
-            if self.book_type == BookType::L1_MBP && self.fill_model.is_slipped() {
+            if !is_expiration_close
+                && self.book_type == BookType::L1_MBP
+                && self.fill_model.is_slipped()
+            {
                 fill_px = match order.order_side().as_specified() {
                     OrderSideSpecified::Buy => fill_px.add(self.instrument.price_increment()),
                     OrderSideSpecified::Sell => fill_px.sub(self.instrument.price_increment()),
@@ -4707,16 +4715,29 @@ impl OrderMatchingEngine {
         }
 
         let underlying_px = self.fee_underlying_price();
-        let commission = self
-            .fee_model
-            .get_commission_with_context(order, last_qty, last_px, &self.instrument, underlying_px)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to compute commission for {}: {}",
-                    order.client_order_id(),
-                    e
-                );
-            });
+        let is_expiration_close = order.tags().is_some_and(|tags| {
+            tags.iter()
+                .any(|t| t.as_str().starts_with("EXPIRATION_") && t.as_str().ends_with("_CLOSE"))
+        });
+        let commission = if is_expiration_close {
+            Money::new(0.0, self.instrument.quote_currency())
+        } else {
+            self.fee_model
+                .get_commission_with_context(
+                    order,
+                    last_qty,
+                    last_px,
+                    &self.instrument,
+                    underlying_px,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to compute commission for {}: {}",
+                        order.client_order_id(),
+                        e
+                    );
+                })
+        };
 
         let venue_order_id = self.ids_generator.get_venue_order_id(order).unwrap();
         self.generate_order_filled(

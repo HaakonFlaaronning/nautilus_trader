@@ -21,8 +21,8 @@ use pyo3::prelude::*;
 use rust_decimal::Decimal;
 
 use crate::models::fee::{
-    CappedOptionFeeModel, FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel,
-    PolymarketFeeModel, TieredNotionalOptionFeeModel,
+    CappedOptionFeeModel, ConfigurableMakerTakerFeeModel, FixedFeeModel, MakerTakerFeeModel,
+    PerContractFeeModel, PolymarketFeeModel, TieredNotionalOptionFeeModel,
 };
 
 #[pymethods]
@@ -50,6 +50,26 @@ impl MakerTakerFeeModel {
     #[new]
     fn py_new() -> Self {
         Self
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl ConfigurableMakerTakerFeeModel {
+    /// Maker/taker fee model with rates configured at construction.
+    ///
+    /// Identical commission math to `MakerTakerFeeModel` but reads its rates from
+    /// the model itself instead of `instrument.maker_fee()` / `instrument.taker_fee()`.
+    /// Use when the catalog's baked-in instrument fees are outdated or when fees
+    /// need to vary per run independently of instrument metadata.
+    #[new]
+    #[pyo3(signature = (maker_rate, taker_rate))]
+    fn py_new(maker_rate: Decimal, taker_rate: Decimal) -> PyResult<Self> {
+        Self::new(maker_rate, taker_rate).map_err(to_pyruntime_err)
     }
 
     fn __repr__(&self) -> String {

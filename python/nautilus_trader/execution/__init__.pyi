@@ -9,6 +9,7 @@ __all__ = [
     "BestPriceFillModel",
     "CappedOptionFeeModel",
     "CompetitionAwareFillModel",
+    "ConfigurableMakerTakerFeeModel",
     "DefaultFillModel",
     "ExecutionEngineConfig",
     "FixedFeeModel",
@@ -116,6 +117,10 @@ class LimitOrderPartialFillModel:
 @typing.final
 class MakerTakerFeeModel:
     def __init__(self) -> None: ...
+
+@typing.final
+class ConfigurableMakerTakerFeeModel:
+    def __init__(self, maker_rate: decimal.Decimal, taker_rate: decimal.Decimal) -> None: ...
 
 @typing.final
 class MarketHoursFillModel:
