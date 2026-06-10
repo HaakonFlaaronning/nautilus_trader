@@ -481,7 +481,7 @@ impl FillModel for PolymarketFixedSlippageFillModel {
     }
 
     fn is_slipped(&mut self) -> bool {
-        true
+        false
     }
 
     fn get_orderbook_for_fill_simulation(
