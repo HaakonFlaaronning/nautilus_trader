@@ -167,23 +167,23 @@ fn get_cash_account(accountid: Option<&str>) -> AccountState {
         AccountType::Cash,
         vec![
             AccountBalance::new(
-                Money::new(10.00000000, Currency::BTC()),
-                Money::new(0.00000000, Currency::BTC()),
-                Money::new(10.00000000, Currency::BTC()),
+                Money::new(10.000_000_00, Currency::BTC()),
+                Money::zero(Currency::BTC()),
+                Money::new(10.000_000_00, Currency::BTC()),
             ),
             AccountBalance::new(
                 Money::new(10.000, Currency::USD()),
-                Money::new(0.000, Currency::USD()),
+                Money::zero(Currency::USD()),
                 Money::new(10.000, Currency::USD()),
             ),
             AccountBalance::new(
-                Money::new(100000.000, Currency::USDT()),
-                Money::new(0.000, Currency::USDT()),
-                Money::new(100000.000, Currency::USDT()),
+                Money::new(100_000.000, Currency::USDT()),
+                Money::zero(Currency::USDT()),
+                Money::new(100_000.000, Currency::USDT()),
             ),
             AccountBalance::new(
                 Money::new(20.000, Currency::ETH()),
-                Money::new(0.000, Currency::ETH()),
+                Money::zero(Currency::ETH()),
                 Money::new(20.000, Currency::ETH()),
             ),
         ],
@@ -206,27 +206,27 @@ fn get_margin_account(accountid: Option<&str>) -> AccountState {
         vec![
             AccountBalance::new(
                 Money::new(10.000, Currency::BTC()),
-                Money::new(0.000, Currency::BTC()),
+                Money::zero(Currency::BTC()),
                 Money::new(10.000, Currency::BTC()),
             ),
             AccountBalance::new(
                 Money::new(20.000, Currency::ETH()),
-                Money::new(0.000, Currency::ETH()),
+                Money::zero(Currency::ETH()),
                 Money::new(20.000, Currency::ETH()),
             ),
             AccountBalance::new(
-                Money::new(100000.000, Currency::USDT()),
-                Money::new(0.000, Currency::USDT()),
-                Money::new(100000.000, Currency::USDT()),
+                Money::new(100_000.000, Currency::USDT()),
+                Money::zero(Currency::USDT()),
+                Money::new(100_000.000, Currency::USDT()),
             ),
             AccountBalance::new(
                 Money::new(10.000, Currency::USD()),
-                Money::new(0.000, Currency::USD()),
+                Money::zero(Currency::USD()),
                 Money::new(10.000, Currency::USD()),
             ),
             AccountBalance::new(
                 Money::new(10.000, Currency::GBP()),
-                Money::new(0.000, Currency::GBP()),
+                Money::zero(Currency::GBP()),
                 Money::new(10.000, Currency::GBP()),
             ),
         ],
@@ -239,11 +239,11 @@ fn get_margin_account(accountid: Option<&str>) -> AccountState {
     )
 }
 
-fn usd_balance_total(portfolio: &Portfolio, account_id: &AccountId) -> Money {
+fn usd_balance_total(portfolio: &Portfolio, account_id: AccountId) -> Money {
     portfolio
         .cache()
         .borrow()
-        .account_owned(account_id)
+        .account_owned(&account_id)
         .unwrap()
         .balance_total(Some(Currency::USD()))
         .unwrap()
@@ -363,8 +363,8 @@ fn get_closed_position(position: &Position) -> PositionClosed {
         avg_px_open: position.avg_px_open,
         avg_px_close: Some(position.avg_px_open),
         realized_return: 0.0,
-        realized_pnl: Some(Money::new(0.0, position.settlement_currency)),
-        unrealized_pnl: Money::new(0.0, position.settlement_currency),
+        realized_pnl: Some(Money::zero(position.settlement_currency)),
+        unrealized_pnl: Money::zero(position.settlement_currency),
         duration: 0,
         event_id: UUID4::new(),
         ts_opened: 0.into(),
@@ -1141,12 +1141,12 @@ fn test_update_order_without_account_state_restores_account(
         vec![
             AccountBalance::new(
                 Money::new(1_000_000.0, Currency::USD()),
-                Money::new(0.0, Currency::USD()),
+                Money::zero(Currency::USD()),
                 Money::new(1_000_000.0, Currency::USD()),
             ),
             AccountBalance::new(
                 Money::new(100_000.0, Currency::EUR()),
-                Money::new(0.0, Currency::EUR()),
+                Money::zero(Currency::EUR()),
                 Money::new(100_000.0, Currency::EUR()),
             ),
         ],
@@ -1248,7 +1248,7 @@ fn test_update_order_filled_restores_account_before_unrealized_pnl(
         Currency::USDT(),
         LiquiditySide::Taker,
         Some(PositionId::new("P-001")),
-        Some(Money::new(0.0, Currency::USDT())),
+        Some(Money::zero(Currency::USDT())),
     );
 
     portfolio.update_order(&OrderEventAny::Filled(filled));
@@ -1263,7 +1263,7 @@ fn test_update_order_filled_restores_account_before_unrealized_pnl(
     assert_eq!(removed_account.id(), account_id);
     assert_eq!(
         portfolio.unrealized_pnl(&instrument_id),
-        Some(Money::new(0.0, Currency::USDT()))
+        Some(Money::zero(Currency::USDT()))
     );
 }
 
@@ -1300,7 +1300,7 @@ fn test_update_order_filled_without_cached_order_updates_account(
         Currency::USDT(),
         LiquiditySide::Taker,
         Some(PositionId::new("P-001")),
-        Some(Money::new(0.0, Currency::USDT())),
+        Some(Money::zero(Currency::USDT())),
     );
 
     portfolio.update_order(&OrderEventAny::Filled(filled));
@@ -1308,7 +1308,7 @@ fn test_update_order_filled_without_cached_order_updates_account(
     assert!(cache.borrow().account(&account_id).is_some());
     assert_eq!(
         portfolio.unrealized_pnl(&instrument_id),
-        Some(Money::new(0.0, Currency::USDT()))
+        Some(Money::zero(Currency::USDT()))
     );
 }
 
@@ -1359,7 +1359,7 @@ fn test_update_order_filled_spread_instrument_skips_balance_update(
 
     portfolio.update_order(&OrderEventAny::Filled(filled));
 
-    assert_eq!(usd_balance_total(&portfolio, &account_id), starting_usd);
+    assert_eq!(usd_balance_total(&portfolio, account_id), starting_usd);
 }
 
 #[rstest]
@@ -1523,7 +1523,7 @@ fn test_initialize_orders_cash_account_with_base_currency() {
         AccountType::Cash,
         vec![AccountBalance::new(
             Money::new(1000.0, Currency::USD()),
-            Money::new(0.0, Currency::USD()),
+            Money::zero(Currency::USD()),
             Money::new(1000.0, Currency::USD()),
         )],
         vec![],
@@ -1625,7 +1625,7 @@ fn test_update_positions(mut portfolio: Portfolio, instrument_audusd: Instrument
     let position2 = Position::new(&instrument_audusd, fill3);
 
     // Update the last quote
-    let last = get_quote_tick(&instrument_audusd, 250001.0, 250002.0, 1.0, 1.0);
+    let last = get_quote_tick(&instrument_audusd, 250_001.0, 250_002.0, 1.0, 1.0);
 
     portfolio
         .cache()
@@ -2260,11 +2260,11 @@ fn test_opening_several_positions_updates_portfolio(
     );
     assert_eq!(
         portfolio.net_position(&instrument_audusd.id()),
-        Decimal::from_f64(100000.0).unwrap()
+        Decimal::from_f64(100_000.0).unwrap()
     );
     assert_eq!(
         portfolio.net_position(&instrument_gbpusd.id()),
-        Decimal::from_f64(100000.0).unwrap()
+        Decimal::from_f64(100_000.0).unwrap()
     );
     assert!(portfolio.is_net_long(&instrument_audusd.id()));
     assert!(!portfolio.is_net_short(&instrument_audusd.id()));
@@ -2406,7 +2406,7 @@ fn test_modifying_position_updates_portfolio(
     );
     assert_eq!(
         portfolio.net_position(&instrument_audusd.id()),
-        Decimal::from_f64(100000.0).unwrap()
+        Decimal::from_f64(100_000.0).unwrap()
     );
     assert!(portfolio.is_net_long(&instrument_audusd.id()));
     assert!(!portfolio.is_net_short(&instrument_audusd.id()));
@@ -2435,7 +2435,7 @@ fn test_closing_position_updates_portfolio(
         AccountType::Margin,
         vec![AccountBalance::new(
             Money::new(1_000_000.0, Currency::USD()),
-            Money::new(0.0, Currency::USD()),
+            Money::zero(Currency::USD()),
             Money::new(1_000_000.0, Currency::USD()),
         )],
         vec![],
@@ -2602,6 +2602,91 @@ fn test_closing_position_updates_portfolio(
 }
 
 #[rstest]
+fn test_closed_position_records_account_currency_realized_pnl(
+    mut simple_cache: Cache,
+    clock: TestClock,
+    instrument_audusd: InstrumentAny,
+) {
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    simple_cache.set_mark_xrate(Currency::USD(), Currency::EUR(), 0.9);
+
+    let config = PortfolioConfig::builder().use_mark_xrates(true).build();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(simple_cache)),
+        Rc::new(RefCell::new(clock)),
+        Some(config),
+    );
+
+    let account_id = AccountId::new("SIM-001");
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            Money::new(1_000.0, Currency::EUR()),
+            Money::zero(Currency::EUR()),
+            Money::new(1_000.0, Currency::EUR()),
+        )],
+        vec![],
+        true,
+        uuid4(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(Currency::EUR()),
+    ));
+
+    let position_id = PositionId::new("P-ACCOUNT-PNL");
+    let fill = make_fill_for_account(
+        &instrument_audusd,
+        account_id,
+        OrderSide::Buy,
+        Quantity::from("1"),
+        Price::new(100.0, 2),
+        position_id,
+    );
+    let position = Position::new(&instrument_audusd, fill);
+    let closed_position = Position {
+        side: PositionSide::Flat,
+        signed_qty: 0.0,
+        quantity: Quantity::from("0"),
+        ts_closed: Some(UnixNanos::from(1)),
+        realized_pnl: Some(Money::from("12.34 USD")),
+        ..position.clone()
+    };
+
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio
+        .cache()
+        .borrow_mut()
+        .update_position(&closed_position)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionClosed(get_closed_position(
+        &closed_position,
+    )));
+
+    let recorded = portfolio.recorded_realized_pnls();
+    assert_eq!(
+        recorded
+            .get(&Currency::USD())
+            .and_then(|pnls| pnls.get(&position_id))
+            .copied(),
+        Some(12.34),
+    );
+    assert_eq!(
+        recorded
+            .get(&Currency::EUR())
+            .and_then(|pnls| pnls.get(&position_id))
+            .copied(),
+        Some(11.11),
+    );
+}
+
+#[rstest]
 fn test_order_fill_endpoint_updates_account_balance_before_position_close(
     mut portfolio: Portfolio,
     instrument_audusd: InstrumentAny,
@@ -2612,7 +2697,7 @@ fn test_order_fill_endpoint_updates_account_balance_before_position_close(
         AccountType::Margin,
         vec![AccountBalance::new(
             Money::new(1_000_000.0, Currency::USD()),
-            Money::new(0.0, Currency::USD()),
+            Money::zero(Currency::USD()),
             Money::new(1_000_000.0, Currency::USD()),
         )],
         vec![],
@@ -2710,7 +2795,7 @@ fn test_order_fill_endpoint_updates_account_balance_before_position_close(
     );
 
     assert_eq!(
-        usd_balance_total(&portfolio, &account_id),
+        usd_balance_total(&portfolio, account_id),
         Money::new(1_000_008.0, Currency::USD())
     );
 
@@ -2724,7 +2809,7 @@ fn test_order_fill_endpoint_updates_account_balance_before_position_close(
     portfolio.update_order(&OrderEventAny::Filled(fill2));
 
     assert_eq!(
-        usd_balance_total(&portfolio, &account_id),
+        usd_balance_total(&portfolio, account_id),
         Money::new(1_000_008.0, Currency::USD())
     );
 }
@@ -2740,7 +2825,7 @@ fn test_order_fill_endpoint_updates_account_balance_before_position_reverse(
         AccountType::Margin,
         vec![AccountBalance::new(
             Money::new(1_000_000.0, Currency::USD()),
-            Money::new(0.0, Currency::USD()),
+            Money::zero(Currency::USD()),
             Money::new(1_000_000.0, Currency::USD()),
         )],
         vec![],
@@ -2838,7 +2923,7 @@ fn test_order_fill_endpoint_updates_account_balance_before_position_reverse(
     );
 
     assert_eq!(
-        usd_balance_total(&portfolio, &account_id),
+        usd_balance_total(&portfolio, account_id),
         Money::new(1_000_007.0, Currency::USD())
     );
 
@@ -2855,7 +2940,7 @@ fn test_order_fill_endpoint_updates_account_balance_before_position_reverse(
     portfolio.update_order(&OrderEventAny::Filled(fill2));
 
     assert_eq!(
-        usd_balance_total(&portfolio, &account_id),
+        usd_balance_total(&portfolio, account_id),
         Money::new(1_000_007.0, Currency::USD())
     );
 }
@@ -3056,9 +3141,9 @@ fn test_realized_pnl_with_missing_exchange_rate_returns_zero_instead_of_panic(
         account_id,
         AccountType::Cash,
         vec![AccountBalance::new(
-            Money::new(100000.0, Currency::EUR()),
-            Money::new(0.0, Currency::EUR()),
-            Money::new(100000.0, Currency::EUR()),
+            Money::new(100_000.0, Currency::EUR()),
+            Money::zero(Currency::EUR()),
+            Money::new(100_000.0, Currency::EUR()),
         )],
         vec![],
         true,
@@ -3099,10 +3184,10 @@ fn test_realized_pnl_with_missing_exchange_rate_returns_zero_instead_of_panic(
 
     let pnl = result.unwrap();
     assert_eq!(pnl.currency, Currency::EUR());
-    assert_eq!(pnl.as_f64(), 0.0);
+    assert_eq!(pnl.as_decimal(), Decimal::ZERO);
 
-    let safe_calculation = result.unwrap().as_f64() * 1.5;
-    assert_eq!(safe_calculation, 0.0);
+    let safe_calculation = pnl.as_decimal() * dec!(1.5);
+    assert_eq!(safe_calculation, Decimal::ZERO);
 
     let result2 = portfolio.realized_pnl(&instrument_audusd.id());
     assert_eq!(result2, result);
@@ -3438,22 +3523,22 @@ fn test_net_exposures_filters_by_account_id(
     // No filter: both accounts aggregated
     let all = portfolio.net_exposures(&venue, None);
     assert!(all.is_some());
-    let all_usd = all.unwrap().get(&Currency::USD()).unwrap().as_f64();
+    let all_usd = all.unwrap().get(&Currency::USD()).unwrap().as_decimal();
 
     // Filter account A only
     let a_only = portfolio.net_exposures(&venue, Some(&account_a));
     assert!(a_only.is_some());
-    let a_usd = a_only.unwrap().get(&Currency::USD()).unwrap().as_f64();
+    let a_usd = a_only.unwrap().get(&Currency::USD()).unwrap().as_decimal();
 
     // Filter account B only
     let b_only = portfolio.net_exposures(&venue, Some(&account_b));
     assert!(b_only.is_some());
-    let b_usd = b_only.unwrap().get(&Currency::USD()).unwrap().as_f64();
+    let b_usd = b_only.unwrap().get(&Currency::USD()).unwrap().as_decimal();
 
     // Account A exposure > Account B exposure (100k vs 50k)
     assert!(a_usd > b_usd);
     // Combined should equal the sum
-    assert!((all_usd - (a_usd + b_usd)).abs() < 1.0);
+    assert_eq!(all_usd, a_usd + b_usd);
 }
 
 #[rstest]
@@ -3524,8 +3609,8 @@ fn test_net_exposure_filters_by_account_id(
         .net_exposure(&instrument_id, Some(&account_b))
         .unwrap();
 
-    assert!(a_only.as_f64() > b_only.as_f64());
-    assert!((all.as_f64() - (a_only.as_f64() + b_only.as_f64())).abs() < 1.0);
+    assert!(a_only.as_decimal() > b_only.as_decimal());
+    assert_eq!(all.as_decimal(), a_only.as_decimal() + b_only.as_decimal());
 }
 
 #[rstest]
@@ -3599,10 +3684,13 @@ fn test_unrealized_pnl_filters_by_account_id(
     assert_eq!(total_all.currency, Currency::USD());
     assert_eq!(total_a.currency, Currency::USD());
     assert_eq!(total_b.currency, Currency::USD());
-    assert!((a_only.as_f64() - (2.0 * b_only.as_f64())).abs() < 1e-6);
-    assert!((all.as_f64() - (a_only.as_f64() + b_only.as_f64())).abs() < 1e-6);
-    assert!((total_a.as_f64() - (2.0 * total_b.as_f64())).abs() < 1e-6);
-    assert!((total_all.as_f64() - (total_a.as_f64() + total_b.as_f64())).abs() < 1e-6);
+    assert_eq!(a_only.as_decimal(), dec!(2.0) * b_only.as_decimal());
+    assert_eq!(all.as_decimal(), a_only.as_decimal() + b_only.as_decimal());
+    assert_eq!(total_a.as_decimal(), dec!(2.0) * total_b.as_decimal());
+    assert_eq!(
+        total_all.as_decimal(),
+        total_a.as_decimal() + total_b.as_decimal()
+    );
 }
 
 #[rstest]
@@ -3694,8 +3782,8 @@ fn test_realized_pnl_filters_by_account_id(
     assert_eq!(all.currency, Currency::USD());
     assert_eq!(a_only.currency, Currency::USD());
     assert_eq!(b_only.currency, Currency::USD());
-    assert!((a_only.as_f64() - (2.0 * b_only.as_f64())).abs() < 1e-6);
-    assert!((all.as_f64() - (a_only.as_f64() + b_only.as_f64())).abs() < 1e-6);
+    assert_eq!(a_only.as_decimal(), dec!(2.0) * b_only.as_decimal());
+    assert_eq!(all.as_decimal(), a_only.as_decimal() + b_only.as_decimal());
 }
 
 #[rstest]
@@ -4331,7 +4419,7 @@ fn test_equity_cash_account_foreign_settlement_converts(
         AccountType::Cash,
         vec![AccountBalance::new(
             Money::new(1_000.0, Currency::EUR()),
-            Money::new(0.0, Currency::EUR()),
+            Money::zero(Currency::EUR()),
             Money::new(1_000.0, Currency::EUR()),
         )],
         vec![],
@@ -4409,7 +4497,7 @@ fn test_equity_rounds_once_across_small_foreign_positions(
         AccountType::Cash,
         vec![AccountBalance::new(
             Money::new(1_000.0, Currency::EUR()),
-            Money::new(0.0, Currency::EUR()),
+            Money::zero(Currency::EUR()),
             Money::new(1_000.0, Currency::EUR()),
         )],
         vec![],
@@ -4485,7 +4573,7 @@ fn test_missing_xrate_flags_instrument(
         AccountType::Cash,
         vec![AccountBalance::new(
             Money::new(1_000.0, Currency::EUR()),
-            Money::new(0.0, Currency::EUR()),
+            Money::zero(Currency::EUR()),
             Money::new(1_000.0, Currency::EUR()),
         )],
         vec![],
@@ -4637,6 +4725,81 @@ fn test_update_position_with_calculate_account_state_does_not_panic(
 }
 
 #[rstest]
+fn test_update_position_margin_state_across_multiple_open_positions(
+    mut portfolio: Portfolio,
+    instrument_audusd: InstrumentAny,
+) {
+    // Regression for the borrow-instead-of-clone refactor of `update_position`:
+    // the margin `calculate_account_state` path now borrows every open position
+    // straight from the cache (a non-trivial `Vec<&Position>` when more than one
+    // is open) and holds that shared borrow while computing the account state,
+    // then releases it before taking the exclusive borrow that persists the
+    // account. This exercises the borrow scoping end-to-end with >1 position and
+    // pins the borrowed-vs-cloned net-position equivalence.
+    let account_state = get_margin_account(None);
+    portfolio.update_account(&account_state);
+
+    let mut account = portfolio
+        .cache()
+        .borrow()
+        .account(&account_state.account_id)
+        .unwrap()
+        .clone();
+    account.set_calculate_account_state(true);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .update_account(&account)
+        .unwrap();
+
+    let last = get_quote_tick(&instrument_audusd, 10510.0, 10511.0, 1.0, 1.0);
+    portfolio.cache().borrow_mut().add_quote(last).unwrap();
+    portfolio.update_quote_tick(&last);
+
+    // Two separate open BUY positions on the same instrument (hedging OMS).
+    let mut expected_net = Decimal::ZERO;
+
+    for position_id in ["PT-1", "PT-2"] {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_audusd.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.00"))
+            .build();
+        let mut fill = fill_order(&order);
+        fill.position_id = Some(PositionId::new(position_id));
+        let position = Position::new(&instrument_audusd, fill);
+        expected_net += position.signed_decimal_qty();
+        portfolio
+            .cache()
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+        let opened = get_open_position(&position);
+        portfolio.update_position(&PositionEvent::PositionOpened(opened));
+    }
+
+    // The borrowed open positions yield the same net as summing each leg directly.
+    assert_eq!(
+        portfolio.net_position(&instrument_audusd.id()),
+        expected_net
+    );
+    assert!(portfolio.is_net_long(&instrument_audusd.id()));
+
+    // Account state was computed and persisted without a RefCell double-borrow.
+    let cached = portfolio
+        .cache()
+        .borrow()
+        .account(&account_state.account_id)
+        .unwrap()
+        .clone();
+
+    match cached {
+        AccountAny::Margin(margin) => assert!(margin.base.calculate_account_state),
+        _ => panic!("Expected MarginAccount"),
+    }
+}
+
+#[rstest]
 fn test_initialize_positions_arms_snapshot_timer_for_reconciled_venues(
     mut simple_cache: Cache,
     clock: TestClock,
@@ -4691,6 +4854,10 @@ fn test_initialize_positions_arms_snapshot_timer_for_reconciled_venues(
     );
 }
 
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "wildcard covers dependency cfg-gated callback variants in workspace feature builds"
+)]
 #[rstest]
 fn test_emit_snapshot_publishes_and_appends_to_ring(instrument_audusd: InstrumentAny) {
     use nautilus_common::{

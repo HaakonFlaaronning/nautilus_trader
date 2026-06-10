@@ -182,7 +182,7 @@ class BinanceWebSocketClient:
         Connect websocket clients to the server based on existing subscriptions.
         """
         if not self._streams:
-            self._log.error("Cannot connect: no streams for initial connection")
+            self._log.warning("Cannot connect: no streams for initial connection")
             return
 
         # Group streams by client (using existing assignments or creating new ones)
@@ -214,7 +214,7 @@ class BinanceWebSocketClient:
 
         """
         if not streams:
-            self._log.error(f"Cannot connect client {client_id}: no streams provided")
+            self._log.warning(f"Cannot connect client {client_id}: no streams provided")
             return
 
         # Update client streams tracking
@@ -287,7 +287,9 @@ class BinanceWebSocketClient:
         Handle reconnection for a specific client.
         """
         if client_id not in self._client_streams or not self._client_streams[client_id]:
-            self._log.error(f"ws-client {client_id}: Cannot reconnect: no streams for this client")
+            self._log.warning(
+                f"ws-client {client_id}: Cannot reconnect: no streams for this client",
+            )
             return
 
         self._log.warning(f"ws-client {client_id}: Reconnected to {self._base_url}")

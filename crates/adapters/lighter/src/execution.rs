@@ -33,7 +33,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
+    enums::LogColor,
     live::{runner::get_exec_event_sender, runtime::get_runtime},
+    log_info,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -66,13 +68,15 @@ use crate::{
     common::{
         consts::{LIGHTER_MAX_BATCH_TX, LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE},
         credential::{Credential, scrub_auth},
-        enums::{LighterPositionMarginMode, LighterProductType, LighterTxType},
+        enums::{LighterAccountTier, LighterPositionMarginMode, LighterProductType, LighterTxType},
+        rate_limit::{LighterTxRateLimiter, await_tx_quota, build_tx_rate_limiter, resolve_quota},
         symbol::{MarketRegistry, product_type_from_instrument_id},
         urls::lighter_chain_id,
     },
     config::LighterExecClientConfig,
     http::{
         client::{LIGHTER_REST_PAGE_SIZE, LighterHttpClient, LighterRawHttpClient},
+        error::LighterHttpError,
         models::{LighterSendTxBatchRequest, LighterSendTxRequest},
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
@@ -119,6 +123,9 @@ const DEFAULT_TX_EXPIRY_MS: i64 = 5 * 60 * 1_000;
 const AUTH_TOKEN_REFRESH_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 const WS_CONSUMER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// Bounds the informational tier-detection call so a slow or failing
+// `/account` endpoint cannot stall connect for the HTTP retry budget.
+const ACCOUNT_TIER_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Attribution window for a bare venue error frame. The frame carries no
 /// `tx_hash` or cloid; if the oldest pending sendTx was submitted within
@@ -137,6 +144,7 @@ pub struct LighterExecutionClient {
     credential: Option<Credential>,
     http_client: LighterHttpClient,
     ws_client: LighterWebSocketClient,
+    tx_rate_limiter: Arc<LighterTxRateLimiter>,
     registry: Arc<MarketRegistry>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
@@ -171,11 +179,17 @@ impl LighterExecutionClient {
 
         let registry = Arc::new(MarketRegistry::new());
 
-        let raw_http = LighterRawHttpClient::new(
+        // One transaction limiter shared across the HTTP and WebSocket sendTx
+        // paths so their combined rate honours the single per-account venue bucket.
+        let tx_rate_limiter = build_tx_rate_limiter(config.sendtx_quota_per_min);
+
+        let raw_http = LighterRawHttpClient::new_with_quotas(
             config.environment,
             config.base_url_http.clone(),
             config.http_timeout_secs,
             config.proxy_url.clone(),
+            resolve_quota(config.rest_quota_per_min),
+            Some(Arc::clone(&tx_rate_limiter)),
         )
         .context("failed to construct Lighter raw HTTP client")?;
         let http_client =
@@ -210,6 +224,7 @@ impl LighterExecutionClient {
             credential,
             http_client,
             ws_client,
+            tx_rate_limiter,
             registry,
             pending_tasks: Mutex::new(Vec::new()),
             ws_stream_handle: Mutex::new(None),
@@ -328,10 +343,115 @@ impl LighterExecutionClient {
         Ok(())
     }
 
+    // Logs the venue-reported account tier in blue. Informational only: the
+    // active quotas are resolved from config at construction, never raised here
+    // (the higher venue limits require registering the caller IP, so the tier
+    // alone does not guarantee them). The call is bounded by
+    // ACCOUNT_TIER_DETECT_TIMEOUT and failures are swallowed, so detection
+    // cannot fail connect or stall it for the HTTP retry budget.
+    async fn detect_account_tier(&self) {
+        let Some(credential) = &self.credential else {
+            return;
+        };
+        let account_index = credential.account_index();
+
+        let detail = match tokio::time::timeout(
+            ACCOUNT_TIER_DETECT_TIMEOUT,
+            self.http_client.get_account_detail(account_index),
+        )
+        .await
+        {
+            Ok(Ok(detail)) => detail,
+            Ok(Err(e)) => {
+                log::warn!(
+                    "Failed to detect Lighter account tier for account_index={account_index}; \
+                     continuing at the configured REST quota: {e}"
+                );
+                return;
+            }
+            Err(_) => {
+                log::warn!(
+                    "Lighter account tier detection timed out after {}s for \
+                     account_index={account_index}; continuing at the configured REST quota",
+                    ACCOUNT_TIER_DETECT_TIMEOUT.as_secs()
+                );
+                return;
+            }
+        };
+
+        let code = detail.account_type;
+        let tier = LighterAccountTier::from_code(code);
+        let standard_rest = LighterAccountTier::Standard
+            .documented_rest_quota_per_min()
+            .unwrap_or(60);
+        let (active_rest, cross_check) =
+            tier_quota_report(tier, self.config.rest_quota_per_min, standard_rest);
+
+        log_info!(
+            "Lighter execution account {account_index} reported tier {tier} \
+             (account_type={code}); active REST quota {active_rest} req/min",
+            color = LogColor::Blue
+        );
+
+        match cross_check {
+            Some(TierCrossCheck::AboveTier { documented }) => {
+                log::warn!(
+                    "Configured Lighter rest_quota_per_min={active_rest} exceeds the {tier} tier \
+                     limit of {documented} req/min; the venue may reject requests unless the \
+                     caller IP is registered for the higher limit"
+                );
+            }
+            Some(TierCrossCheck::RaiseHint { documented }) => {
+                log_info!(
+                    "Lighter {tier} tier permits up to {documented} REST req/min; set \
+                     rest_quota_per_min (and register the caller IP with Lighter) to use it",
+                    color = LogColor::Blue
+                );
+            }
+            None => {}
+        }
+    }
+
+    /// Returns `Ok(true)` if this credential's `api_key_index` is maker-only.
+    /// Maker-only keys cannot submit `ApproveIntegrator`, so the caller skips
+    /// the integrator auto-approval when `true`.
+    async fn is_maker_only_api_key(&self, credential: &Credential) -> anyhow::Result<bool> {
+        let auth_token = build_auth_token_for(credential)
+            .context("failed to mint Lighter auth token for maker-only check")?;
+        let response = self
+            .http_client
+            .get_maker_only_api_keys(credential.account_index(), auth_token)
+            .await
+            .context("failed to query getMakerOnlyApiKeys")?;
+        let api_key_index = i64::from(credential.api_key_index());
+        Ok(response.api_key_indexes.contains(&api_key_index))
+    }
+
     async fn submit_integrator_auto_approval(&self) -> anyhow::Result<()> {
         let Some(credential) = &self.credential else {
             return Ok(());
         };
+
+        let mut maker_only_check_failed = false;
+
+        match self.is_maker_only_api_key(credential).await {
+            Ok(true) => {
+                log::warn!(
+                    "Skipping Lighter integrator auto-approval: api_key_index={} is maker-only; \
+                     ensure the account has been approved by a non-maker-only key",
+                    credential.api_key_index(),
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                maker_only_check_failed = true;
+                log::debug!(
+                    "Lighter maker-only api key check failed; attempting integrator approval \
+                     anyway: {e:?}"
+                );
+            }
+        }
 
         let approval = self.prepare_integrator_auto_approval(credential)?;
         let request = LighterSendTxRequest::new(
@@ -339,8 +459,14 @@ impl LighterExecutionClient {
             approval.tx_info.clone(),
         );
         let response = self.http_client.send_tx(&request).await.with_context(|| {
+            let hint = if maker_only_check_failed {
+                " (maker-only pre-flight check failed earlier; venue may reject with 62007 \
+                 if this key is maker-only)"
+            } else {
+                ""
+            };
             format!(
-                "failed to submit Lighter integrator approval nonce={} api_key_index={}",
+                "failed to submit Lighter integrator approval nonce={} api_key_index={}{hint}",
                 approval.nonce, approval.api_key_index,
             )
         })?;
@@ -828,6 +954,7 @@ impl LighterExecutionClient {
         } = prepared;
         let ws_client = self.ws_client.clone();
         let dispatch = self.dispatch.clone();
+        let tx_rate_limiter = self.tx_rate_limiter.clone();
         let credential = credential.clone();
         let client_order_id = order.client_order_id();
         let emitter = self.emitter.clone();
@@ -836,6 +963,9 @@ impl LighterExecutionClient {
         self.emitter.emit_order_submitted(&order);
         self.spawn_task("submit_order", async move {
             log::debug!("Lighter submit_order: queueing CreateOrder tx for {client_order_id}");
+            // Pace before enqueueing so the pending FIFO order matches the send
+            // order and `submitted_at` is fresh for ack/rejection attribution.
+            await_tx_quota(&tx_rate_limiter).await;
             dispatch.enqueue_pending_sendtx(PendingSendTx {
                 kind: PendingSendTxKind::Create {
                     order: Box::new(order.clone()),
@@ -1059,7 +1189,9 @@ impl LighterExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
 
+        let tx_rate_limiter = self.tx_rate_limiter.clone();
         self.spawn_task("cancel_order", async move {
+            await_tx_quota(&tx_rate_limiter).await;
             dispatch.enqueue_pending_sendtx(PendingSendTx {
                 kind: PendingSendTxKind::Other,
                 submitted_at: clock.get_time_ns(),
@@ -1253,7 +1385,9 @@ impl LighterExecutionClient {
         let instrument_id = cmd.instrument_id;
         let venue_order_id = Some(voi);
 
+        let tx_rate_limiter = self.tx_rate_limiter.clone();
         self.spawn_task("modify_order", async move {
+            await_tx_quota(&tx_rate_limiter).await;
             dispatch.enqueue_pending_sendtx(PendingSendTx {
                 kind: PendingSendTxKind::Other,
                 submitted_at: clock.get_time_ns(),
@@ -1349,7 +1483,9 @@ impl LighterExecutionClient {
         let credential = credential.clone();
         let clock = self.clock;
 
+        let tx_rate_limiter = self.tx_rate_limiter.clone();
         self.spawn_task("update_leverage", async move {
+            await_tx_quota(&tx_rate_limiter).await;
             dispatch.enqueue_pending_sendtx(PendingSendTx {
                 kind: PendingSendTxKind::Other,
                 submitted_at: clock.get_time_ns(),
@@ -1398,6 +1534,38 @@ struct PreparedIntegratorApproval {
     nonce: i64,
     api_key_index: u8,
     approval_expiry: i64,
+}
+
+// Cross-check between a detected account tier and the configured REST quota:
+// AboveTier when the override exceeds the tier limit, RaiseHint when the tier
+// allows more than standard but no override is set.
+#[derive(Debug, PartialEq, Eq)]
+enum TierCrossCheck {
+    AboveTier { documented: u32 },
+    RaiseHint { documented: u32 },
+}
+
+// Computes the active REST quota to report and any cross-check advisory from the
+// detected tier and the raw override. A zero override resolves to the standard
+// default (matching resolve_quota), so the reported quota always matches the
+// limiter. Pure so the reporting decision is unit-testable without log capture.
+fn tier_quota_report(
+    tier: LighterAccountTier,
+    rest_quota_per_min: Option<u32>,
+    standard_rest: u32,
+) -> (u32, Option<TierCrossCheck>) {
+    let configured = rest_quota_per_min.filter(|&n| n > 0);
+    let active_rest = configured.unwrap_or(standard_rest);
+    let cross_check = match (tier.documented_rest_quota_per_min(), configured) {
+        (Some(documented), Some(configured)) if configured > documented => {
+            Some(TierCrossCheck::AboveTier { documented })
+        }
+        (Some(documented), None) if documented > standard_rest => {
+            Some(TierCrossCheck::RaiseHint { documented })
+        }
+        _ => None,
+    };
+    (active_rest, cross_check)
 }
 
 fn send_tx_batch_request(
@@ -1749,9 +1917,27 @@ impl ExecutionClient for LighterExecutionClient {
 
         self.ensure_instruments_initialized_async().await?;
         self.refresh_nonce().await?;
+        self.detect_account_tier().await;
 
         if let Err(e) = self.submit_integrator_auto_approval().await {
-            log::debug!("Lighter integrator approval failed; continuing startup: {e:?}");
+            // Bail on venue 21149 ("integrator is not approved") so the
+            // operator catches it at startup rather than at first order.
+            // Other failures are tolerated: approval is account-scoped and
+            // may already be in place, or a reconnect can retry.
+            let is_unapproved = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<LighterHttpError>(),
+                    Some(LighterHttpError::Venue { code: 21149, .. }),
+                )
+            });
+
+            if is_unapproved {
+                return Err(e.context(
+                    "Lighter account is not integrator-approved (venue 21149); \
+                     orders cannot be placed",
+                ));
+            }
+            log::error!("Lighter integrator approval failed; continuing startup: {e:?}");
         }
 
         if let Err(e) = self.refresh_nonce().await {
@@ -1827,7 +2013,7 @@ impl ExecutionClient for LighterExecutionClient {
         self.cancellation_token.cancel();
 
         if let Err(e) = self.ws_client.disconnect().await {
-            log::error!("Error disconnecting Lighter WebSocket client: {e}");
+            log::warn!("Error disconnecting Lighter WebSocket client: {e}");
         }
 
         let ws_stream_handle = { self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() };
@@ -3341,6 +3527,8 @@ mod tests {
             ws_timeout_secs: 1,
             active_markets: Vec::new(),
             market_order_slippage_bps: 50,
+            rest_quota_per_min: None,
+            sendtx_quota_per_min: None,
             transport_backend: Default::default(),
         }
     }
@@ -5954,6 +6142,35 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), rx.recv())
                 .await
                 .is_err(),
+        );
+    }
+
+    #[rstest]
+    #[case::standard_no_override(LighterAccountTier::Standard, None, 60, None)]
+    #[case::standard_zero_is_default(LighterAccountTier::Standard, Some(0), 60, None)]
+    #[case::standard_override_above_tier(
+        LighterAccountTier::Standard,
+        Some(24_000),
+        24_000,
+        Some(TierCrossCheck::AboveTier { documented: 60 })
+    )]
+    #[case::premium_raise_hint(
+        LighterAccountTier::Premium,
+        None,
+        60,
+        Some(TierCrossCheck::RaiseHint { documented: 24_000 })
+    )]
+    #[case::premium_configured_no_advisory(LighterAccountTier::Premium, Some(24_000), 24_000, None)]
+    #[case::unknown_no_advisory(LighterAccountTier::Unknown(7), None, 60, None)]
+    fn test_tier_quota_report(
+        #[case] tier: LighterAccountTier,
+        #[case] configured: Option<u32>,
+        #[case] expected_active: u32,
+        #[case] expected_cross_check: Option<TierCrossCheck>,
+    ) {
+        assert_eq!(
+            tier_quota_report(tier, configured, 60),
+            (expected_active, expected_cross_check),
         );
     }
 }

@@ -105,8 +105,7 @@ impl PostgresCacheDatabase {
         let pool = connect_pg(pg_connect_options.clone().into()).await.unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseQuery>();
 
-        // Spawn a task to handle messages
-        let handle = tokio::spawn(async move {
+        let handle = get_runtime().spawn(async move {
             Box::pin(Self::process_commands(
                 rx,
                 pg_connect_options.clone().into(),
@@ -246,7 +245,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
         // Cancel message handling task
         if let Err(e) = self.tx.send(DatabaseQuery::Close) {
-            log::error!("Error sending close: {e:?}");
+            log::warn!("Error sending close: {e:?}");
         }
 
         log_task_awaiting("cache-write");
