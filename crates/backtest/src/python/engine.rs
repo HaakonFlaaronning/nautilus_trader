@@ -33,9 +33,9 @@ use nautilus_execution::models::{
     },
     fill::{
         BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
-        LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
-        PolymarketFixedSlippageFillModel, ProbabilisticFillModel, SizeAwareFillModel,
-        ThreeTierFillModel, TwoTierFillModel, VolumeSensitiveFillModel,
+        FixedTickSlippageFillModel, LimitOrderPartialFillModel, MarketHoursFillModel,
+        OneTickSlippageFillModel, PolymarketFixedSlippageFillModel, ProbabilisticFillModel,
+        SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel, VolumeSensitiveFillModel,
     },
     latency::{LatencyModelAny, StaticLatencyModel},
 };
@@ -1026,6 +1026,10 @@ pub(crate) fn pyobject_to_fill_model_any(
 
     if let Ok(m) = obj.extract::<OneTickSlippageFillModel>() {
         return Ok(FillModelAny::OneTickSlippage(m));
+    }
+
+    if let Ok(m) = obj.extract::<FixedTickSlippageFillModel>() {
+        return Ok(FillModelAny::FixedTickSlippage(m));
     }
 
     if let Ok(m) = obj.extract::<PolymarketFixedSlippageFillModel>() {

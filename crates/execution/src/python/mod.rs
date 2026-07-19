@@ -58,6 +58,7 @@ pub fn execution(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::models::fill::DefaultFillModel>()?;
     m.add_class::<crate::models::fill::BestPriceFillModel>()?;
     m.add_class::<crate::models::fill::OneTickSlippageFillModel>()?;
+    m.add_class::<crate::models::fill::FixedTickSlippageFillModel>()?;
     m.add_class::<crate::models::fill::PolymarketFixedSlippageFillModel>()?;
     m.add_class::<crate::models::fill::ProbabilisticFillModel>()?;
     m.add_class::<crate::models::fill::TwoTierFillModel>()?;

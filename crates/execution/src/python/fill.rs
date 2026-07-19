@@ -19,10 +19,10 @@ use nautilus_core::python::to_pyruntime_err;
 use pyo3::prelude::*;
 
 use crate::models::fill::{
-    BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, LimitOrderPartialFillModel,
-    MarketHoursFillModel, OneTickSlippageFillModel, PolymarketFixedSlippageFillModel,
-    ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
-    VolumeSensitiveFillModel,
+    BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FixedTickSlippageFillModel,
+    LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
+    PolymarketFixedSlippageFillModel, ProbabilisticFillModel, SizeAwareFillModel,
+    ThreeTierFillModel, TwoTierFillModel, VolumeSensitiveFillModel,
 };
 
 macro_rules! impl_fill_model_pymethods {
@@ -57,6 +57,30 @@ impl_fill_model_pymethods!(LimitOrderPartialFillModel);
 impl_fill_model_pymethods!(SizeAwareFillModel);
 impl_fill_model_pymethods!(VolumeSensitiveFillModel);
 impl_fill_model_pymethods!(MarketHoursFillModel);
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl FixedTickSlippageFillModel {
+    /// Fill model that forces a configurable number of ticks of slippage for all
+    /// orders. Aggressive buys fill at `best_ask + slippage_ticks * tick`;
+    /// aggressive sells fill at `best_bid - slippage_ticks * tick`, using each
+    /// instrument's own price increment at fill time.
+    #[new]
+    #[pyo3(signature = (slippage_ticks=1, prob_fill_on_limit=1.0, prob_slippage=0.0, random_seed=None))]
+    fn py_new(
+        slippage_ticks: u32,
+        prob_fill_on_limit: f64,
+        prob_slippage: f64,
+        random_seed: Option<u64>,
+    ) -> PyResult<Self> {
+        Self::new(slippage_ticks, prob_fill_on_limit, prob_slippage, random_seed)
+            .map_err(to_pyruntime_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]

@@ -417,6 +417,109 @@ impl FillModel for OneTickSlippageFillModel {
     }
 }
 
+/// Fill model that forces a configurable number of ticks of slippage for all orders.
+///
+/// Builds a synthetic L2 book with unlimited liquidity sitting `slippage_ticks`
+/// price increments away from the matching engine's transient best bid/ask.
+/// Aggressive buys fill at `best_ask + slippage_ticks * tick`; aggressive sells
+/// fill at `best_bid - slippage_ticks * tick`. The tick size is taken from each
+/// instrument at fill time, so one model instance is correct across instruments
+/// with different price increments.
+///
+/// Differs from `OneTickSlippageFillModel` only in that the number of ticks is
+/// configurable.
+#[derive(Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.execution",
+        unsendable,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")
+)]
+pub struct FixedTickSlippageFillModel {
+    slippage_ticks: u32,
+    state: ProbabilisticFillState,
+}
+
+impl FixedTickSlippageFillModel {
+    /// Creates a new [`FixedTickSlippageFillModel`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if probability parameters are not in range [0, 1].
+    pub fn new(
+        slippage_ticks: u32,
+        prob_fill_on_limit: f64,
+        prob_slippage: f64,
+        random_seed: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            slippage_ticks,
+            state: ProbabilisticFillState::new(prob_fill_on_limit, prob_slippage, random_seed)?,
+        })
+    }
+}
+
+impl Clone for FixedTickSlippageFillModel {
+    fn clone(&self) -> Self {
+        Self {
+            slippage_ticks: self.slippage_ticks,
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl Default for FixedTickSlippageFillModel {
+    fn default() -> Self {
+        Self::new(1, 1.0, 0.0, None).unwrap()
+    }
+}
+
+impl FillModel for FixedTickSlippageFillModel {
+    fn is_limit_filled(&mut self) -> bool {
+        self.state.is_limit_filled()
+    }
+
+    fn is_slipped(&mut self) -> bool {
+        self.state.is_slipped()
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        instrument: &InstrumentAny,
+        _order: &OrderAny,
+        best_bid: Price,
+        best_ask: Price,
+    ) -> Option<OrderBook> {
+        let tick = instrument.price_increment();
+        let price_prec = instrument.price_precision();
+        let size_prec = instrument.size_precision();
+        let offset = Price::new(tick.as_f64() * f64::from(self.slippage_ticks), price_prec);
+        let mut book = build_l2_book(instrument.id());
+
+        add_order(
+            &mut book,
+            OrderSide::Buy,
+            best_bid - offset,
+            unlimited_liquidity(size_prec),
+            1,
+        );
+        add_order(
+            &mut book,
+            OrderSide::Sell,
+            best_ask + offset,
+            unlimited_liquidity(size_prec),
+            2,
+        );
+        Some(book)
+    }
+}
+
 /// Fill model that forces a configurable fixed slippage on every fill, with
 /// optional clamping to the Polymarket binary-option `[tick, 1 - tick]`
 /// probability domain.
@@ -1374,6 +1477,7 @@ pub enum FillModelAny {
     Default(DefaultFillModel),
     BestPrice(BestPriceFillModel),
     OneTickSlippage(OneTickSlippageFillModel),
+    FixedTickSlippage(FixedTickSlippageFillModel),
     PolymarketFixedSlippage(PolymarketFixedSlippageFillModel),
     Probabilistic(ProbabilisticFillModel),
     TwoTier(TwoTierFillModel),
@@ -1391,6 +1495,7 @@ impl FillModel for FillModelAny {
             Self::Default(m) => m.is_limit_filled(),
             Self::BestPrice(m) => m.is_limit_filled(),
             Self::OneTickSlippage(m) => m.is_limit_filled(),
+            Self::FixedTickSlippage(m) => m.is_limit_filled(),
             Self::PolymarketFixedSlippage(m) => m.is_limit_filled(),
             Self::Probabilistic(m) => m.is_limit_filled(),
             Self::TwoTier(m) => m.is_limit_filled(),
@@ -1408,6 +1513,7 @@ impl FillModel for FillModelAny {
             Self::Default(m) => m.fill_limit_inside_spread(),
             Self::BestPrice(m) => m.fill_limit_inside_spread(),
             Self::OneTickSlippage(m) => m.fill_limit_inside_spread(),
+            Self::FixedTickSlippage(m) => m.fill_limit_inside_spread(),
             Self::PolymarketFixedSlippage(m) => m.fill_limit_inside_spread(),
             Self::Probabilistic(m) => m.fill_limit_inside_spread(),
             Self::TwoTier(m) => m.fill_limit_inside_spread(),
@@ -1425,6 +1531,7 @@ impl FillModel for FillModelAny {
             Self::Default(m) => m.is_slipped(),
             Self::BestPrice(m) => m.is_slipped(),
             Self::OneTickSlippage(m) => m.is_slipped(),
+            Self::FixedTickSlippage(m) => m.is_slipped(),
             Self::PolymarketFixedSlippage(m) => m.is_slipped(),
             Self::Probabilistic(m) => m.is_slipped(),
             Self::TwoTier(m) => m.is_slipped(),
@@ -1452,6 +1559,9 @@ impl FillModel for FillModelAny {
                 m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask)
             }
             Self::OneTickSlippage(m) => {
+                m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask)
+            }
+            Self::FixedTickSlippage(m) => {
                 m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask)
             }
             Self::PolymarketFixedSlippage(m) => {
@@ -1497,6 +1607,7 @@ impl Display for FillModelAny {
             Self::Default(m) => write!(f, "{m}"),
             Self::BestPrice(_) => write!(f, "BestPriceFillModel"),
             Self::OneTickSlippage(_) => write!(f, "OneTickSlippageFillModel"),
+            Self::FixedTickSlippage(_) => write!(f, "FixedTickSlippageFillModel"),
             Self::PolymarketFixedSlippage(_) => write!(f, "PolymarketFixedSlippageFillModel"),
             Self::Probabilistic(_) => write!(f, "ProbabilisticFillModel"),
             Self::TwoTier(_) => write!(f, "TwoTierFillModel"),
